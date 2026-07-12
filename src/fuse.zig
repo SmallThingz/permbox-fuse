@@ -172,7 +172,7 @@ fn chmod(path: [*:0]const u8, mode: c.mode_t, fi: ?*c.struct_fuse_file_info) cal
 ///
 /// Returns:
 ///   - `0` on success, or a negative C error code (e.g., `-c.EINVAL`).
-fn chown(path: [*:0]const u8, uid: c.uid_t, gid: c.gid_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {}
+fn chown(path: [*:0]const u8, uid: std.c.uid_t, gid: std.c.gid_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {}
 
 /// Change the size of a file.
 ///
@@ -188,7 +188,7 @@ fn chown(path: [*:0]const u8, uid: c.uid_t, gid: c.gid_t, fi: ?*c.struct_fuse_fi
 ///
 /// Returns:
 ///   - `0` on success, or a negative C error code (e.g., `-c.EFBIG`).
-fn truncate(path: [*:0]const u8, size: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {}
+fn truncate(path: [*:0]const u8, size: std.c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {}
 
 /// Opens a file and initializes file handles or caching strategies.
 ///
@@ -262,7 +262,7 @@ fn open(path: [*:0]const u8, fi: *c.struct_fuse_file_info) callconv(.c) c_int {}
 /// Returns:
 ///   - The actual number of bytes read on success (>= 0).
 ///   - A negative C error code (e.g., -c.EIO) on failure.
-fn read(path: [*:0]const u8, buf: [*]u8, size: usize, offset: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {}
+fn read(path: [*:0]const u8, buf: [*]u8, size: usize, offset: std.c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {}
 
 /// Write data to an open file descriptor.
 ///
@@ -294,7 +294,7 @@ fn read(path: [*:0]const u8, buf: [*]u8, size: usize, offset: c.off_t, fi: ?*c.s
 /// Returns:
 ///    - The actual number of bytes written on success (>= 0).
 ///    - A negative C error code (e.g., -c.ENOSPC on disk full, -c.EIO) on failure.
-fn write(path: [*:0]const u8, buf: [*]const u8, size: usize, offset: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {}
+fn write(path: [*:0]const u8, buf: [*]const u8, size: usize, offset: std.c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {}
 
 /// Get file system storage statistics.
 ///
@@ -541,7 +541,7 @@ fn readdir(
     path: [*:0]const u8,
     buf: ?*anyopaque,
     filler: c.fuse_fill_dir_t,
-    offset: c.off_t,
+    offset: std.c.off_t,
     fi: ?*c.struct_fuse_file_info,
     flags: c.enum_fuse_readdir_flags,
 ) callconv(.c) c_int {}
@@ -887,7 +887,7 @@ fn poll(
 fn write_buf(
     path: [*:0]const u8,
     buf: *c.struct_fuse_bufvec,
-    off: c.off_t,
+    off: std.c.off_t,
     fi: ?*c.struct_fuse_file_info,
 ) callconv(.c) c_int {}
 
@@ -923,7 +923,7 @@ fn read_buf(
     path: [*:0]const u8,
     bufp: *?*c.struct_fuse_bufvec,
     size: usize,
-    off: c.off_t,
+    off: std.c.off_t,
     fi: ?*c.struct_fuse_file_info,
 ) callconv(.c) c_int {}
 
@@ -984,8 +984,8 @@ fn flock(path: [*:0]const u8, fi: *c.struct_fuse_file_info, op: c_int) callconv(
 fn fallocate(
     path: [*:0]const u8,
     mode: c_int,
-    offset: c.off_t,
-    len: c.off_t,
+    offset: std.c.off_t,
+    len: std.c.off_t,
     fi: ?*c.struct_fuse_file_info,
 ) callconv(.c) c_int {}
 
@@ -1026,10 +1026,10 @@ fn fallocate(
 fn copy_file_range(
     path_in: [*:0]const u8,
     fi_in: *c.struct_fuse_file_info,
-    offset_in: c.off_t,
+    offset_in: std.c.off_t,
     path_out: [*:0]const u8,
     fi_out: *c.struct_fuse_file_info,
-    offset_out: c.off_t,
+    offset_out: std.c.off_t,
     size: usize,
     flags: c_int,
 ) callconv(.c) isize {}
@@ -1056,7 +1056,7 @@ fn copy_file_range(
 /// Returns:
 ///   - The calculated absolute file offset address matching the target block search on success (>= 0).
 ///   - A negative C error code (e.g., -c.ENXIO if seeking past data boundaries, -c.EINVAL for invalid flags).
-fn lseek(path: [*:0]const u8, off: c.off_t, whence: c_int, fi: ?*c.struct_fuse_file_info) callconv(.c) std.c.off_t {}
+fn lseek(path: [*:0]const u8, off: std.c.off_t, whence: c_int, fi: ?*c.struct_fuse_file_info) callconv(.c) std.c.off_t {}
 
 /// Get extended file attributes with precise bitmask selectivity.
 ///
