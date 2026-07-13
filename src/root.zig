@@ -2,7 +2,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mem = @import("mem.zig");
-const testing = @import("testing.zig");
 
 const children_count = 1 << 8;
 const I = u8;
@@ -99,13 +98,13 @@ const OpAdd = struct {
     idx: u8,
     gpa: std.mem.Allocator,
 
-    fn executeNull(self: *OpAdd) !void {
+    fn executeNull(self: *const OpAdd) !void {
         std.debug.assert(self.cursed.isNull());
 
         var cursed = self.cursed;
         var idx = self.idx;
         var remaining = self.path;
-        const parent = cursed.getParent(idx);
+        var parent = cursed.getParent(idx);
 
         while (true) {
             const node = try Node.init(self.gpa);
@@ -129,62 +128,95 @@ const OpAdd = struct {
             idx = remaining[0];
             remaining = remaining[1..];
             cursed = &node.children[idx];
+            parent = node;
         }
     }
 
     /// idx is our index in the parent's block
     pub fn execute(self: *@This()) !void {
-        switch (self.cursed.getNextNode(self.idx)) {
-            .this => {
-                self.cursed.getParent(self.idx).data[self.idx] = self.data;
-                return;
-            },
+        // At this point, it is guaranteed that there has not been any modification to the trie.
+        // Yes, this is true even when we enter this after recursion.
+        blk: switch (self.cursed.getNextNode(self.idx)) {
+            .this => self.cursed.getParent(self.idx).data[self.idx] = self.data,
             .node => |next| {
                 self.cursed = &self.cursed.ptr().?.children[next];
                 self.idx = next;
                 self.path = self.path[@as(usize, self.cursed._radix_len) + 1 ..];
 
-                if (self.cursed.isNull()) return executeNull(self);
-                return @call(.always_tail, execute, .{self});
+                if (self.cursed.isNull()) executeNull(self) catch |e| {
+                    self.freeChain();
+                    self.cursed.* = .{};
+                    return e;
+                } else {
+                    // This function is just a glorified for loop; the behavior is same as
+                    // return @call(.always_tail, execute, .{self});
+                    continue :blk self.cursed.getNextNode(self.idx);
+                }
             },
             .consumed => |consumed| {
                 const parent = self.cursed.getParent(self.idx);
-                const old = self.cursed.*;
+                var old = self.cursed.*;
                 const old_node = old.ptr().?;
+                std.debug.assert(consumed < old._radix_len);
                 const olds_new_idx = old_node.radix_str[consumed];
 
-                const node = try Node.init(self.gpa);
+                const node = try Node.init(self.gpa); // No change was made so no harm
                 node.count_minus_1[olds_new_idx] = parent.count_minus_1[self.idx];
                 node.data[olds_new_idx] = parent.data[self.idx];
                 @memcpy(node.radix_str[0..consumed], old_node.radix_str[0..consumed]);
 
-                const olds_new_str = old_node.radix_str[@as(usize, consumed) + 1 .. old._radix_len];
-                std.mem.copyForwards(I, old_node.radix_str[0..], olds_new_str);
-                old._radix_len = @intCast(olds_new_str.len);
-                node.children[olds_new_idx] = old;
-
                 self.cursed.* = @bitCast(node);
                 std.debug.assert(self.cursed._radix_len == 0);
                 self.cursed._radix_len = consumed;
-                parent.children[self.idx] = self.cursed.*;
 
                 if (self.path.len == consumed) {
                     parent.count_minus_1[self.idx] = 0;
                     parent.data[self.idx] = self.data;
-                    return;
+                } else {
+                    std.debug.assert(self.path.len > consumed);
+
+                    const new_idx = self.path[consumed];
+                    executeNull(.{
+                        .idx = new_idx,
+                        .cursed = &node.children[new_idx],
+                        .path = self.path[@as(usize, consumed) + 1 ..],
+                        .data = self.data,
+                        .gpa = self.gpa,
+                    }) catch |e| {
+                        self.freeChain();
+                        self.cursed.* = old;
+                        return e;
+                    };
+
+                    parent.count_minus_1[self.idx] = 1;
+                    parent.data[self.idx] = .midway;
                 }
 
-                std.debug.assert(self.path.len > consumed);
-                parent.count_minus_1[self.idx] = 1;
-                parent.data[self.idx] = .midway;
-                self.idx = self.path[consumed];
-                self.cursed = &node.children[self.idx];
-                self.path = self.path[@as(usize, consumed) + 1 ..];
-                std.debug.assert(self.cursed.isNull());
-                return executeNull(self);
+                const olds_new_str = old_node.radix_str[@as(usize, consumed) + 1 .. old._radix_len];
+                std.mem.copyForwards(I, old_node.radix_str[0..olds_new_str.len], olds_new_str);
+                old._radix_len = @intCast(olds_new_str.len);
+                node.children[olds_new_idx] = old;
             },
         }
-        unreachable;
+    }
+
+    // Separate free function that does not blow up the stack
+    fn freeChain(self: *const @This()) void {
+        var ptr = self.cursed.ptr() orelse return;
+        while (true) {
+            const next = blk: for (ptr.children) |c| {
+                if (!c.isNull()) {
+                    @branchHint(.unlikely);
+                    break :blk c.ptr();
+                }
+            } else {
+                self.gpa.destroy(ptr);
+                return;
+            };
+
+            self.gpa.destroy(ptr);
+            ptr = next;
+        }
     }
 };
 
