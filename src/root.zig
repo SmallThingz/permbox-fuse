@@ -1,17 +1,191 @@
 //! This has the implementation of the trie that tracks the permissions
 const std = @import("std");
+const builtin = @import("builtin");
+const mem = @import("mem.zig");
+const testing = @import("testing.zig");
 
 const children_count = 1 << 8;
 const I = u8;
 /// The total size of the node will be 2^8 * (2^2 | 2^3)
-/// Adding the data block makes this  2^8 * (1 + 2^2 | 1 + 2^3) = 1.25 KiB | 2.25KiB
+/// Adding the data block makes this  2^8 * (2 + 2^2 | 2 + 2^3) = 1.50 KiB | 2.50KiB
 /// for smp allocatore
-///     for 32 bit closest size class higher than 1.25 KiB is 2KiB; got 0.75KiB = 2^8 * 3
-///     for 64 bit closest size class higher than 2.25 KiB is 4KiB; got 1.75KiB = 2^8 * 7
+///     for 32 bit closest size class higher than 1.25 KiB is 2KiB; got 0.5KiB = 2^8 * 3
+///     for 64 bit closest size class higher than 2.25 KiB is 4KiB; got 1.5KiB = 2^8 * 7
 const node_size: struct { total: usize, free: usize } = switch (@bitSizeOf(usize)) {
-    32 => .{ .total = 1 << 11, .free = (1 << 8) * 3 },
+    32 => @compileError("TODO: add 32 bit support"),
+    // 32 => .{ .total = 1 << 11, .free = (1 << 8) * 3 },
     64 => .{ .total = 1 << 12, .free = (1 << 8) * 7 },
     else => |v| @compileError(std.fmt.comptimePrint("unsupported register width of {d}", .{v})),
+};
+
+const nodepopcnt = @popCount(node_size.total / 2);
+const RadixInt = @Int(.unsigned, nodepopcnt);
+
+const Node = struct {
+    /// Set the alignment
+    _: void align(node_size.total / 2),
+    /// Childrens, if they exist
+    ///
+    /// Note that it might seem inticing to place the allocation inline along with one data pointer with
+    /// [options.children_count]?*@This() & ?*options.data but that is actually a prettie bad idea.
+    ///
+    /// Most modern allocators use size classes; since usize is a multiple of 2,
+    /// total size of this block is gonna be same as size class.
+    /// But note that the data pointer must also takes 1 usize; that increases our size class of node allocation and wastes a LOT of space.
+    /// for 64wide register and children_count = 256; that would likely waste ~1KiB atleast if not more
+    children: [children_count]Cursed = children_count ** [1]Cursed{},
+    /// The count for the childrens
+    count_minus_1: [children_count]I = undefined,
+    /// If this is non-null; this node has data
+    data: [children_count]Mode = children_count ** [1]Mode.midway,
+
+    /// This would have been wasted anyways
+    radix_str: [@divExact(node_size.free, @sizeOf(I))]I = undefined,
+
+    comptime {
+        std.debug.assert(@alignOf(@This()) >= children_count);
+        std.debug.assert(@sizeOf(@This()) == node_size.total);
+    }
+
+    pub fn init(gpa: std.mem.Allocator) !*@This() {
+        const node = try gpa.create(@This());
+        node.* = .{};
+        return node;
+    }
+
+    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        gpa.destroy(self);
+    }
+};
+
+/// Use alignment hacks to store lengths
+pub const Cursed = packed struct(usize) {
+    /// The upper part of the pointer; this being 0 means the node is null.
+    _upper: @Int(.unsigned, @bitSizeOf(usize) - nodepopcnt) = 0,
+    /// Zero length means this is the terminal node; we are setting the upper part anyways so no harm in setting this too.
+    _radix_len: RadixInt = 0,
+
+    pub inline fn isNull(self: *const @This()) bool {
+        // The lower part must be 0 if the upper is 0
+        return @as(usize, @bitCast(self.underlying)) == 0;
+    }
+
+    pub inline fn ptr(self: *const @This()) ?*Node {
+        return @bitCast(Cursed{ ._upper = self._upper });
+    }
+
+    fn getNextNode(self: *@This(), path: [:0]const I) union(enum) { this, node: I, consumed: RadixInt } {
+        const node = self.ptr().?;
+        const maybe_consumed = mem.findDiff(I, node.radix_str[0..self._radix_len], path);
+        if (maybe_consumed) |consumed| {
+            if (consumed == self._radix_len) return .{ .node = path[consumed] };
+            return .{ .consumed = consumed };
+        } else {
+            return .this;
+        }
+    }
+
+    fn getParent(self: *@This(), self_idx: I) *Node {
+        const field = "children";
+        const start = (@as([*]@This(), @ptrCast(self)) - self_idx);
+        return @fieldParentPtr(field, @as(@FieldType(Node, field), @ptrCast(start)));
+    }
+};
+
+const OpAdd = struct {
+    cursed: *Cursed,
+    path: []const u8,
+    data: Mode,
+    idx: u8,
+    gpa: std.mem.Allocator,
+
+    fn executeNull(self: *OpAdd) !void {
+        std.debug.assert(self.cursed.isNull());
+
+        var cursed = self.cursed;
+        var idx = self.idx;
+        var remaining = self.path;
+        const parent = cursed.getParent(idx);
+
+        while (true) {
+            const node = try Node.init(self.gpa);
+            const chunk_len = @min(remaining.len, node.radix_str.len);
+            cursed.* = @bitCast(node);
+            cursed._radix_len = @intCast(chunk_len);
+            @memcpy(node.radix_str[0..chunk_len], remaining[0..chunk_len]);
+
+            parent.children[idx] = cursed.*;
+
+            if (chunk_len == remaining.len) {
+                parent.count_minus_1[idx] = 0;
+                parent.data[idx] = self.data;
+                return;
+            }
+
+            parent.count_minus_1[idx] = 0;
+            parent.data[idx] = .midway;
+
+            remaining = remaining[chunk_len..];
+            idx = remaining[0];
+            remaining = remaining[1..];
+            cursed = &node.children[idx];
+        }
+    }
+
+    /// idx is our index in the parent's block
+    pub fn execute(self: *@This()) !void {
+        switch (self.cursed.getNextNode(self.idx)) {
+            .this => {
+                self.cursed.getParent(self.idx).data[self.idx] = self.data;
+                return;
+            },
+            .node => |next| {
+                self.cursed = &self.cursed.ptr().?.children[next];
+                self.idx = next;
+                self.path = self.path[@as(usize, self.cursed._radix_len) + 1 ..];
+
+                if (self.cursed.isNull()) return executeNull(self);
+                return @call(.always_tail, execute, .{self});
+            },
+            .consumed => |consumed| {
+                const parent = self.cursed.getParent(self.idx);
+                const old = self.cursed.*;
+                const old_node = old.ptr().?;
+                const olds_new_idx = old_node.radix_str[consumed];
+
+                const node = try Node.init(self.gpa);
+                node.count_minus_1[olds_new_idx] = parent.count_minus_1[self.idx];
+                node.data[olds_new_idx] = parent.data[self.idx];
+                @memcpy(node.radix_str[0..consumed], old_node.radix_str[0..consumed]);
+
+                const olds_new_str = old_node.radix_str[@as(usize, consumed) + 1 .. old._radix_len];
+                std.mem.copyForwards(I, old_node.radix_str[0..], olds_new_str);
+                old._radix_len = @intCast(olds_new_str.len);
+                node.children[olds_new_idx] = old;
+
+                self.cursed.* = @bitCast(node);
+                std.debug.assert(self.cursed._radix_len == 0);
+                self.cursed._radix_len = consumed;
+                parent.children[self.idx] = self.cursed.*;
+
+                if (self.path.len == consumed) {
+                    parent.count_minus_1[self.idx] = 0;
+                    parent.data[self.idx] = self.data;
+                    return;
+                }
+
+                std.debug.assert(self.path.len > consumed);
+                parent.count_minus_1[self.idx] = 1;
+                parent.data[self.idx] = .midway;
+                self.idx = self.path[consumed];
+                self.cursed = &node.children[self.idx];
+                self.path = self.path[@as(usize, consumed) + 1 ..];
+                std.debug.assert(self.cursed.isNull());
+                return executeNull(self);
+            },
+        }
+        unreachable;
+    }
 };
 
 const Mode = packed struct(u8) {
@@ -31,7 +205,7 @@ const Mode = packed struct(u8) {
     pub const file: @This() = .{ .k = .visible, .value = true, .r = .deny, .w = .overlay, .x = .allow };
 
     pub const K = enum(u2) {
-        /// This is a mid-way node and does not have it's own data.
+        /// This is a mid-way node and does not have it's own data; may or may not have children
         midway = 0,
         /// The file/dir is visible and present in the original fs
         visible_raw = 1,
@@ -52,57 +226,4 @@ const Mode = packed struct(u8) {
         allow = 2,
         overlay = 3,
     };
-};
-
-const Node = struct {
-    /// Childrens, if they exist
-    ///
-    /// Note that it might seem inticing to place the allocation inline along with one data pointer with
-    /// [options.children_count]?*@This() & ?*options.data but that is actually a prettie bad idea.
-    ///
-    /// Most modern allocators use size classes; since usize is a multiple of 2,
-    /// total size of this block is gonna be same as size class.
-    /// But note that the data pointer must also takes 1 usize; that increases our size class of node allocation and wastes a LOT of space.
-    /// for 64wide register and children_count = 256; that would likely waste ~1KiB atleast if not more
-    children: [children_count]Cursed = children_count ** [1]Cursed{},
-    /// If this is non-null; this node has data
-    data: [children_count]Mode = children_count ** [1]Mode.midway,
-    /// This would have been wasted anyways
-    free: Free = .{},
-
-    comptime {
-        std.debug.assert(@alignOf(@This()) >= children_count);
-        std.debug.assert(@sizeOf(@This()) == node_size.total);
-    }
-
-    /// Use alignment hacks to help store lengths
-    pub const Cursed = packed struct(usize) {
-        upper: @Int(.unsigned, @bitSizeOf(usize) - 8) = 0,
-        count_minus_1: u8 = 0,
-
-        pub fn ptr(self: @This()) ?*Node {
-            var copy = self;
-            copy.count_minus_1 = 0;
-            return @bitCast(copy);
-        }
-    };
-
-    pub const Free = struct {
-        radix_len: u16 = 0,
-        data: [@divExact(node_size.free - 2, @sizeOf(I))]I = undefined,
-
-        comptime {
-            std.debug.assert(@sizeOf(@This()) == node_size.free);
-        }
-    };
-
-    pub fn init(gpa: std.mem.Allocator) !*@This() {
-        const node = try gpa.create(@This());
-        node.* = .{};
-        return node;
-    }
-};
-
-const Slab = struct {
-    children: [256]Node,
 };
