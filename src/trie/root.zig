@@ -17,12 +17,10 @@ const node_size: struct { total: usize, free: usize } = switch (@bitSizeOf(usize
     else => |v| @compileError(std.fmt.comptimePrint("unsupported register width of {d}", .{v})),
 };
 
-const NodePool = struct {};
-
 const nodepopcnt = std.math.log2_int(node_size.total / 2);
 const RadixInt = @Int(.unsigned, nodepopcnt);
 
-const Node = struct {
+pub const Node = struct {
     /// Set the alignment
     _: void align(node_size.total / 2),
     /// Childrens, if they exist
