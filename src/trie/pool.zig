@@ -46,7 +46,7 @@ pub fn init(fd: fd_t) !@This() {
     return self;
 }
 
-const StatxError = error {StatxFailed};
+const StatxError = error{StatxFailed};
 fn getSize(fd: fd_t) !@Tuple(.{ u64, u32 }) {
     var result: linux.Statx = undefined;
     const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &result);
@@ -59,7 +59,7 @@ fn mapFd(fd: fd_t, len: u64) MMapError![]align(page_size_min) u8 {
     return try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .NORESERVE = true, .HUGETLB = true }, fd, 0);
 }
 
-pub const OOB = if (check_oob) error {
+pub const OOB = if (check_oob) error{
     /// The file was invalid and would have done an out of bounds access
     OutOfBounds,
 } else error{};
@@ -72,7 +72,7 @@ pub fn nodeAt(self: *@This(), idx: u24) OOB!*root.Node {
 }
 
 /// Validation error
-const ValidateError = error {
+const ValidateError = error{
     /// The file magic does not match to what was expected
     MagicMismatch,
     /// The file's version is too new. The software is out of date
@@ -124,7 +124,7 @@ pub fn switchEndian(self: *@This(), dest_fd: fd_t) !void {
 
     {
         var blk: Block = self.block().*;
-        blk.endian = switch(blk.endian) {
+        blk.endian = switch (blk.endian) {
             .big => .little,
             .little => .big,
         };
@@ -144,9 +144,9 @@ pub fn switchEndian(self: *@This(), dest_fd: fd_t) !void {
             continue;
         }
 
-        @memcpy(@as([]align(1024) u8, dnode)[0..node.radix_len + 2], @as([]align(1024) u8, node)[0..node.radix_len + 2]);
+        @memcpy(@as([]align(1024) u8, dnode)[0 .. node.radix_len + 2], @as([]align(1024) u8, node)[0 .. node.radix_len + 2]);
         for (dnode.bitset, node.bitset) |*d, s| d.* = @byteSwap(s);
-        for (0.. node.idx_arr.len/3) |j| {
+        for (0..node.idx_arr.len / 3) |j| {
             const a = j * 3;
             const b = a + 1;
             const c = b + 1;
@@ -171,7 +171,7 @@ pub fn acquire(self: @This()) AcquireError!u24 {
     if (blk.free_from >= self.mem.len >> 10) {
         @branchHint(.unlikely);
         blk.free_from = self.mem.len;
-        try self.resize(self.mem.len + (1<<16));
+        try self.resize(self.mem.len + (1 << 16));
     }
 
     std.debug.assert(blk.free_from < self.mem.len >> 10);
@@ -179,7 +179,7 @@ pub fn acquire(self: @This()) AcquireError!u24 {
     return blk.free_from;
 }
 
-const TruncateError = error { ResizeFailed };
+const TruncateError = error{ResizeFailed};
 const ResizeError = TruncateError || std.posix.MRemapError;
 fn resize(self: *@This(), new_len: u63) !void {
     if (linux.ftruncate(self.fd, new_len) != 0) return ResizeError.ResizeFailed;
@@ -198,6 +198,14 @@ pub fn release(self: @This(), idx: u24) void {
         node.indexAt(0xfe).set(blk.free_idx);
         blk.free_idx = idx;
     }
+}
+
+pub fn indexOf(self: *@This(), node: *root.Node) OOB!u24 {
+    const int = @intFromPtr(node);
+    std.debug.assert(int & 0b11_1111_1111 == 0);
+    const mem = @intFromPtr(self.mem.ptr);
+    if (int < mem or int + 1024 > mem + self.mem.len) return OOB.OutOfBounds;
+    return int - mem;
 }
 
 const Endian = enum(u8) {

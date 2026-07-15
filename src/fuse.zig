@@ -6,6 +6,7 @@ pub const c = @cImport({
     @cInclude("/usr/include/fuse3/fuse.h");
     @cInclude("/usr/include/fuse3/fuse_log.h");
 });
+
 /// Retrieves metadata and file attributes for the path, mirroring a standard `stat` call.
 ///
 /// Implementation Notes:

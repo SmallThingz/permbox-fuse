@@ -5,17 +5,9 @@ const mem = @import("mem.zig");
 const Pool = @import("pool.zig");
 
 const native_endian = builtin.cpu.arch.endian();
+const max_depth = 1 << 12;
 const children_count = 1 << 8;
 const RadixInt = u8;
-
-pub const BlkIdx = packed struct(u32) {
-    chr: u8,
-    blk: u24,
-
-    pub fn int(self: @This()) u32 {
-        return @bitCast(self);
-    }
-};
 
 pub const Node = extern struct {
     /// radix string length
@@ -48,17 +40,62 @@ pub const Node = extern struct {
         return .{ .arr = &self.idx_arr, .at = at * 3 };
     }
 
+    pub fn fromIdx(self: u24) Pool.OOB!*@This() {
+        return Pool.global.nodeAt(self);
+    }
+
+    pub fn toIdx(self: *@This()) Pool.OOB!u24 {
+        return Pool.global.indexOf(self);
+    }
+
     /// Acquire a brand new node from the pool and init it with the required values
-    pub fn acquire(pool: *Pool) !*@This() {
-        const node = try pool.acquire();
+    pub fn acquire() !u24 {
+        const node_idx = try Pool.global.acquire();
+        const node = fromIdx(node_idx) catch unreachable;
         node.* = .{};
-        return node;
+        return node_idx;
     }
 
     /// Release the node to the pool; does Not release all the nodes; only this one
-    pub fn releaseOne(self: *@This(), pool: *Pool) void {
+    pub fn releaseOne(self: u24) void {
         self.* = undefined;
-        pool.release(self);
+        Pool.global.release(self);
+    }
+
+    fn release(self: u24, comptime assert_inbounds: bool) if (assert_inbounds) void else (Pool.OOB || PathTooLong)!void {
+        var stack: [max_depth]BlkIdx = undefined;
+        stack[0] = .{ .chr = 0, .idx = self };
+        var len = 1;
+        outer: while (len > 0) {
+            const top = &stack[len - 1];
+            const node = if (assert_inbounds) fromIdx(top.blk) catch unreachable else try fromIdx(top.blk);
+
+            if (len == stack.len) {
+                @branchHint(.cold);
+                for (top.chr..0xff) |i| {
+                    if (node.bitset.isSet(i)) {
+                        const subidx = node.indexAt(top.chr).get();
+                        const subnode = if (assert_inbounds) fromIdx(subidx) catch unreachable else try fromIdx(subidx);
+                        inline for (0..4) |j| {
+                            if (subnode.bitset[j] != 0) return PathTooLong.PathTooLong;
+                        }
+                        Pool.global.release(subidx);
+                    }
+                }
+                len -= 1;
+                continue :outer;
+            }
+
+            for (top.chr..0xff) |i| {
+                if (node.bitset.isSet(i)) {
+                    top.chr = @bitCast(i);
+                    stack[len] = .{ .chr = 0, .blk = node.indexAt(top.chr).get() };
+                    len += 1;
+                    continue :outer;
+                }
+            }
+            len -= 1;
+        }
     }
 
     fn getNextNode(self: *@This(), path: []const u8) union(enum) { this: u8, next: u8, diff: u8 } {
@@ -68,6 +105,21 @@ pub const Node = extern struct {
         const consumed = maybe_consumed.?;
         if (consumed == self.radix_len) return .{ .next = path[self.radix_len] };
         return .{ .diff = consumed };
+    }
+};
+
+const PathTooLong = error{
+    /// The file was invalid or had overlong path.
+    /// the only valid reason for this to happen is if the file was created by a version that supports longer paths.
+    PathTooLong,
+};
+
+pub const BlkIdx = packed struct(u32) {
+    chr: u8,
+    blk: u24,
+
+    pub fn int(self: @This()) u32 {
+        return @bitCast(self);
     }
 };
 
