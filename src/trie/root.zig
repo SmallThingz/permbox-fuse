@@ -2,113 +2,90 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mem = @import("mem.zig");
+const Pool = @import("pool.zig");
 
+const native_endian = builtin.cpu.arch.endian();
 const children_count = 1 << 8;
-const I = u8;
-/// The total size of the node will be 2^8 * (2^2 | 2^3)
-/// Adding the data block makes this  2^8 * (2 + 2^2 | 2 + 2^3) = 1.50 KiB | 2.50KiB
-/// for smp allocatore
-///     for 32 bit closest size class higher than 1.25 KiB is 2KiB; got 0.5KiB = 2^8 * 3
-///     for 64 bit closest size class higher than 2.25 KiB is 4KiB; got 1.5KiB = 2^8 * 7
-const node_size: struct { total: usize, free: usize } = switch (@bitSizeOf(usize)) {
-    32 => @compileError("TODO: add 32 bit support"),
-    // 32 => .{ .total = 1 << 11, .free = (1 << 8) * 2 },
-    64 => .{ .total = 1 << 12, .free = (1 << 8) * 6 },
-    else => |v| @compileError(std.fmt.comptimePrint("unsupported register width of {d}", .{v})),
+const RadixInt = u8;
+
+pub const BlkIdx = packed struct(u32) {
+    chr: u8,
+    blk: u24,
+
+    pub fn int(self: @This()) u32 {
+        return @bitCast(self);
+    }
 };
 
-const nodepopcnt = std.math.log2_int(node_size.total / 2);
-const RadixInt = @Int(.unsigned, nodepopcnt);
-
-pub const Node = struct {
-    /// Set the alignment
-    _: void align(node_size.total / 2),
-    /// Childrens, if they exist
-    ///
-    /// Note that it might seem inticing to place the allocation inline along with one data pointer with
-    /// [options.children_count]?*@This() & ?*options.data but that is actually a prettie bad idea.
-    ///
-    /// Most modern allocators use size classes; since usize is a multiple of 2,
-    /// total size of this block is gonna be same as size class.
-    /// But note that the data pointer must also takes 1 usize; that increases our size class of node allocation and wastes a LOT of space.
-    /// for 64wide register and children_count = 256; that would likely waste ~1KiB atleast if not more
-    children: [children_count]Cursed = children_count ** [1]Cursed{},
-    /// The count for the childrens
-    count_minus_1: [children_count]I = undefined,
-    /// If this is non-null; this node has data
-    data: [children_count]Mode = children_count ** [1]Mode.midway,
-
-    /// This would have been wasted anyways
-    radix_str: [@divExact(node_size.free, @sizeOf(I))]I = undefined,
+pub const Node = extern struct {
+    /// radix string length
+    radix_len: u8 = 0,
+    /// The data associated with the current node
+    data: Mode,
+    /// the actual storage for radix string
+    radix_str: [children_count - 2 - (8 * 4)]u8 = undefined,
+    /// If n't bit is set means nt'h index has an actual subnode; otherwise it's data
+    bitset: std.bit_set.ArrayBitSet(u64, 4) = .empty,
+    /// The indexes to the sub-nodes; 24 bits each
+    idx_arr: [children_count * 3]u8 = (children_count * 3) ** [_]u8{0},
 
     comptime {
-        std.debug.assert(@alignOf(@This()) >= children_count);
-        std.debug.assert(@sizeOf(@This()) == node_size.total);
+        std.debug.assert(@sizeOf(@This()) == 1 << 10);
     }
 
-    pub fn init(gpa: std.mem.Allocator) !*@This() {
-        const node = try gpa.create(@This());
+    pub fn indexAt(self: *@This(), at: u8) struct {
+        arr: *[children_count * 3]u8,
+        at: u16,
+
+        pub fn get(me: @This()) u24 {
+            return std.mem.readInt(u24, &me.arr[me.at][0..3], native_endian);
+        }
+
+        pub fn set(me: @This(), val: u24) void {
+            return std.mem.writeInt(u24, &me.arr[me.at][0..3], val, native_endian);
+        }
+    } {
+        return .{ .arr = &self.idx_arr, .at = at * 3 };
+    }
+
+    /// Acquire a brand new node from the pool and init it with the required values
+    pub fn acquire(pool: *Pool) !*@This() {
+        const node = try pool.acquire();
         node.* = .{};
         return node;
     }
 
-    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        gpa.destroy(self);
+    /// Release the node to the pool; does Not release all the nodes; only this one
+    pub fn releaseOne(self: *@This(), pool: *Pool) void {
+        self.* = undefined;
+        pool.release(self);
     }
 
-    fn firstChild(self: *Node) ?I {
-        for (self.children, 0..) |c, i| {
-            if (!c.isNull()) return @intCast(i);
-        }
-        return null;
-    }
-};
+    fn getNextNode(self: *@This(), path: []const u8) union(enum) { this: u8, next: u8, diff: u8 } {
+        const maybe_consumed = mem.findDiff(u8, self.radix_str[0..self.radix_len], path[0 .. path.len - 1]);
+        if (maybe_consumed == null) return .{ .idx = path[path.len - 1] };
 
-/// Use alignment hacks to store lengths
-pub const Cursed = packed struct(usize) {
-    /// Zero length means this is the terminal node; we are setting the upper part anyways so no harm in setting this too.
-    _radix_len: RadixInt = 0,
-    /// The upper part of the pointer; this being 0 means the node is null.
-    _upper: @Int(.unsigned, @bitSizeOf(usize) - nodepopcnt) = 0,
-
-    pub inline fn isNull(self: *const @This()) bool {
-        // The lower part must be 0 if the upper is 0
-        return @as(usize, @bitCast(self.underlying)) == 0;
-    }
-
-    pub inline fn ptr(self: *const @This()) ?*Node {
-        return @bitCast(Cursed{ ._upper = self._upper });
-    }
-
-    fn getNextNode(self: *@This(), path: [:0]const I) union(enum) { this, node: I, consumed: RadixInt } {
-        const node = self.ptr().?;
-        const maybe_consumed = mem.findDiff(I, node.radix_str[0..self._radix_len], path);
-        if (maybe_consumed) |consumed| {
-            if (consumed == self._radix_len) return .{ .node = path[consumed] };
-            return .{ .consumed = consumed };
-        } else {
-            return .this;
-        }
-    }
-
-    fn getParent(self: *@This(), self_idx: I) *Node {
-        const field = "children";
-        const start = (@as([*]@This(), @ptrCast(self)) - self_idx);
-        return @fieldParentPtr(field, @as(@FieldType(Node, field), @ptrCast(start)));
+        const consumed = maybe_consumed.?;
+        if (consumed == self.radix_len) return .{ .next = path[self.radix_len] };
+        return .{ .diff = consumed };
     }
 };
 
 const OpAdd = struct {
     /// The current edge we are on
-    cursed: *Cursed,
+    parent: *Node,
+    /// The index of the current node inside of the parent
+    idx_in_parent: u8,
+
+    /// offset in mem
+    offset: u34,
+
     /// The path that is left
     path: []const u8,
     /// The data we wanna add at the given path
     data: Mode,
-    /// Index of `cursed` inside its parent's children array
-    idx: u8,
     /// The allocator used to allocate and free nodes
-    gpa: std.mem.Allocator,
+    gpa: *Pool,
 
     fn executeNull(self: *const OpAdd) !void {
         std.debug.assert(self.cursed.isNull());
@@ -229,7 +206,6 @@ const OpAdd = struct {
         }
     }
 };
-
 
 const Mode = packed struct(u8) {
     /// Dicatates the kind of node
