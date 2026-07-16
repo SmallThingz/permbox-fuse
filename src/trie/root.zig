@@ -486,9 +486,12 @@ pub const Mode = packed struct(u8) {
         overlay = 3,
     };
 };
+
+const testing = std.testing;
+
 // Helper to compare packed structs safely
 fn expectModeEqual(expected: Mode, actual: Mode) !void {
-    try std.testing.expectEqual(@as(u8, @bitCast(expected)), @as(u8, @bitCast(actual)));
+    try testing.expectEqual(@as(u8, @bitCast(expected)), @as(u8, @bitCast(actual)));
 }
 
 fn ensurePoolInitialized() !void {
@@ -496,12 +499,9 @@ fn ensurePoolInitialized() !void {
     Pool.global = try Pool.init(fd);
 }
 
-test "init pool" {
-    try ensurePoolInitialized();
-}
-
 test "trie exhaustive subsets (add, get, overwrite, del)" {
-    const gpa = std.testing.allocator;
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
 
     // Generate all paths with chars 'a' and 'b' up to length 3
     // Total paths: 2^1 + 2^2 + 2^3 = 14 paths
@@ -542,10 +542,10 @@ test "trie exhaustive subsets (add, get, overwrite, del)" {
         for (0..14) |i| {
             const res = try get(paths[i]);
             if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                try std.testing.expect(res != null);
+                try testing.expect(res != null);
                 try expectModeEqual(Mode.file, res.?);
             } else {
-                try std.testing.expectEqual(@as(?Mode, null), res);
+                try testing.expectEqual(@as(?Mode, null), res);
             }
         }
 
@@ -560,13 +560,15 @@ test "trie exhaustive subsets (add, get, overwrite, del)" {
         // 5. Verify all are null after deletion
         for (0..14) |i| {
             const res = try get(paths[i]);
-            try std.testing.expectEqual(@as(?Mode, null), res);
+            try testing.expectEqual(@as(?Mode, null), res);
         }
     }
 }
 
 test "trie randomized fuzz test" {
-    const gpa = std.testing.allocator;
+    if (!builtin.fuzz) return error.SkipZigTest;
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(12345);
     const random = prng.random();
 
@@ -609,7 +611,7 @@ test "trie randomized fuzz test" {
                 _ = try del(path);
                 _ = ref.remove(path);
             } else {
-                try std.testing.expectError(error.NotFound, del(path));
+                try testing.expectError(error.NotFound, del(path));
             }
         }
 
@@ -618,17 +620,18 @@ test "trie randomized fuzz test" {
             const r = ref.get(p);
             const t = try get(p);
             if (r) |rv| {
-                try std.testing.expect(t != null);
+                try testing.expect(t != null);
                 try expectModeEqual(rv, t.?);
             } else {
-                try std.testing.expectEqual(@as(?Mode, null), t);
+                try testing.expectEqual(@as(?Mode, null), t);
             }
         }
     }
 }
 
 test "trie deep path string limit and partial shift" {
-    const gpa = std.testing.allocator;
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
 
     // The trie's radix_str capacity is 222 bytes.
     // We want to test the case where top_len + 1 + left_len > 222
@@ -663,34 +666,36 @@ test "trie deep path string limit and partial shift" {
     // because top_len (200) + 1 + left_len (30) = 231 > 222
     _ = try del(p2);
 
-    try std.testing.expectEqual(@as(?Mode, null), try get(p2));
+    try testing.expectEqual(@as(?Mode, null), try get(p2));
     try expectModeEqual(Mode.dir, (try get(p1)).?);
     try expectModeEqual(Mode.dir, (try get(p3)).?);
 
     // Delete p1. This triggers the partial shift logic again
     _ = try del(p1);
 
-    try std.testing.expectEqual(@as(?Mode, null), try get(p1));
+    try testing.expectEqual(@as(?Mode, null), try get(p1));
     try expectModeEqual(Mode.dir, (try get(p3)).?);
 
     // Delete p3
     _ = try del(p3);
-    try std.testing.expectEqual(@as(?Mode, null), try get(p3));
+    try testing.expectEqual(@as(?Mode, null), try get(p3));
 }
 
 test "trie delete non-existent and empty" {
-    try std.testing.expectError(error.NotFound, del("a"));
+    try ensurePoolInitialized();
+    try testing.expectError(error.NotFound, del("a"));
 
     try add("a", Mode.dir);
-    try std.testing.expectError(error.NotFound, del("b"));
-    try std.testing.expectError(error.NotFound, del("aa"));
+    try testing.expectError(error.NotFound, del("b"));
+    try testing.expectError(error.NotFound, del("aa"));
 
     _ = try del("a");
-    try std.testing.expectError(error.NotFound, del("a"));
+    try testing.expectError(error.NotFound, del("a"));
 }
 
 test "trie procedural forward and backward insertion/deletion" {
-    const gpa = std.testing.allocator;
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
 
     // Generate all paths with chars 'a' and 'b' up to length 5
     // Total paths: 2^1 + 2^2 + 2^3 + 2^4 + 2^5 = 62 paths
@@ -719,7 +724,7 @@ test "trie procedural forward and backward insertion/deletion" {
     // Verify all were inserted
     for (paths) |p| {
         const res = try get(p);
-        try std.testing.expect(res != null);
+        try testing.expect(res != null);
         try expectModeEqual(Mode.dir, res.?);
     }
 
@@ -737,9 +742,9 @@ test "trie procedural forward and backward insertion/deletion" {
     for (0..paths.len) |i| {
         const res = try get(paths[i]);
         if (i % 3 == 0) {
-            try std.testing.expectEqual(@as(?Mode, null), res);
+            try testing.expectEqual(@as(?Mode, null), res);
         } else {
-            try std.testing.expect(res != null);
+            try testing.expect(res != null);
             try expectModeEqual(Mode.dir, res.?);
         }
     }
@@ -756,10 +761,10 @@ test "trie procedural forward and backward insertion/deletion" {
     for (0..paths.len) |i| {
         const res = try get(paths[i]);
         if (i % 3 == 0) {
-            try std.testing.expect(res != null);
+            try testing.expect(res != null);
             try expectModeEqual(Mode.file, res.?);
         } else {
-            try std.testing.expect(res != null);
+            try testing.expect(res != null);
             try expectModeEqual(Mode.dir, res.?);
         }
     }
@@ -772,7 +777,7 @@ test "trie procedural forward and backward insertion/deletion" {
     }
 
     for (paths) |p| {
-        try std.testing.expectEqual(@as(?Mode, null), try get(p));
+        try testing.expectEqual(@as(?Mode, null), try get(p));
     }
 
     // ==========================================
@@ -789,7 +794,7 @@ test "trie procedural forward and backward insertion/deletion" {
     while (i > 0) {
         i -= 1;
         const res = try get(paths[i]);
-        try std.testing.expect(res != null);
+        try testing.expect(res != null);
         try expectModeEqual(Mode.dir, res.?);
     }
 
@@ -802,19 +807,20 @@ test "trie procedural forward and backward insertion/deletion" {
         _ = try del(paths[i]);
 
         // Ensure the deleted one is gone
-        try std.testing.expectEqual(@as(?Mode, null), try get(paths[i]));
+        try testing.expectEqual(@as(?Mode, null), try get(paths[i]));
 
         // Ensure all previous items in the array still exist
         for (0..i) |j| {
             const res = try get(paths[j]);
-            try std.testing.expect(res != null);
+            try testing.expect(res != null);
             try expectModeEqual(Mode.dir, res.?);
         }
     }
 }
 
 test "trie deep path chains (length 4)" {
-    const gpa = std.testing.allocator;
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
 
     // Generate all paths up to length 4 (2+4+8+16 = 30 paths)
     var paths: [30][]const u8 = undefined;
@@ -840,7 +846,7 @@ test "trie deep path chains (length 4)" {
     // Verify all exist
     for (paths) |p| {
         const res = try get(p);
-        try std.testing.expect(res != null);
+        try testing.expect(res != null);
         try expectModeEqual(Mode.dir, res.?);
     }
 
@@ -848,7 +854,7 @@ test "trie deep path chains (length 4)" {
     for (paths) |p| {
         _ = try del(p);
         const res = try get(p);
-        try std.testing.expectEqual(@as(?Mode, null), res);
+        try testing.expectEqual(@as(?Mode, null), res);
     }
 
     // Re-add and delete in reverse order (longest to shortest)
@@ -861,18 +867,19 @@ test "trie deep path chains (length 4)" {
         i -= 1;
         _ = try del(paths[i]);
         const res = try get(paths[i]);
-        try std.testing.expectEqual(@as(?Mode, null), res);
+        try testing.expectEqual(@as(?Mode, null), res);
 
         // Ensure earlier items still exist
         for (0..i) |j| {
             const r = try get(paths[j]);
-            try std.testing.expect(r != null);
+            try testing.expect(r != null);
             try expectModeEqual(Mode.file, r.?);
         }
     }
 }
 
 test "trie edge cases and merges" {
+    try ensurePoolInitialized();
     // Test adding and removing paths that cause repeated splits and merges
     const p1 = "a";
     const p2 = "ab";
@@ -888,13 +895,13 @@ test "trie edge cases and merges" {
 
     // Delete from the middle
     _ = try del(p3);
-    try std.testing.expectEqual(@as(?Mode, null), try get(p3));
-    try std.testing.expect(try get(p4) != null);
-    try std.testing.expect(try get(p5) != null);
+    try testing.expectEqual(@as(?Mode, null), try get(p3));
+    try testing.expect(try get(p4) != null);
+    try testing.expect(try get(p5) != null);
 
     // Re-add it
     try add(p3, Mode.file);
-    try std.testing.expect(try get(p3) != null);
+    try testing.expect(try get(p3) != null);
 
     // Delete all
     _ = try del(p1);
@@ -903,9 +910,423 @@ test "trie edge cases and merges" {
     _ = try del(p4);
     _ = try del(p5);
 
-    try std.testing.expectEqual(@as(?Mode, null), try get(p1));
-    try std.testing.expectEqual(@as(?Mode, null), try get(p2));
-    try std.testing.expectEqual(@as(?Mode, null), try get(p3));
-    try std.testing.expectEqual(@as(?Mode, null), try get(p4));
-    try std.testing.expectEqual(@as(?Mode, null), try get(p5));
+    try testing.expectEqual(@as(?Mode, null), try get(p1));
+    try testing.expectEqual(@as(?Mode, null), try get(p2));
+    try testing.expectEqual(@as(?Mode, null), try get(p3));
+    try testing.expectEqual(@as(?Mode, null), try get(p4));
+    try testing.expectEqual(@as(?Mode, null), try get(p5));
+}
+
+// --- Permutation Helper ---
+fn nextPermutation(comptime T: type, array: []T) bool {
+    if (array.len <= 1) return false;
+    var i: usize = array.len - 1;
+    while (true) {
+        const j = i;
+        i -= 1;
+        if (array[i] < array[j]) {
+            var k = array.len - 1;
+            while (array[i] >= array[k]) k -= 1;
+            std.mem.swap(T, &array[i], &array[k]);
+            std.mem.reverse(T, array[j..]);
+            return true;
+        }
+        if (i == 0) {
+            std.mem.reverse(T, array);
+            return false;
+        }
+    }
+}
+
+// --- Structural & Allocation Invariants ---
+fn checkAllocationInvariant() !void {
+    const blk = Pool.global.block();
+    if (blk.free_from > 2) {
+        try testing.expect(blk.free_idx == 0 or blk.free_idx < blk.free_from);
+    }
+    try testing.expect(blk.root < blk.free_from);
+}
+
+fn checkStructuralInvariants() !void {
+    const gpa = testing.allocator;
+    var visited = std.AutoHashMap(u24, void).init(gpa);
+    defer visited.deinit();
+
+    const blk = Pool.global.block();
+    try visitNode(@intCast(blk.root), &visited);
+
+    // Count free list size
+    var free_count: u32 = 0;
+    var curr_free = blk.free_idx;
+    while (curr_free != 0) {
+        free_count += 1;
+        const node = try Pool.global.nodeAt(@intCast(curr_free));
+        curr_free = node.indexAt(0xfe).get();
+    }
+
+    // Total nodes = reachable (includes root) + free + 1 (block 0)
+    try testing.expectEqual(@as(u32, @intCast(visited.count())) + free_count + 1, blk.free_from);
+}
+
+fn visitNode(idx: u24, visited: *std.AutoHashMap(u24, void)) !void {
+    if (idx == 0) return;
+    if (visited.contains(idx)) return error.CycleDetected;
+    try visited.put(idx, {});
+
+    const node = try Pool.global.nodeAt(idx);
+    if (node.radix_len > node.radix_str.len) return error.RadixLenTooLarge;
+
+    var iter = node.bitset.iterator(.{});
+    while (iter.next()) |i| {
+        const child_idx = node.indexAt(@intCast(i)).get();
+        if (child_idx == 0) return error.BitSetChildIsZero;
+        try visitNode(child_idx, visited);
+    }
+}
+
+// --- 1. Exhaust every insertion permutation ---
+test "1. exhaustive insertion permutations" {
+    try ensurePoolInitialized();
+    const paths = [_][]const u8{ "a", "ab", "aba", "abb", "abc" };
+    var perm = [_]usize{ 0, 1, 2, 3, 4 };
+
+    var first = true;
+    while (first or nextPermutation(usize, &perm)) {
+        first = false;
+        // Clear trie
+        for (paths) |p| _ = del(p) catch {};
+
+        for (perm) |i| try add(paths[i], Mode.dir);
+        for (paths) |p| try testing.expect(try get(p) != null);
+
+        var j: usize = perm.len;
+        while (j > 0) {
+            j -= 1;
+            _ = try del(paths[perm[j]]);
+        }
+
+        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try get(p));
+
+        try checkStructuralInvariants();
+        try checkAllocationInvariant();
+    }
+}
+
+// --- 2. Exhaust every delete permutation ---
+test "2. exhaustive delete permutations" {
+    try ensurePoolInitialized();
+    const paths = [_][]const u8{ "a", "ab", "aba", "abb", "abc" };
+    var perm = [_]usize{ 0, 1, 2, 3, 4 };
+
+    for (paths) |p| try add(p, Mode.dir);
+
+    var first = true;
+    while (first or nextPermutation(usize, &perm)) {
+        first = false;
+        // Reset trie
+        for (paths) |p| _ = del(p) catch {};
+        for (paths) |p| try add(p, Mode.dir);
+
+        for (perm) |i| {
+            _ = try del(paths[i]);
+        }
+
+        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try get(p));
+        try checkStructuralInvariants();
+        try checkAllocationInvariant();
+    }
+}
+
+// --- 3. Exhaust every split point ---
+test "3. exhaust every split point" {
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
+
+    for (0..30) |split_idx| {
+        const p1 = try gpa.alloc(u8, 30);
+        defer gpa.free(p1);
+        @memset(p1, 'a');
+
+        const p2 = try gpa.alloc(u8, 30);
+        defer gpa.free(p2);
+        @memset(p2, 'a');
+        p2[split_idx] = 'b';
+
+        try add(p1, Mode.dir);
+        try add(p2, Mode.file);
+
+        try expectModeEqual(Mode.dir, (try get(p1)).?);
+        try expectModeEqual(Mode.file, (try get(p2)).?);
+
+        _ = try del(p1);
+        _ = try del(p2);
+
+        try checkStructuralInvariants();
+        try checkAllocationInvariant();
+    }
+}
+
+// --- 4. Root replacement torture ---
+test "4. root replacement torture" {
+    try ensurePoolInitialized();
+    const paths = [_][]const u8{ "a", "ab", "abc", "abcd", "abcde" };
+
+    for (paths) |p| try add(p, Mode.dir);
+    // Delete backwards
+    var i = paths.len;
+    while (i > 0) {
+        i -= 1;
+        _ = try del(paths[i]);
+        try checkStructuralInvariants();
+    }
+
+    // Re-add and delete forwards
+    for (paths) |p| try add(p, Mode.file);
+    for (paths) |p| _ = try del(p);
+
+    try checkStructuralInvariants();
+    try checkAllocationInvariant();
+}
+
+// --- 5 & 8. Alternate split/merge (Oscillating tree) ---
+test "5 & 8. alternate split/merge oscillating tree" {
+    try ensurePoolInitialized();
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        try add("a", Mode.dir);
+        try add("ab", Mode.dir);
+        try add("abc", Mode.dir);
+
+        _ = try del("ab");
+        try add("ab", Mode.file);
+
+        _ = try del("a");
+        try add("a", Mode.file);
+
+        _ = try del("abc");
+        try add("abc", Mode.file);
+
+        if (i % 100 == 0) {
+            try checkStructuralInvariants();
+            try checkAllocationInvariant();
+        }
+    }
+    _ = try del("a");
+    _ = try del("ab");
+    _ = try del("abc");
+}
+
+// --- 6. Every possible common prefix ---
+test "6. every possible common prefix" {
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
+    const capacity = (Node{}).radix_str.len; // 222
+
+    for (0..capacity + 1) |prefix_len| {
+        const p1 = try gpa.alloc(u8, prefix_len + 1);
+        defer gpa.free(p1);
+        const p2 = try gpa.alloc(u8, prefix_len + 1);
+        defer gpa.free(p2);
+
+        @memset(p1[0..prefix_len], 'a');
+        @memset(p2[0..prefix_len], 'a');
+        p1[prefix_len] = 'X';
+        p2[prefix_len] = 'Y';
+
+        try add(p1, Mode.dir);
+        try add(p2, Mode.file);
+
+        try expectModeEqual(Mode.dir, (try get(p1)).?);
+        try expectModeEqual(Mode.file, (try get(p2)).?);
+
+        _ = try del(p1);
+        _ = try del(p2);
+    }
+    try checkStructuralInvariants();
+}
+
+// --- 7. Long linear chain ---
+test "7. long linear chain" {
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
+    var paths = std.ArrayList([]u8).empty;
+    defer {
+        for (paths.items) |p| gpa.free(p);
+        paths.deinit(gpa);
+    }
+
+    // Create paths up to length 224
+    for (1..225) |len| {
+        const p = try gpa.alloc(u8, len);
+        @memset(p, 'a');
+        try paths.append(gpa, p);
+    }
+
+    for (paths.items) |p| try add(p, Mode.dir);
+
+    // Delete from middle outward
+    var low: usize = paths.items.len / 2;
+    var high = low + 1;
+    while (true) {
+        _ = try del(paths.items[low]);
+        if (high < paths.items.len) {
+            _ = try del(paths.items[high]);
+            high += 1;
+        }
+        if (low == 0) break;
+        low -%= 1;
+    }
+    // Clean up the rest (should be none, but safe)
+    for (paths.items) |p| _ = del(p) catch {};
+
+    try checkStructuralInvariants();
+}
+
+// --- 9. Free list reuse ---
+test "9. free list reuse" {
+    try ensurePoolInitialized();
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        try add("a", Mode.dir);
+        _ = try del("a");
+    }
+    // After oscillating, free_from should be exactly at the root + 1
+    try testing.expectEqual(@as(u32, 2), Pool.global.block().free_from);
+    try checkAllocationInvariant();
+}
+
+// --- 10. Maximum branching ---
+test "10. maximum branching" {
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
+    const paths = try gpa.alloc([]const u8, 256);
+    defer gpa.free(paths);
+
+    var buf: [1]u8 = undefined;
+    for (0..256) |i| {
+        buf[0] = @intCast(i);
+        paths[i] = try gpa.dupe(u8, &buf);
+    }
+    defer for (paths) |p| gpa.free(p);
+
+    for (paths) |p| try add(p, Mode.dir);
+    try checkStructuralInvariants();
+
+    // Delete forwards
+    for (paths) |p| _ = try del(p);
+    try checkStructuralInvariants();
+
+    // Re-add and delete backwards
+    for (paths) |p| try add(p, Mode.file);
+    var i: usize = paths.len;
+    while (i > 0) {
+        i -= 1;
+        _ = try del(paths[i]);
+    }
+    try checkStructuralInvariants();
+}
+
+// --- 11. Prefix/non-prefix combinations ---
+test "11. prefix/non-prefix combinations" {
+    try ensurePoolInitialized();
+    const paths = [_][]const u8{ "a", "ab", "abc", "abcd", "abcde" };
+    var perm = [_]usize{ 0, 1, 2, 3, 4 };
+
+    const total_subsets = @as(usize, 1) << paths.len;
+    for (0..total_subsets) |subset_mask| {
+        // Insert subset
+        for (0..paths.len) |i| {
+            if ((subset_mask & (@as(usize, 1) << @intCast(i))) != 0) {
+                try add(paths[i], Mode.dir);
+            }
+        }
+
+        // Delete in every permutation
+        var first = true;
+        while (first or nextPermutation(usize, &perm)) {
+            first = false;
+            // Re-insert if missing
+            for (0..paths.len) |i| {
+                if ((subset_mask & (@as(usize, 1) << @intCast(i))) != 0) {
+                    if (try get(paths[i]) == null) {
+                        try add(paths[i], Mode.dir);
+                    }
+                }
+            }
+
+            for (perm) |i| {
+                if ((subset_mask & (@as(usize, 1) << @intCast(i))) != 0) {
+                    _ = try del(paths[i]);
+                }
+            }
+        }
+        try checkStructuralInvariants();
+    }
+}
+
+// --- 12. Random long paths ---
+test "12. random long paths" {
+    try ensurePoolInitialized();
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(54321);
+    const random = prng.random();
+
+    var ref = std.StringHashMap(Mode).init(gpa);
+    defer ref.deinit();
+
+    var i: usize = 0;
+    while (i < 50_000) : (i += 1) {
+        const len = random.intRangeLessThan(usize, 1, 250);
+        const path = try gpa.alloc(u8, len);
+        defer gpa.free(path);
+        for (path) |*c| c.* = random.int(u8);
+
+        const op = random.intRangeLessThan(u8, 0, 3);
+        if (op == 0 or op == 1) {
+            const data: Mode = if (op == 0) Mode.dir else Mode.file;
+            try add(path, data);
+            // We can't easily put stack allocated slice in hashmap, so dupe it
+            const owned = try gpa.dupe(u8, path);
+            const gop = try ref.getOrPut(owned);
+            if (gop.found_existing) gpa.free(owned) else gop.value_ptr.* = data;
+            gop.value_ptr.* = data;
+        } else {
+            if (ref.fetchRemove(path)) |entry| {
+                _ = try del(entry.key);
+                gpa.free(entry.key);
+            } else {
+                try testing.expectError(error.NotFound, del(path));
+            }
+        }
+
+        if (i % 1000 == 0) {
+            try checkStructuralInvariants();
+        }
+    }
+
+    // Cleanup
+    var it = ref.iterator();
+    while (it.next()) |entry| {
+        _ = try del(entry.key_ptr.*);
+        gpa.free(entry.key_ptr.*);
+    }
+    try checkStructuralInvariants();
+}
+
+// --- 13. Repeated overwrite ---
+test "13. repeated overwrite" {
+    try ensurePoolInitialized();
+    const blk = Pool.global.block();
+    const start_free_from = blk.free_from;
+
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        try add("path", Mode.dir);
+        try add("path", Mode.file);
+        try add("path", Mode.dir);
+    }
+
+    // No new nodes should have been allocated
+    try testing.expectEqual(start_free_from, blk.free_from);
+    _ = try del("path");
 }
