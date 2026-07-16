@@ -28,7 +28,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                 node.indexAt(idx).set(data);
             }
         },
-        .node => |idx| { // Go to next node
+        .next => |idx| { // Go to next node
             path = path[node.radix_len + 1 ..];
             std.debug.assert(path.len != 0);
             index_at = node.indexAt(idx);
@@ -58,7 +58,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                 const new = fromIdx(new_idx) catch unreachable;
                 var current = new;
                 while (true) {
-                    current.radix_len = @min(path.len - 1, node.radix_str.len);
+                    current.radix_len = @min(path.len - 1, current.radix_str.len);
                     current.data = .midway;
                     @memcpy(current.radix_str[0..current.radix_len], path[0..current.radix_len]);
 
@@ -85,14 +85,14 @@ pub fn add(_path: []const u8, data: Mode) !void {
                 new.radix_len = idx;
                 new.data = node.data;
                 @memcpy(new.radix_str[0..idx], node.radix_str[0..idx]);
-                new.bitset.set(left_idx);
+                new.bitset.set(node.radix_str[idx]);
                 new.indexAt(node.radix_str[idx]).set(left_idx);
 
                 if (need_right) {
-                    new.bitset.set(right_idx);
+                    new.bitset.set(ogpath[idx]);
                     new.indexAt(ogpath[idx]).set(right_idx);
                 } else {
-                    new.indexAt(idx).set(data);
+                    new.indexAt(ogpath[idx]).set(data);
                 }
 
                 break :init new_idx;
@@ -120,6 +120,7 @@ pub fn get(_path: []const u8) !?Mode {
         .this => |idx| {
             if (node.bitset.isSet(idx)) {
                 const sub = try node.indexAt(idx).getNode();
+                if (sub.data == .midway) return null;
                 return sub.data;
             } else {
                 const val = node.indexAt(idx).get();
@@ -210,7 +211,7 @@ pub fn del(_path: []const u8) !Mode {
 
             if (!child.is_node) {
                 const child_data: Mode = @enumFromInt(@as(u8, @truncate(child.val)));
-                if (top_node.radix_len + 1 >= top_node.radix_str.len) {
+                if (top_node.radix_len + 1 > top_node.radix_str.len) {
                     return old_data;
                 }
                 top_node.radix_str[top_node.radix_len] = left_byte_idx;
@@ -225,35 +226,29 @@ pub fn del(_path: []const u8) !Mode {
             }
 
             const left_node_idx = child.val;
-            const left_node = try Node.fromIdx(left_node_idx);
+            const left_node = try fromIdx(left_node_idx);
 
             const top_len = top_node.radix_len;
             const left_len = left_node.radix_len;
             const new_len = @as(usize, top_len) + 1 + left_len;
 
-            if (new_len > left_node.radix_str.len) {
-                // we can and should merge this [shift strings up in a chain] but skipping it for now
+            if (new_len <= left_node.radix_str.len) {
+                const old_top_idx = index_at.get();
+
+                // -> CRITICAL SECTION
+                const offset = top_len + 1;
+                std.mem.copyBackwards(u8, left_node.radix_str[offset .. offset + left_len], left_node.radix_str[0..left_len]);
+                @memcpy(left_node.radix_str[0..top_len], top_node.radix_str[0..top_len]);
+                left_node.radix_str[top_len] = left_byte_idx;
+                left_node.radix_len = @intCast(new_len);
+                index_at.set(left_node_idx);
+                // <- CRITICAL SECTION
+
+                releaseOne(old_top_idx);
                 return old_data;
             }
 
-            const old_top_idx = index_at.get();
-
-            // -> CRITICAL SECTION
-            // Shift left_node's string to the right
-            var i: usize = left_len;
-            while (i > 0) {
-                i -= 1;
-                left_node.radix_str[i + top_len + 1] = left_node.radix_str[i];
-            }
-            // Copy top_node's string to the beginning
-            @memcpy(left_node.radix_str[0..top_len], top_node.radix_str[0..top_len]);
-            left_node.radix_str[top_len] = left_byte_idx;
-            left_node.radix_len = @intCast(new_len);
-            index_at.set(left_node_idx);
-            // <- CRITICAL SECTION
-
-            releaseOne(old_top_idx);
-
+            // TODO: we can and should merge this [shift strings up in a chain of these ] but skipping it for now
             return old_data;
         },
         .next => |idx| {
@@ -292,12 +287,12 @@ fn acquire() !u24 {
 }
 
 /// Release the node to the pool; does Not release all the nodes; only this one
-fn releaseOne(self: u24) void {
-    Pool.global.release(self);
+fn releaseOne(idx: u24) void {
+    Pool.global.release(idx);
 }
 
-fn fromIdx(self: u24) Pool.OOB!*Node() {
-    return Pool.global.nodeAt(self);
+fn fromIdx(idx: u24) Pool.OOB!*Node {
+    return Pool.global.nodeAt(idx);
 }
 
 /// Releases a whole line of nodes starting from `start_idx`.
@@ -334,13 +329,13 @@ pub const Node = extern struct {
     /// If n't bit is set means nt'h index has an actual subnode; otherwise it's data
     bitset: Bitset = .empty,
     /// The indexes to the sub-nodes; 24 bits each
-    idx_arr: [children_count * 3]u8 = (children_count * 3) ** [_]u8{0},
+    idx_arr: [children_count * 3]u8 = [_]u8{0} ** (children_count * 3),
 
     comptime {
         std.debug.assert(@sizeOf(@This()) == 1 << 10);
     }
 
-    const Bitset = std.bit_set.ArrayBitSet(u64, 4);
+    const Bitset = std.bit_set.ArrayBitSet(u64, children_count);
 
     const IndexAt = struct {
         arr: *[children_count * 3]u8,
@@ -380,12 +375,12 @@ pub const Node = extern struct {
     }
 
     fn valcntbounded(self: *@This(), comptime less_than: comptime_int) u8 {
-        const bitsetcnt: u8 = self.bitset.count();
+        var bitsetcnt: u8 = self.bitset.count();
         if (bitsetcnt >= less_than) return less_than;
-        inline for (0..children_count) |i| {
-            if (!self.bitset.isSet(i) and @as(u8, @truncate(self.indexAt(i).get())) != 0) {
+        for (0..children_count) |i| {
+            if (!self.bitset.isSet(i) and self.indexAt(@intCast(i)).get() != 0) {
                 bitsetcnt += 1;
-                if (bitsetcnt == less_than) {
+                if (bitsetcnt >= less_than) {
                     @branchHint(.unlikely);
                     return less_than;
                 }
@@ -400,7 +395,7 @@ pub const Node = extern struct {
             const idx: u8 = @intCast(i);
             return .{ .idx = idx, .is_node = true, .val = self.indexAt(idx).get() };
         }
-        inline for (0..children_count) |i| {
+        for (0..children_count) |i| {
             const val = self.indexAt(@intCast(i)).get();
             if (val != 0) {
                 return .{ .idx = @intCast(i), .is_node = false, .val = val };
@@ -421,7 +416,7 @@ pub const BlkIdx = packed struct(u32) {
     blk: u24,
 
     pub fn int(self: @This()) u32 {
-        return @bitCast(self);
+        return @as(u32, @bitCast(self));
     }
 };
 
@@ -438,8 +433,8 @@ pub const Mode = packed struct(u8) {
     x: A,
 
     pub const midway: @This() = @bitCast(0);
-    pub const dir: @This() = .{ .k = .visible, .r = .allow, .w = .overlay, .x = .allow };
-    pub const file: @This() = .{ .k = .visible, .r = .deny, .w = .overlay, .x = .allow };
+    pub const dir: @This() = .{ .k = .visible_raw, .r = .allow, .w = .overlay, .x = .allow };
+    pub const file: @This() = .{ .k = .visible_raw, .r = .deny, .w = .overlay, .x = .allow };
 
     pub const K = enum(u2) {
         /// This is a mid-way node and does not have it's own data; may or may not have children
