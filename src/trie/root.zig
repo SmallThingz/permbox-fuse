@@ -152,66 +152,107 @@ pub fn del(_path: []const u8) !Mode {
 
     blk: switch (node.next(path)) {
         .this => |idx| {
-            // 1. Delete the data
+            // Delete the data
             const old_data: Mode = init: {
                 if (node.bitset.isSet(idx)) {
                     const sub_idx = node.indexAt(idx).get();
                     const sub = try fromIdx(sub_idx);
+                    if (sub.data == .midway) return error.NotFound;
                     const old = sub.data;
                     sub.data = .midway;
+
+                    // If sub is empty, remove it from node
+                    if (sub.valcntbounded(1) == 0) {
+                        // -> CRITICAL SECTION
+                        node.bitset.unset(idx);
+                        node.indexAt(idx).set(0);
+                        // <- CRITICAL SECTION
+                        releaseOne(sub_idx);
+                    }
                     break :init old;
                 } else {
                     const val = node.indexAt(idx).get();
+                    if (val == 0) return error.NotFound;
                     node.indexAt(idx).set(0);
                     break :init @enumFromInt(@as(u8, @truncate(val)));
                 }
             };
 
-            if (old_data == .midway) return error.NotFound;
-
-            const top_node = try index_at.getNode();
-            const r_idx = right_node_idx orelse init: {
-                const ni = node.indexAt(idx);
-                const n = try ni.getNode();
-                if (!n.bitset.isSet(idx)) return old_data;
-                const valcnt = n.valcntbounded(2);
-                if (valcnt == 0) { // sus; maybe corrupted file
-                    @branchHint(.cold);
-                    const niv = ni.get();
+            // Prune `node` if it's empty and not the top node
+            if (right_node_idx) |r_idx| {
+                if (node.data == .midway and node.valcntbounded(1) == 0) {
+                    const top_node = try index_at.getNode();
+                    const right_idx = top_node.indexAt(r_idx).get();
                     // -> CRITICAL SECTION
-                    node.bitset.unset(idx);
-                    ni.set(0);
+                    top_node.bitset.unset(r_idx);
+                    top_node.indexAt(r_idx).set(0);
                     // <- CRITICAL SECTION
-                    try releaseOne(niv, false);
-                } else if (valcnt == 1) {
-                    break :init idx;
+                    releaseLine(right_idx, false);
                 }
-                return old_data;
-            };
-
-            if (node.data != .midway or node.valcntbounded(1) == 1) return old_data;
-            // Because of our top_node rule, if `node` is empty, the ENTIRE chain
-            // from `right_node` down to `node` is empty and can be removed!
-
-            const right_idx = top_node.indexAt(r_idx).get();
-            // -> CRITICAL SECTION
-            top_node.bitset.unset(r_idx);
-            top_node.indexAt(r_idx).set(0);
-            // <- CRITICAL SECTION
-            releaseLine(right_idx, false);
-
-            if (top_node.data != .midway) return old_data;
-            const topvalcnt = top_node.valcntbounded(2);
-            std.debug.assert(topvalcnt != 0);
-            if (topvalcnt != 1) return old_data;
-            // If top node now has exactly 1 child and no data, we must merge it;
-
-            if (@intFromPtr(index_at.arr) == @intFromPtr(&index_at_buf)) { // index_at was root
-                @branchHint(.unlikely);
-                // TODO
-            } else { // Normal case
-                // TODO
             }
+
+            // Check top_node for merge or prune
+            const top_node = try index_at.getNode();
+            const top_valcnt = top_node.valcntbounded(2);
+
+            if (top_node.data == .midway and top_valcnt == 0) {
+                // removed the very last node
+                std.debug.assert(@intFromPtr(index_at.arr) == @intFromPtr(&index_at_buf));
+                return old_data;
+            }
+
+            // Top node has data
+            if (top_node.data != .midway or top_valcnt != 1) return old_data;
+
+            // Merge top_node with its single remaining child
+            const child = top_node.findFirstChild() orelse unreachable;
+            const left_byte_idx = child.idx;
+
+            if (!child.is_node) {
+                const child_data: Mode = @enumFromInt(@as(u8, @truncate(child.val)));
+                if (top_node.radix_len + 1 >= top_node.radix_str.len) {
+                    return old_data;
+                }
+                top_node.radix_str[top_node.radix_len] = left_byte_idx;
+
+                // -> CRITICAL SECTION
+                top_node.data = child_data;
+                top_node.radix_len += 1;
+                top_node.indexAt(left_byte_idx).set(0);
+                // <- CRITICAL SECTION
+
+                return old_data;
+            }
+
+            const left_node_idx = child.val;
+            const left_node = try Node.fromIdx(left_node_idx);
+
+            const top_len = top_node.radix_len;
+            const left_len = left_node.radix_len;
+            const new_len = @as(usize, top_len) + 1 + left_len;
+
+            if (new_len > left_node.radix_str.len) {
+                // we can and should merge this [shift strings up in a chain] but skipping it for now
+                return old_data;
+            }
+
+            const old_top_idx = index_at.get();
+
+            // -> CRITICAL SECTION
+            // Shift left_node's string to the right
+            var i: usize = left_len;
+            while (i > 0) {
+                i -= 1;
+                left_node.radix_str[i + top_len + 1] = left_node.radix_str[i];
+            }
+            // Copy top_node's string to the beginning
+            @memcpy(left_node.radix_str[0..top_len], top_node.radix_str[0..top_len]);
+            left_node.radix_str[top_len] = left_byte_idx;
+            left_node.radix_len = @intCast(new_len);
+            index_at.set(left_node_idx);
+            // <- CRITICAL SECTION
+
+            releaseOne(old_top_idx);
 
             return old_data;
         },
@@ -232,8 +273,8 @@ pub fn del(_path: []const u8) !Mode {
             }
 
             path = path[node.radix_len + 1 ..];
-            node = try fromIdx(node.indexAt(idx).get());
-            continue :blk node.next();
+            node = try node.indexAt(idx).getNode();
+            continue :blk node.next(path);
         },
         .diff => {
             @branchHint(.cold);
@@ -255,7 +296,7 @@ fn releaseOne(self: u24) void {
     Pool.global.release(self);
 }
 
-fn fromIdx(self: u24) Pool.OOB!*@This() {
+fn fromIdx(self: u24) Pool.OOB!*Node() {
     return Pool.global.nodeAt(self);
 }
 
@@ -291,13 +332,15 @@ pub const Node = extern struct {
     /// the actual storage for radix string
     radix_str: [children_count - 2 - (8 * 4)]u8 = undefined,
     /// If n't bit is set means nt'h index has an actual subnode; otherwise it's data
-    bitset: std.bit_set.ArrayBitSet(u64, 4) = .empty,
+    bitset: Bitset = .empty,
     /// The indexes to the sub-nodes; 24 bits each
     idx_arr: [children_count * 3]u8 = (children_count * 3) ** [_]u8{0},
 
     comptime {
         std.debug.assert(@sizeOf(@This()) == 1 << 10);
     }
+
+    const Bitset = std.bit_set.ArrayBitSet(u64, 4);
 
     const IndexAt = struct {
         arr: *[children_count * 3]u8,
@@ -339,7 +382,7 @@ pub const Node = extern struct {
     fn valcntbounded(self: *@This(), comptime less_than: comptime_int) u8 {
         const bitsetcnt: u8 = self.bitset.count();
         if (bitsetcnt >= less_than) return less_than;
-        for (0..children_count) |i| {
+        inline for (0..children_count) |i| {
             if (!self.bitset.isSet(i) and @as(u8, @truncate(self.indexAt(i).get())) != 0) {
                 bitsetcnt += 1;
                 if (bitsetcnt == less_than) {
@@ -349,6 +392,21 @@ pub const Node = extern struct {
             }
         }
         return bitsetcnt;
+    }
+
+    /// Finds the first child (subnode or inline data)
+    pub fn findFirstChild(self: *@This()) ?struct { idx: u8, is_node: bool, val: u24 } {
+        if (self.bitset.findFirstSet()) |i| {
+            const idx: u8 = @intCast(i);
+            return .{ .idx = idx, .is_node = true, .val = self.indexAt(idx).get() };
+        }
+        inline for (0..children_count) |i| {
+            const val = self.indexAt(@intCast(i)).get();
+            if (val != 0) {
+                return .{ .idx = @intCast(i), .is_node = false, .val = val };
+            }
+        }
+        return null;
     }
 };
 
