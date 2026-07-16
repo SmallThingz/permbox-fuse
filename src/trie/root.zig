@@ -25,7 +25,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                 const next = try node.indexAt(idx).getNode();
                 next.data = data;
             } else {
-                node.indexAt(idx).set(@as(u24, @bitCast(data)));
+                node.indexAt(idx).set(@as(u24, @as(u8, @bitCast(data))));
             }
         },
         .next => |idx| { // Go to next node
@@ -44,7 +44,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                 const new = fromIdx(new_idx) catch unreachable;
                 new.radix_len = node.radix_len - idx - 1;
                 new.data = node.data; // Inherit data
-                @memcpy(new.radix_str[0..new.radix_len], node.radix_str[idx + 1 ..]);
+                @memcpy(new.radix_str[0..new.radix_len], node.radix_str[idx + 1 ..][0..new.radix_len]);
                 const boff = @offsetOf(Node, "bitset");
                 @memcpy(std.mem.asBytes(new)[boff..], std.mem.asBytes(node)[boff..]);
                 break :init new_idx;
@@ -65,7 +65,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                     const next_idx = path[current.radix_len];
                     path = path[current.radix_len + 1 ..];
                     if (path.len == 0) {
-                        current.indexAt(next_idx).set(@as(u24, @bitCast(data)));
+                        current.indexAt(next_idx).set(@as(u24, @as(u8, @bitCast(data))));
                         break :init new_idx;
                     }
 
@@ -92,7 +92,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                     new.bitset.set(ogpath[idx]);
                     new.indexAt(ogpath[idx]).set(right_idx);
                 } else {
-                    new.indexAt(ogpath[idx]).set(@as(u24, @bitCast(data)));
+                    new.indexAt(ogpath[idx]).set(@as(u24, @as(u8, @bitCast(data))));
                 }
 
                 break :init new_idx;
@@ -101,12 +101,12 @@ pub fn add(_path: []const u8, data: Mode) !void {
 
             const og = index_at.get();
             defer releaseOne(og);
-            Pool.global.sync();
+            try Pool.global.sync();
 
             // -> CRITICAL SECTION
             index_at.set(top_idx);
-            Pool.global.sync();
             // <- CRITICAL SECTION
+            try Pool.global.sync();
         },
     }
 }
@@ -114,13 +114,13 @@ pub fn add(_path: []const u8, data: Mode) !void {
 pub fn get(_path: []const u8) !?Mode {
     var path = _path;
     if (path.len == 0) return null;
-    var node = try fromIdx(Pool.global.block().root);
+    var node = try fromIdx(@intCast(Pool.global.block().root));
 
     blk: switch (node.next(path)) {
         .this => |idx| {
             if (node.bitset.isSet(idx)) {
                 const sub = try node.indexAt(idx).getNode();
-                if (sub.data == .midway) return null;
+                if (@as(u8, @bitCast(sub.data)) == 0) return null;
                 return sub.data;
             } else {
                 const val = node.indexAt(idx).get();
@@ -158,7 +158,7 @@ pub fn del(_path: []const u8) !Mode {
                 if (node.bitset.isSet(idx)) {
                     const sub_idx = node.indexAt(idx).get();
                     const sub = try fromIdx(sub_idx);
-                    if (sub.data == .midway) return error.NotFound;
+                    if (@as(u8, @bitCast(sub.data)) == 0) return error.NotFound;
                     const old = sub.data;
                     sub.data = .midway;
 
@@ -181,14 +181,14 @@ pub fn del(_path: []const u8) !Mode {
 
             // Prune `node` if it's empty and not the top node
             if (right_node_idx) |r_idx| {
-                if (node.data == .midway and node.valcntbounded(1) == 0) {
+                if (@as(u8, @bitCast(node.data)) == 0 and node.valcntbounded(1) == 0) {
                     const top_node = try index_at.getNode();
                     const right_idx = top_node.indexAt(r_idx).get();
                     // -> CRITICAL SECTION
                     top_node.bitset.unset(r_idx);
                     top_node.indexAt(r_idx).set(0);
                     // <- CRITICAL SECTION
-                    releaseLine(right_idx, false);
+                    try releaseLine(right_idx, false);
                 }
             }
 
@@ -196,14 +196,14 @@ pub fn del(_path: []const u8) !Mode {
             const top_node = try index_at.getNode();
             const top_valcnt = top_node.valcntbounded(2);
 
-            if (top_node.data == .midway and top_valcnt == 0) {
+            if (@as(u8, @bitCast(top_node.data)) == 0 and top_valcnt == 0) {
                 // removed the very last node
                 std.debug.assert(@intFromPtr(index_at.arr) == @intFromPtr(&index_at_buf));
                 return old_data;
             }
 
             // Top node has data
-            if (top_node.data != .midway or top_valcnt != 1) return old_data;
+            if (@as(u8, @bitCast(top_node.data)) != 0 or top_valcnt != 1) return old_data;
 
             // Merge top_node with its single remaining child
             const child = top_node.findFirstChild() orelse unreachable;
@@ -280,7 +280,7 @@ pub fn del(_path: []const u8) !Mode {
             }
 
             const valcnt = node.valcntbounded(2);
-            if (valcnt > 1 or (valcnt == 1 and node.data != .midway)) {
+            if (valcnt > 1 or (valcnt == 1 and @as(u8, @bitCast(node.data)) != 0)) {
                 // Update top node (index_at) ONLY if current node is a fork or has data
                 index_at = node.indexAt(idx);
                 right_node_idx = null;
@@ -398,11 +398,11 @@ pub const Node = extern struct {
 
         const consumed = maybe_consumed.?;
         if (consumed == self.radix_len) return .{ .next = path[self.radix_len] };
-        return .{ .diff = consumed };
+        return .{ .diff = @as(u8, @intCast(consumed)) };
     }
 
     fn valcntbounded(self: *@This(), comptime less_than: comptime_int) u8 {
-        var bitsetcnt: u8 = self.bitset.count();
+        var bitsetcnt: u8 = @intCast(self.bitset.count());
         if (bitsetcnt >= less_than) return less_than;
         for (0..children_count) |i| {
             if (!self.bitset.isSet(i) and self.indexAt(@intCast(i)).get() != 0) {
@@ -491,6 +491,204 @@ fn expectModeEqual(expected: Mode, actual: Mode) !void {
     try std.testing.expectEqual(@as(u8, @bitCast(expected)), @as(u8, @bitCast(actual)));
 }
 
+fn ensurePoolInitialized() !void {
+    const fd = try std.posix.memfd_create("permbox-test-pool", 0);
+    Pool.global = try Pool.init(fd);
+}
+
+test "init pool" {
+    try ensurePoolInitialized();
+}
+
+test "trie exhaustive subsets (add, get, overwrite, del)" {
+    const gpa = std.testing.allocator;
+
+    // Generate all paths with chars 'a' and 'b' up to length 3
+    // Total paths: 2^1 + 2^2 + 2^3 = 14 paths
+    var paths: [14][]const u8 = undefined;
+    var idx: usize = 0;
+    for (1..4) |len| {
+        const states = @as(usize, 1) << @as(u6, @intCast(len));
+        for (0..states) |mask| {
+            const path = try gpa.alloc(u8, len);
+            for (0..len) |i| {
+                path[i] = if ((mask & (@as(usize, 1) << @intCast(i))) != 0) 'a' else 'b';
+            }
+            paths[idx] = path;
+            idx += 1;
+        }
+    }
+    defer for (paths) |p| gpa.free(p);
+
+    // Test all possible subsets of these paths (2^14 = 16384 subsets)
+    const total_sets = @as(usize, 1) << 14;
+    for (0..total_sets) |set_mask| {
+
+        // 1. Add all paths in this subset
+        for (0..14) |i| {
+            if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
+                try add(paths[i], Mode.dir);
+            }
+        }
+
+        // 2. Overwrite all paths in this subset with a different mode
+        for (0..14) |i| {
+            if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
+                try add(paths[i], Mode.file);
+            }
+        }
+
+        // 3. Verify gets
+        for (0..14) |i| {
+            const res = try get(paths[i]);
+            if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
+                try std.testing.expect(res != null);
+                try expectModeEqual(Mode.file, res.?);
+            } else {
+                try std.testing.expectEqual(@as(?Mode, null), res);
+            }
+        }
+
+        // 4. Delete all paths in this subset
+        for (0..14) |i| {
+            if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
+                const old = try del(paths[i]);
+                try expectModeEqual(Mode.file, old);
+            }
+        }
+
+        // 5. Verify all are null after deletion
+        for (0..14) |i| {
+            const res = try get(paths[i]);
+            try std.testing.expectEqual(@as(?Mode, null), res);
+        }
+    }
+}
+
+test "trie randomized fuzz test" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(12345);
+    const random = prng.random();
+
+    var ref = std.StringHashMap(Mode).init(gpa);
+    defer ref.deinit();
+
+    // Generate all paths of 'a' and 'b' up to length 5 (62 paths)
+    var paths: [62][]const u8 = undefined;
+    var idx: usize = 0;
+    for (1..6) |len| {
+        const states = @as(usize, 1) << @as(u6, @intCast(len));
+        for (0..states) |mask| {
+            const path = try gpa.alloc(u8, len);
+            for (0..len) |i| {
+                path[i] = if ((mask & (@as(usize, 1) << @intCast(i))) != 0) 'a' else 'b';
+            }
+            paths[idx] = path;
+            idx += 1;
+        }
+    }
+    defer for (paths) |p| gpa.free(p);
+
+    var i: usize = 0;
+    while (i < 200_000) : (i += 1) {
+        const path_idx = random.intRangeLessThan(usize, 0, paths.len);
+        const path = paths[path_idx];
+        const op = random.intRangeLessThan(u8, 0, 3);
+
+        if (op == 0) {
+            // Add dir
+            try add(path, Mode.dir);
+            try ref.put(path, Mode.dir);
+        } else if (op == 1) {
+            // Add file
+            try add(path, Mode.file);
+            try ref.put(path, Mode.file);
+        } else {
+            // Del
+            if (ref.get(path)) |_| {
+                _ = try del(path);
+                _ = ref.remove(path);
+            } else {
+                try std.testing.expectError(error.NotFound, del(path));
+            }
+        }
+
+        // Verify all paths against the reference map
+        for (paths) |p| {
+            const r = ref.get(p);
+            const t = try get(p);
+            if (r) |rv| {
+                try std.testing.expect(t != null);
+                try expectModeEqual(rv, t.?);
+            } else {
+                try std.testing.expectEqual(@as(?Mode, null), t);
+            }
+        }
+    }
+}
+
+test "trie deep path string limit and partial shift" {
+    const gpa = std.testing.allocator;
+
+    // The trie's radix_str capacity is 222 bytes.
+    // We want to test the case where top_len + 1 + left_len > 222
+    // Let's make top_len = 200, left_len = 30.
+    // new_len = 231 > 222.
+
+    const p1 = try gpa.alloc(u8, 200);
+    defer gpa.free(p1);
+    @memset(p1, 'a');
+
+    const p2 = try gpa.alloc(u8, 231);
+    defer gpa.free(p2);
+    @memset(p2, 'a');
+    p2[200] = 'b';
+    @memset(p2[201..], 'a');
+
+    const p3 = try gpa.alloc(u8, 231);
+    defer gpa.free(p3);
+    @memset(p3, 'a');
+    p3[200] = 'c';
+    @memset(p3[201..], 'a');
+
+    try add(p1, Mode.dir);
+    try add(p2, Mode.dir);
+    try add(p3, Mode.dir);
+
+    try expectModeEqual(Mode.dir, (try get(p1)).?);
+    try expectModeEqual(Mode.dir, (try get(p2)).?);
+    try expectModeEqual(Mode.dir, (try get(p3)).?);
+
+    // Delete p2. This will trigger the partial shift logic
+    // because top_len (200) + 1 + left_len (30) = 231 > 222
+    _ = try del(p2);
+
+    try std.testing.expectEqual(@as(?Mode, null), try get(p2));
+    try expectModeEqual(Mode.dir, (try get(p1)).?);
+    try expectModeEqual(Mode.dir, (try get(p3)).?);
+
+    // Delete p1. This triggers the partial shift logic again
+    _ = try del(p1);
+
+    try std.testing.expectEqual(@as(?Mode, null), try get(p1));
+    try expectModeEqual(Mode.dir, (try get(p3)).?);
+
+    // Delete p3
+    _ = try del(p3);
+    try std.testing.expectEqual(@as(?Mode, null), try get(p3));
+}
+
+test "trie delete non-existent and empty" {
+    try std.testing.expectError(error.NotFound, del("a"));
+
+    try add("a", Mode.dir);
+    try std.testing.expectError(error.NotFound, del("b"));
+    try std.testing.expectError(error.NotFound, del("aa"));
+
+    _ = try del("a");
+    try std.testing.expectError(error.NotFound, del("a"));
+}
+
 test "trie procedural forward and backward insertion/deletion" {
     const gpa = std.testing.allocator;
 
@@ -499,7 +697,7 @@ test "trie procedural forward and backward insertion/deletion" {
     var paths: [62][]const u8 = undefined;
     var idx: usize = 0;
     for (1..6) |len| {
-        const states = @as(usize, 1) << len;
+        const states = @as(usize, 1) << @as(u6, @intCast(len));
         for (0..states) |mask| {
             const path = try gpa.alloc(u8, len);
             for (0..len) |i| {
@@ -602,80 +800,15 @@ test "trie procedural forward and backward insertion/deletion" {
     while (i > 0) {
         i -= 1;
         _ = try del(paths[i]);
-        
+
         // Ensure the deleted one is gone
         try std.testing.expectEqual(@as(?Mode, null), try get(paths[i]));
-        
+
         // Ensure all previous items in the array still exist
         for (0..i) |j| {
             const res = try get(paths[j]);
             try std.testing.expect(res != null);
             try expectModeEqual(Mode.dir, res.?);
-        }
-    }
-}
-
-test "trie exhaustive subsets (add, get, overwrite, del)" {
-    const gpa = std.testing.allocator;
-
-    // Generate all paths with chars 'a' and 'b' up to length 3
-    // Total paths: 2^1 + 2^2 + 2^3 = 14
-    var paths: [14][]const u8 = undefined;
-    var idx: usize = 0;
-    for (1..4) |len| {
-        const states = @as(usize, 1) << len;
-        for (0..states) |mask| {
-            const path = try gpa.alloc(u8, len);
-            for (0..len) |i| {
-                path[i] = if ((mask & (@as(usize, 1) << @intCast(i))) != 0) 'a' else 'b';
-            }
-            paths[idx] = path;
-            idx += 1;
-        }
-    }
-    defer for (paths) |p| gpa.free(p);
-    
-    // Test all possible subsets of these paths (2^14 = 16384 subsets)
-    const total_sets = @as(usize, 1) << 14;
-    for (0..total_sets) |set_mask| {
-        
-        // 1. Add all paths in this subset
-        for (paths, 0..) |p, i| {
-            if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                try add(p, Mode.dir);
-            }
-        }
-        
-        // 2. Overwrite all paths in this subset with a different mode
-        for (paths, 0..) |p, i| {
-            if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                try add(p, Mode.file);
-            }
-        }
-
-        // 3. Verify gets
-        for (paths, 0..) |p, i| {
-            const res = try get(p);
-            if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                try std.testing.expect(res != null);
-                try expectModeEqual(Mode.file, res.?);
-            } else {
-                try std.testing.expectEqual(@as(?Mode, null), res);
-            }
-        }
-        
-        // 4. Delete all paths in this subset
-        for (paths, 0..) |p, i| {
-            if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                const old = try del(p);
-                try expectModeEqual(Mode.file, old);
-            }
-        }
-        
-        // 5. Verify all are null after deletion
-        for (paths) |p| {
-            const res = try get(p);
-            try std.testing.expectEqual(@as(?Mode, null), res);
         }
     }
 }
@@ -687,7 +820,7 @@ test "trie deep path chains (length 4)" {
     var paths: [30][]const u8 = undefined;
     var idx: usize = 0;
     for (1..5) |len| {
-        const states = @as(usize, 1) << len;
+        const states = @as(usize, 1) << @as(u6, @intCast(len));
         for (0..states) |mask| {
             const path = try gpa.alloc(u8, len);
             for (0..len) |i| {
@@ -717,19 +850,19 @@ test "trie deep path chains (length 4)" {
         const res = try get(p);
         try std.testing.expectEqual(@as(?Mode, null), res);
     }
-    
+
     // Re-add and delete in reverse order (longest to shortest)
     for (paths) |p| {
         try add(p, Mode.file);
     }
-    
+
     var i: usize = paths.len;
     while (i > 0) {
         i -= 1;
         _ = try del(paths[i]);
         const res = try get(paths[i]);
         try std.testing.expectEqual(@as(?Mode, null), res);
-        
+
         // Ensure earlier items still exist
         for (0..i) |j| {
             const r = try get(paths[j]);

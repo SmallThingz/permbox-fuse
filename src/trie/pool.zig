@@ -37,7 +37,7 @@ pub fn init(fd: fd_t) !@This() {
 
     if (!initialized) {
         const blk = self.block();
-        blk.* = .{ .free_range = .{ 2, @divExact(self.mem.len, 1 << 10) }, .free_idx = 0, .root = 1 };
+        blk.* = .{ .free_range = .{ 2, @divExact(self.mem.len, 1 << 10) }, .free_from = 2, .free_idx = 0, .root = 1 };
         (try self.nodeAt(1)).* = .{};
     } else {
         try self.validate();
@@ -68,7 +68,7 @@ pub fn nodeAt(self: *@This(), idx: u24) OOB!*root.Node {
     if (check_oob) {
         if (off > self.mem.len - 1024) return OOB.OutOfBounds;
     }
-    return @ptrCast(self.mem[off..][0 .. 1 << 10].ptr);
+    return @as(*root.Node, @ptrCast(@alignCast(self.mem[off..][0 .. 1 << 10].ptr)));
 }
 
 /// Validation error
@@ -101,7 +101,7 @@ fn validate(self: *@This()) ValidateError!void {
     if (blk.root >= blk.free_from) return error.InvalidBoundsInFileFreeList;
 }
 
-pub fn block(self: *@This()) Block {
+pub fn block(self: *@This()) *Block {
     return .from(self.mem);
 }
 
@@ -161,34 +161,35 @@ pub fn switchEndian(self: *@This(), dest_fd: fd_t) !void {
 pub const AcquireError = OOB || ResizeError;
 
 /// Acquire a node from the pool
-pub fn acquire(self: @This()) AcquireError!u24 {
+pub fn acquire(self: *@This()) AcquireError!u24 {
     const blk = self.block();
-    if (blk.free_idx) {
-        const node = try self.nodeAt(blk.free_idx);
+    if (blk.free_idx != 0) {
+        const idx = blk.free_idx;
+        const node = try self.nodeAt(@intCast(idx));
         blk.free_idx = node.indexAt(0xfe).get();
-        return node;
+        return @intCast(idx);
     }
 
     if (blk.free_from >= self.mem.len >> 10) {
         @branchHint(.unlikely);
-        blk.free_from = self.mem.len;
-        try self.resize(self.mem.len + (1 << 16));
+        blk.free_from = @intCast(self.mem.len);
+        try self.resize(@intCast(self.mem.len + (1 << 16)));
     }
 
     std.debug.assert(blk.free_from < self.mem.len >> 10);
     defer blk.free_from += 1;
-    return blk.free_from;
+    return @intCast(blk.free_from);
 }
 
 const TruncateError = error{ResizeFailed};
 const ResizeError = TruncateError || std.posix.MRemapError;
 fn resize(self: *@This(), new_len: u63) !void {
     if (linux.ftruncate(self.fd, new_len) != 0) return ResizeError.ResizeFailed;
-    try std.posix.mremap(self.mem.ptr, self.mem.len, new_len, .{ .MAYMOVE = true }, null);
+    self.mem = try std.posix.mremap(self.mem.ptr, self.mem.len, new_len, .{ .MAYMOVE = true }, null);
 }
 
 /// Release a node to the pool
-pub fn release(self: @This(), idx: u24) void {
+pub fn release(self: *@This(), idx: u24) void {
     const blk = self.block();
     if (idx == blk.free_from - 1) {
         @branchHint(.cold);
@@ -196,7 +197,7 @@ pub fn release(self: @This(), idx: u24) void {
     } else {
         const node = self.nodeAt(idx) catch unreachable;
         node.indexAt(0xff).set(idx);
-        node.indexAt(0xfe).set(blk.free_idx);
+        node.indexAt(0xfe).set(@intCast(blk.free_idx));
         blk.free_idx = idx;
     }
 }
@@ -210,7 +211,7 @@ pub fn indexOf(self: *@This(), node: *root.Node) OOB!u24 {
 }
 
 pub fn sync(self: *@This()) !void {
-    std.posix.msync(self.mem, linux.MSF.SYNC);
+    return std.posix.msync(self.mem, linux.MSF.SYNC);
 }
 
 const Endian = enum(u8) {
@@ -220,23 +221,25 @@ const Endian = enum(u8) {
     pub const default = @field(@This(), @tagName(builtin.cpu.arch.endian()));
 };
 
-const MAGIC = "PERMBOX" ++ "RDXTRIE";
+const MAGIC = @as([14]u8, ("PERMBOX" ++ "RDXTRIE").*);
 
 const VERSION = 0;
 
-const Block = packed struct {
+const Block = extern struct {
     const Range = packed struct(u64) { start: u32, end: u32 };
     magic: [14]u8 = MAGIC,
     /// The endian-ness of the current file
     endian: Endian = .default,
     /// The version of the current file
     version: u8 = VERSION,
+    /// The range of free blocks
+    free_range: Range = .{ .start = 2, .end = 0 },
     /// All the blocks after this index are free
-    free_from: u32,
+    free_from: u32 = 0,
     /// This block is free
-    free_idx: u32,
+    free_idx: u32 = 0,
     /// The index of the root node
-    root: u32,
+    root: u32 = 0,
 
     pub fn from(mem: []align(page_size_min) u8) *@This() {
         return @ptrCast(mem.ptr);
