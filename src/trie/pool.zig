@@ -23,21 +23,21 @@ pub const InitError = StatxError || TruncateError || OOB || ValidateError;
 pub fn init(fd: fd_t) !@This() {
     const _len, const blksize = try getSize(fd);
     const initialized = _len >= 1 << 16;
-    const len = @min(1 << 16, _len);
+    const len = if (initialized) _len else @as(u64, 1 << 16);
 
     if (!initialized) {
-        if (linux.ftruncate(fd, len) != 0) return TruncateError.ResizeFailed;
+        if (linux.ftruncate(fd, @intCast(len)) != 0) return TruncateError.ResizeFailed;
     }
 
-    const self: @This() = .{
+    var self: @This() = .{
         .fd = fd,
-        .mem = mapFd(fd, len),
+        .mem = try mapFd(fd, len),
         .blksize = blksize,
     };
 
     if (!initialized) {
         const blk = self.block();
-        blk.* = .{ .free_range = .{ 2, @divExact(self.mem.len, 1 << 10) }, .free_from = 2, .free_idx = 0, .root = 1 };
+        blk.* = .{ .free_range = .{ .start = 2, .end = @intCast(@divExact(self.mem.len, 1 << 10)) }, .free_from = 2, .free_idx = 0, .root = 1 };
         (try self.nodeAt(1)).* = .{};
     } else {
         try self.validate();
@@ -47,7 +47,7 @@ pub fn init(fd: fd_t) !@This() {
 }
 
 const StatxError = error{StatxFailed};
-fn getSize(fd: fd_t) !@Tuple(.{ u64, u32 }) {
+fn getSize(fd: fd_t) !@Tuple(&.{ u64, u32 }) {
     var result: linux.Statx = undefined;
     const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &result);
     if (rc != 0) return StatxError.StatxFailed;
@@ -56,7 +56,7 @@ fn getSize(fd: fd_t) !@Tuple(.{ u64, u32 }) {
 
 const MMapError = std.posix.MMapError;
 fn mapFd(fd: fd_t, len: u64) MMapError![]align(page_size_min) u8 {
-    return try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .NORESERVE = true, .HUGETLB = true }, fd, 0);
+    return try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
 }
 
 pub const OOB = if (check_oob) error{
@@ -79,11 +79,15 @@ const ValidateError = error{
     UnsupportedVersion,
     /// The endian-ness of the file mismatches the expected. Use switchEndian to change the endian-ness
     EndianMismatch,
+    /// The file's free_from field
+    InvalidBoundsInFileFreeFrom,
+    /// The file's free_idx field
+    InvalidBoundsInFileFreeIdx,
 };
 fn validate(self: *@This()) ValidateError!void {
     const VE = ValidateError;
     const blk = self.block();
-    if (blk.magic != MAGIC) return VE.MagicMismatch;
+    if (!std.mem.eql(u8, &blk.magic, &MAGIC)) return VE.MagicMismatch;
 
     if (blk.version > VERSION) {
         // FUTURE; also will need to handle endian-ness
@@ -96,9 +100,9 @@ fn validate(self: *@This()) ValidateError!void {
     }
 
     const max_idx = @divExact(self.mem.len, 1 << 10);
-    if (blk.free_range.from > max_idx or blk.free_range.end != max_idx) error.InvalidBoundsInFileFreeRange;
-    if (blk.free_idx >= blk.free_from) return error.InvalidBoundsInFileFreeList;
-    if (blk.root >= blk.free_from) return error.InvalidBoundsInFileFreeList;
+    if (blk.free_range.start > max_idx or blk.free_range.end != max_idx) return VE.InvalidBoundsInFileFreeFrom;
+    if (blk.free_idx >= blk.free_from) return VE.InvalidBoundsInFileFreeList;
+    if (blk.root >= blk.free_from) return VE.InvalidBoundsInFileFreeIdx;
 }
 
 pub fn block(self: *@This()) *Block {
@@ -112,10 +116,10 @@ pub const SwitchEndianError = StatxError || std.posix.MMapError;
 pub fn switchEndian(self: *@This(), dest_fd: fd_t) !void {
     const _len, const blksize = try getSize(dest_fd);
     if (_len != self.mem.len) {
-        if (linux.ftruncate(self.fd, self.mem.len) != 0) return error.FileResizeFailed;
+        if (linux.ftruncate(self.fd, @intCast(self.mem.len)) != 0) return error.FileResizeFailed;
     }
 
-    const dest: @This() = .{
+    var dest: @This() = .{
         .fd = dest_fd,
         .mem = try mapFd(dest_fd, self.mem.len),
         .blksize = blksize,
@@ -136,8 +140,8 @@ pub fn switchEndian(self: *@This(), dest_fd: fd_t) !void {
     const is_native = self.block().isEndianNative();
     const till = if (is_native) self.block().free_from else @byteSwap(self.block().free_from);
     for (0..till) |i| {
-        const node = self.nodeAt(i) catch unreachable;
-        const dnode = dest.nodeAt(i) catch unreachable;
+        const node = self.nodeAt(@intCast(i)) catch unreachable;
+        const dnode = dest.nodeAt(@intCast(i)) catch unreachable;
 
         if ((if (is_native) node.indexAt(0xff).get() else @byteSwap(node.indexAt(0xff).get())) == i) {
             dnode.indexAt(0xff).set(@byteSwap(node.indexAt(0xff).get()));
@@ -145,8 +149,8 @@ pub fn switchEndian(self: *@This(), dest_fd: fd_t) !void {
             continue;
         }
 
-        @memcpy(@as([]align(1024) u8, dnode)[0 .. node.radix_len + 2], @as([]align(1024) u8, node)[0 .. node.radix_len + 2]);
-        for (dnode.bitset, node.bitset) |*d, s| d.* = @byteSwap(s);
+        @memcpy(std.mem.asBytes(dnode)[0 .. node.radix_len + 2], std.mem.asBytes(node)[0 .. node.radix_len + 2]);
+        for (&dnode.bitset.masks, node.bitset.masks) |*d, s| d.* = @byteSwap(s);
         for (0..node.idx_arr.len / 3) |j| {
             const a = j * 3;
             const b = a + 1;
@@ -172,19 +176,23 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
 
     if (blk.free_from >= self.mem.len >> 10) {
         @branchHint(.unlikely);
+        try self.resize(self.mem.len + (1 << 16));
         blk.free_from = @intCast(self.mem.len);
-        try self.resize(@intCast(self.mem.len + (1 << 16)));
     }
 
-    std.debug.assert(blk.free_from < self.mem.len >> 10);
-    defer blk.free_from += 1;
-    return @intCast(blk.free_from);
+    // re-obtain block pointer after resize (mem may have moved)
+    const blk2 = self.block();
+    // Update free_range.end if we resized
+    blk2.free_range.end = @intCast(self.mem.len >> 10);
+    std.debug.assert(blk2.free_from < self.mem.len >> 10);
+    defer blk2.free_from += 1;
+    return @intCast(blk2.free_from);
 }
 
 const TruncateError = error{ResizeFailed};
 const ResizeError = TruncateError || std.posix.MRemapError;
-fn resize(self: *@This(), new_len: u63) !void {
-    if (linux.ftruncate(self.fd, new_len) != 0) return ResizeError.ResizeFailed;
+fn resize(self: *@This(), new_len: usize) !void {
+    if (linux.ftruncate(self.fd, @intCast(new_len)) != 0) return ResizeError.ResizeFailed;
     self.mem = try std.posix.mremap(self.mem.ptr, self.mem.len, new_len, .{ .MAYMOVE = true }, null);
 }
 
@@ -204,10 +212,13 @@ pub fn release(self: *@This(), idx: u24) void {
 
 pub fn indexOf(self: *@This(), node: *root.Node) OOB!u24 {
     const int = @intFromPtr(node);
-    std.debug.assert(int & 0b11_1111_1111 == 0);
     const mem = @intFromPtr(self.mem.ptr);
-    if (int < mem or int + 1024 > mem + self.mem.len) return OOB.OutOfBounds;
-    return int - mem;
+    if (int & 0b11_1111_1111 != 0) return OOB.OutOfBounds;
+    // Overflow-safe bounds check
+    if (int < mem) return OOB.OutOfBounds;
+    const offset = int - mem;
+    if (offset > self.mem.len - 1024) return OOB.OutOfBounds;
+    return @intCast(offset >> 10);
 }
 
 pub fn sync(self: *@This()) !void {
@@ -508,10 +519,10 @@ test "Pool full capacity cycle" {
     }
 
     // Release everything randomly
-    var keys = std.ArrayList(u24).init(testing.allocator);
-    defer keys.deinit();
+    var keys = std.ArrayList(u24).empty;
+    defer keys.deinit(testing.allocator);
     var it = allocated.keyIterator();
-    while (it.next()) |k| try keys.append(k.*);
+    while (it.next()) |k| try keys.append(testing.allocator, k.*);
 
     for (keys.items) |k| {
         global.release(k);
