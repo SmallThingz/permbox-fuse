@@ -10,6 +10,7 @@ const children_count = 1 << 8;
 const RadixInt = u8;
 
 pub fn add(_path: []const u8, data: Mode) !void {
+    std.debug.assert(_path.len != 0);
     const b = Pool.global.block();
     var path = _path;
     var index_at_buf: [3]u8 = undefined;
@@ -122,7 +123,7 @@ pub fn get(_path: []const u8) !?Mode {
             } else {
                 const val = node.indexAt(idx).get();
                 if (val == 0) return null;
-                return @enumFromInt(@as(u8, @intCast(val)));
+                return @enumFromInt(@as(u8, @truncate(val)));
             }
         },
         .next => |idx| {
@@ -137,13 +138,38 @@ pub fn get(_path: []const u8) !?Mode {
     }
 }
 
-pub fn del(path: []const u8) !Mode {
+pub fn del(_path: []const u8) !Mode {
+    std.debug.assert(_path.len != 0);
     const b = Pool.global.block();
     var path = _path;
     var index_at_buf: [3]u8 = undefined;
     std.mem.writeInt(u24, &index_at_buf, @intCast(b.root), native_endian);
     var index_at: Node.IndexAt = .{ .at = 0, .arr = @ptrCast(&index_at_buf) };
     var node = Node.fromIdx(index_at.get()) catch unreachable;
+
+    blk: switch (node.next(path)) {
+        .this => |idx| {
+            const sub_idx = node.indexAt(idx).get();
+            if (node.bitset.isSet(idx)) {
+                const sub = try Node.fromIdx(sub_idx);
+                const old = sub.data;
+                sub.data = .midway;
+                return old;
+            } else {
+                node.indexAt(idx).set(0); // 0 is .midway
+                return @enumFromInt(@as(u8, @truncate(sub_idx)));
+            }
+        },
+        .next => |idx| {
+            if (!node.bitset.isSet(idx)) return error.NotFound;
+            path = path[node.radix_len + 1 ..];
+            node = try Node.fromIdx(node.indexAt(idx).get());
+            continue :blk node.next(path);
+        },
+        .diff => {
+            return .midway;
+        },
+    }
 }
 
 pub const Node = extern struct {
