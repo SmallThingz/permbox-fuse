@@ -37,7 +37,7 @@ pub fn init(fd: fd_t) !@This() {
 
     if (!initialized) {
         const blk = self.block();
-        blk.* = .{ .free_range = .{ 2, @divExact(self.mem.len, 1 << 10) }, .free_idx = 0 };
+        blk.* = .{ .free_range = .{ 2, @divExact(self.mem.len, 1 << 10) }, .free_idx = 0, .root = 1 };
         (try self.nodeAt(1)).* = .{};
     } else {
         try self.validate();
@@ -97,10 +97,11 @@ fn validate(self: *@This()) ValidateError!void {
 
     const max_idx = @divExact(self.mem.len, 1 << 10);
     if (blk.free_range.from > max_idx or blk.free_range.end != max_idx) error.InvalidBoundsInFileFreeRange;
-    if (blk.free_idx >= blk.free_range.from) return error.InvalidBoundsInFileFreeList;
+    if (blk.free_idx >= blk.free_from) return error.InvalidBoundsInFileFreeList;
+    if (blk.root >= blk.free_from) return error.InvalidBoundsInFileFreeList;
 }
 
-fn block(self: *@This()) Block {
+pub fn block(self: *@This()) Block {
     return .from(self.mem);
 }
 
@@ -208,6 +209,10 @@ pub fn indexOf(self: *@This(), node: *root.Node) OOB!u24 {
     return int - mem;
 }
 
+pub fn sync(self: *@This()) !void {
+    std.posix.msync(self.mem, linux.MSF.SYNC);
+}
+
 const Endian = enum(u8) {
     big = 'B',
     little = 'L',
@@ -230,6 +235,8 @@ const Block = packed struct {
     free_from: u32,
     /// This block is free
     free_idx: u32,
+    /// The index of the root node
+    root: u32,
 
     pub fn from(mem: []align(page_size_min) u8) *@This() {
         return @ptrCast(mem.ptr);

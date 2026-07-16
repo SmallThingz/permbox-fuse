@@ -9,11 +9,115 @@ const max_depth = 1 << 12;
 const children_count = 1 << 8;
 const RadixInt = u8;
 
+pub fn add(_path: []const u8, data: Mode) !void {
+    const blk = Pool.global.block();
+    var path = _path;
+    var index_at_buf: [3]u8 = undefined;
+    std.mem.writeInt(u24, &index_at_buf, @intCast(blk.root), native_endian);
+    var index_at: Node.IndexAt = .{ .at = 0, .arr = @ptrCast(&index_at_buf) };
+    var node = Node.fromIdx(index_at.get()) catch unreachable;
+
+    blk: switch (node.next(path)) {
+        .node => |idx| { // Go to next node
+            path = path[node.radix_len + 1 ..];
+            std.debug.assert(path.len != 0);
+            index_at = node.indexAt(idx);
+            node = try Node.fromIdx(index_at.get());
+            continue :blk node.next(path);
+        },
+        .this => |idx| { // the entry already exists; only need to set data
+            if (node.bitset.isSet(idx)) {
+                const next = try Node.fromIdx(node.indexAt(idx).get());
+                next.data = data;
+            } else {
+                node.indexAt(idx).set(data);
+            }
+        },
+        .diff => |idx| {
+            const ogpath = path;
+            path = path[idx + 1 ..];
+
+            const left_idx: u24 = init: {
+                const new_idx = try Node.acquire();
+                const new = Node.fromIdx(new_idx) catch unreachable;
+                new.radix_len = node.radix_len - idx - 1;
+                new.data = .midway;
+                @memcpy(new.radix_str[0..new.radix_len], node.radix_str[idx + 1 ..]);
+                const boff = @offsetOf(Node, "bitset");
+                @memcpy(std.mem.asBytes(new)[boff..], std.mem.asBytes(node)[boff..]);
+                break :init new_idx;
+            };
+            errdefer Node.releaseOne(left_idx);
+
+            const need_right = path.len != 0;
+            const right_idx: u24 = init: {
+                if (!need_right) break :init 0;
+                const new_idx = try Node.acquire();
+                const new = Node.fromIdx(new_idx) catch unreachable;
+                var current = new;
+                while (true) {
+                    current.radix_len = @min(path.len - 1, node.radix_str.len);
+                    current.data = .midway;
+                    @memcpy(current.radix_str[0..current.radix_len], path[0..current.radix_len]);
+
+                    const next_idx = path[current.radix_len];
+                    path = path[current.radix_len + 1 ..];
+                    if (path.len == 0) {
+                        current.indexAt(next_idx).set(data);
+                        break :init new_idx;
+                    }
+
+                    const new_next = try Node.acquire();
+                    current.bitset.set(next_idx);
+                    current.indexAt(next_idx).set(new_next);
+                    current = Node.fromIdx(new_next) catch unreachable;
+                }
+            };
+            errdefer {
+                if (need_right) Node.release(right_idx, true);
+            }
+
+            const top_idx: u24 = init: {
+                const new_idx = try Node.acquire();
+                const new = Node.fromIdx(new_idx) catch unreachable;
+                new.radix_len = idx;
+                new.data = node.data;
+                @memcpy(new.radix_str[0..idx], node.radix_str[0..idx]);
+                new.bitset.set(left_idx);
+                new.indexAt(node.radix_str[idx]).set(left_idx);
+
+                if (need_right) {
+                    new.bitset.set(right_idx);
+                    new.indexAt(ogpath[idx]).set(right_idx);
+                } else {
+                    new.indexAt(idx).set(data);
+                }
+
+                break :init new_idx;
+            };
+            errdefer Node.releaseOne(top_idx);
+
+            const og = index_at.get();
+            defer Node.releaseOne(og);
+            Pool.global.sync();
+
+            // -> CRITICAL SECTION
+            index_at.set(top_idx);
+            Pool.global.sync();
+            // <- CRITICAL SECTION
+        },
+    }
+}
+
+pub fn get(self: *@This(), path: []const u8) ?Mode {}
+
+pub fn del(self: *@This(), path: []const u8) ?Mode {}
+
 pub const Node = extern struct {
     /// radix string length
     radix_len: u8 = 0,
     /// The data associated with the current node
-    data: Mode,
+    data: Mode = .midway,
     /// the actual storage for radix string
     radix_str: [children_count - 2 - (8 * 4)]u8 = undefined,
     /// If n't bit is set means nt'h index has an actual subnode; otherwise it's data
@@ -25,7 +129,7 @@ pub const Node = extern struct {
         std.debug.assert(@sizeOf(@This()) == 1 << 10);
     }
 
-    pub fn indexAt(self: *@This(), at: u8) struct {
+    const IndexAt = struct {
         arr: *[children_count * 3]u8,
         at: u16,
 
@@ -36,20 +140,21 @@ pub const Node = extern struct {
         pub fn set(me: @This(), val: u24) void {
             return std.mem.writeInt(u24, &me.arr[me.at][0..3], val, native_endian);
         }
-    } {
+    };
+    pub fn indexAt(self: *@This(), at: u8) IndexAt {
         return .{ .arr = &self.idx_arr, .at = at * 3 };
     }
 
-    pub fn fromIdx(self: u24) Pool.OOB!*@This() {
+    fn fromIdx(self: u24) Pool.OOB!*@This() {
         return Pool.global.nodeAt(self);
     }
 
-    pub fn toIdx(self: *@This()) Pool.OOB!u24 {
+    fn toIdx(self: *@This()) Pool.OOB!u24 {
         return Pool.global.indexOf(self);
     }
 
     /// Acquire a brand new node from the pool and init it with the required values
-    pub fn acquire() !u24 {
+    fn acquire() !u24 {
         const node_idx = try Pool.global.acquire();
         const node = fromIdx(node_idx) catch unreachable;
         node.* = .{};
@@ -57,14 +162,14 @@ pub const Node = extern struct {
     }
 
     /// Release the node to the pool; does Not release all the nodes; only this one
-    pub fn releaseOne(self: u24) void {
+    fn releaseOne(self: u24) void {
         self.* = undefined;
         Pool.global.release(self);
     }
 
-    fn release(self: u24, comptime assert_inbounds: bool) if (assert_inbounds) void else (Pool.OOB || PathTooLong)!void {
+    fn release(idx: u24, comptime assert_inbounds: bool) if (assert_inbounds) void else (Pool.OOB || PathTooLong)!void {
         var stack: [max_depth]BlkIdx = undefined;
-        stack[0] = .{ .chr = 0, .idx = self };
+        stack[0] = .{ .chr = 0, .idx = idx };
         var len = 1;
         outer: while (len > 0) {
             const top = &stack[len - 1];
@@ -74,33 +179,51 @@ pub const Node = extern struct {
                 @branchHint(.cold);
                 for (top.chr..0xff) |i| {
                     if (node.bitset.isSet(i)) {
-                        const subidx = node.indexAt(top.chr).get();
+                        const subidx = node.indexAt(@intCast(i)).get();
+
                         const subnode = if (assert_inbounds) fromIdx(subidx) catch unreachable else try fromIdx(subidx);
                         inline for (0..4) |j| {
-                            if (subnode.bitset[j] != 0) return PathTooLong.PathTooLong;
+                            if (subnode.bitset[j] != 0) {
+                                if (assert_inbounds) unreachable;
+                                return PathTooLong.PathTooLong;
+                            }
                         }
                         Pool.global.release(subidx);
                     }
                 }
-                len -= 1;
-                continue :outer;
-            }
+            } else {
+                for (top.chr..0xff) |i| {
+                    if (node.bitset.isSet(i)) {
+                        top.chr = @bitCast(i);
+                        stack[len] = .{ .chr = 0, .blk = node.indexAt(@intCast(i)).get() };
 
-            for (top.chr..0xff) |i| {
-                if (node.bitset.isSet(i)) {
-                    top.chr = @bitCast(i);
-                    stack[len] = .{ .chr = 0, .blk = node.indexAt(top.chr).get() };
-                    len += 1;
-                    continue :outer;
+                        len += 1;
+                        continue :outer;
+                    }
                 }
             }
-            len -= 1;
+
+            const blk = top.blk;
+            if (node.bitset.isSet(0xff)) {
+                top.* = .{ .chr = 0, .blk = node.indexAt(0xff).get() };
+            } else {
+                len -= 1;
+            }
+            Pool.global.release(blk);
         }
     }
 
-    fn getNextNode(self: *@This(), path: []const u8) union(enum) { this: u8, next: u8, diff: u8 } {
+    const Next = union(enum) {
+        /// The child in the nodes `this` idx is the one you want
+        this: u8,
+        /// What you want is is the subnode at idx `next`
+        next: u8,
+        /// There was a difference bw the node's radix_str and your path at idx `diff`
+        diff: u8,
+    };
+    fn next(self: *@This(), path: []const u8) Next {
         const maybe_consumed = mem.findDiff(u8, self.radix_str[0..self.radix_len], path[0 .. path.len - 1]);
-        if (maybe_consumed == null) return .{ .idx = path[path.len - 1] };
+        if (maybe_consumed == null) return .{ .this = path[path.len - 1] };
 
         const consumed = maybe_consumed.?;
         if (consumed == self.radix_len) return .{ .next = path[self.radix_len] };
@@ -123,143 +246,7 @@ pub const BlkIdx = packed struct(u32) {
     }
 };
 
-const OpAdd = struct {
-    /// The current edge we are on
-    parent: *Node,
-    /// The index of the current node inside of the parent
-    idx_in_parent: u8,
-
-    /// offset in mem
-    offset: u34,
-
-    /// The path that is left
-    path: []const u8,
-    /// The data we wanna add at the given path
-    data: Mode,
-    /// The allocator used to allocate and free nodes
-    gpa: *Pool,
-
-    fn executeNull(self: *const OpAdd) !void {
-        std.debug.assert(self.cursed.isNull());
-
-        var cursed = self.cursed;
-        var idx = self.idx;
-        var remaining = self.path;
-        var parent = cursed.getParent(idx);
-
-        while (true) {
-            const node = try Node.init(self.gpa);
-            const chunk_len = @min(remaining.len, node.radix_str.len);
-            cursed.* = @bitCast(node);
-            cursed._radix_len = @intCast(chunk_len);
-            @memcpy(node.radix_str[0..chunk_len], remaining[0..chunk_len]);
-
-            parent.children[idx] = cursed.*;
-
-            if (chunk_len == remaining.len) {
-                parent.count_minus_1[idx] = 0;
-                parent.data[idx] = self.data;
-                return;
-            }
-
-            parent.count_minus_1[idx] = 0;
-            parent.data[idx] = .midway;
-
-            remaining = remaining[chunk_len..];
-            idx = remaining[0];
-            remaining = remaining[1..];
-            cursed = &node.children[idx];
-            parent = node;
-        }
-    }
-
-    /// idx is our index in the parent's block
-    pub fn execute(self: *@This()) !void {
-        if (self.cursed.isNull()) return self.executeNull();
-
-        // At this point, it is guaranteed that there has not been any modification to the trie.
-        // Yes, this is true even when we enter this after recursion.
-        blk: switch (self.cursed.getNextNode(self.idx)) {
-            .this => self.cursed.getParent(self.idx).data[self.idx] = self.data,
-            .node => |next| {
-                self.idx = next;
-                self.path = self.path[@as(usize, self.cursed._radix_len) + 1 ..];
-                self.cursed = &self.cursed.ptr().?.children[next];
-
-                if (self.cursed.isNull()) executeNull(self) catch |e| {
-                    self.freeChain();
-                    self.cursed.* = .{};
-                    return e;
-                } else {
-                    // This function is just a glorified for loop; the behavior is same as
-                    // return @call(.always_tail, execute, .{self});
-                    continue :blk self.cursed.getNextNode(self.idx);
-                }
-            },
-            .consumed => |consumed| {
-                const parent = self.cursed.getParent(self.idx);
-                var old = self.cursed.*;
-                const old_node = old.ptr().?;
-                std.debug.assert(consumed < old._radix_len);
-                const olds_new_idx = old_node.radix_str[consumed];
-
-                const node = try Node.init(self.gpa); // No change was made so no harm
-                node.count_minus_1[olds_new_idx] = parent.count_minus_1[self.idx];
-                node.data[olds_new_idx] = parent.data[self.idx];
-                @memcpy(node.radix_str[0..consumed], old_node.radix_str[0..consumed]);
-
-                self.cursed.* = @bitCast(node);
-                std.debug.assert(self.cursed._radix_len == 0);
-                self.cursed._radix_len = consumed;
-
-                if (self.path.len == consumed) {
-                    parent.count_minus_1[self.idx] = 0;
-                    parent.data[self.idx] = self.data;
-                } else {
-                    std.debug.assert(self.path.len > consumed);
-
-                    const new_idx = self.path[consumed];
-                    executeNull(.{
-                        .idx = new_idx,
-                        .cursed = &node.children[new_idx],
-                        .path = self.path[@as(usize, consumed) + 1 ..],
-                        .data = self.data,
-                        .gpa = self.gpa,
-                    }) catch |e| {
-                        self.freeChain();
-                        self.cursed.* = old;
-                        return e;
-                    };
-
-                    parent.count_minus_1[self.idx] = 1;
-                    parent.data[self.idx] = .midway;
-                }
-
-                const olds_new_str = old_node.radix_str[@as(usize, consumed) + 1 .. old._radix_len];
-                std.mem.copyForwards(I, old_node.radix_str[0..olds_new_str.len], olds_new_str);
-                old._radix_len = @intCast(olds_new_str.len);
-                node.children[olds_new_idx] = old;
-            },
-        }
-    }
-
-    // Separate free function that does not blow up the stack
-    fn freeChain(self: *const @This()) void {
-        var ptr = self.cursed.ptr() orelse return;
-        while (true) {
-            const next = ptr.children[
-                ptr.firstChild() orelse {
-                    self.gpa.destroy(ptr);
-                    return;
-                }
-            ];
-            self.gpa.destroy(ptr);
-            ptr = next;
-        }
-    }
-};
-
-const Mode = packed struct(u8) {
+pub const Mode = packed struct(u8) {
     /// Dicatates the kind of node
     k: K,
     /// Controls weather one can read the contents of the current dir or not.
