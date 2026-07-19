@@ -48,33 +48,44 @@ pub fn findDiff(comptime T: type, a: []const T, b: []const T) ?usize {
         !@inComptime() and
         (@typeInfo(T) == .int or @typeInfo(T) == .float) and std.math.isPowerOfTwo(@bitSizeOf(T)))
     {
-        if (std.simd.suggestVectorLength(T)) |block_len| {
-            // See std.mem.findScalarPos for discussion of alignment and unrolling.
-            const Block = @Vector(block_len, T);
-            while (index + 2 * block_len <= shortest) {
-                inline for (0..2) |_| {
-                    const blocka: Block = a[index..][0..block_len].*;
-                    const blockb: Block = b[index..][0..block_len].*;
-                    const diffs = blocka != blockb;
-                    if (@reduce(.Or, diffs)) return index + std.simd.firstTrue(diffs).?;
-                    index += block_len;
-                }
+        if (std.simd.suggestVectorLength(T)) |suggested_len| {
+            const max_len = suggested_len * 2;
+            const min_len = @min(suggested_len, 4);
+
+            comptime var block_len_sum: u16 = max_len;
+            inline while (block_len_sum >= min_len) : (block_len_sum /= 2) {
+                const block_len = @min(block_len_sum, suggested_len);
+                const block_cnt = @max(1, block_len_sum / block_len);
+                const Block = @Vector(block_len, T);
+                const BoolBlock = @Vector(block_len, bool);
+
+                var blocks: [block_cnt]BoolBlock = undefined;
+
+                if (index + block_len_sum <= shortest) while (true) {
+                    const start_index = index;
+                    var merged: BoolBlock = undefined;
+                    inline for (0..block_cnt) |block_idx| {
+                        blocks[block_idx] = @as(Block, a[index..][0..block_len].*) != @as(Block, b[index..][0..block_len].*);
+                        if (block_idx == 0) merged = blocks[block_idx] else merged |= blocks[block_idx];
+                        index += block_len;
+                    }
+
+                    if (@reduce(.Or, merged)) {
+                        inline for (0..block_cnt) |block_idx| {
+                            if (@reduce(.Or, blocks[block_idx])) {
+                                return start_index + block_idx * block_len + std.simd.firstTrue(blocks[block_idx]).?;
+                            }
+                        }
+                        unreachable;
+                    }
+
+                    if (block_len_sum == max_len) {
+                        if (index + block_len_sum > shortest) break;
+                    } else break;
+                };
             }
 
-            // {block_len, block_len / 2} check
-            inline for (0..2) |j| {
-                const block_x_len = block_len / (1 << j);
-                comptime if (block_x_len < 4) break;
-
-                const BlockX = @Vector(block_x_len, T);
-                if (index + block_x_len <= shortest) {
-                    const blocka: BlockX = a[index..][0..block_x_len].*;
-                    const blockb: BlockX = b[index..][0..block_x_len].*;
-                    const diffs = blocka != blockb;
-                    if (@reduce(.Or, diffs)) return index + std.simd.firstTrue(diffs).?;
-                    index += block_x_len;
-                }
-            }
+            std.debug.assert(min_len > shortest - index);
         }
     }
 

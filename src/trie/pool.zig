@@ -18,9 +18,9 @@ mem: []align(page_size_min) u8,
 /// The block size of the fs that this file is on
 blksize: u32,
 
-pub const InitError = StatxError || TruncateError || OOB || ValidateError;
+pub const InitError = StatxError || TruncateError || MMapError || OOB || ValidateError;
 /// These must reside on the same fs; or atleast reside on fs's with same block sizes
-pub fn init(fd: fd_t) !@This() {
+pub fn init(fd: fd_t) InitError!@This() {
     const _len, const blksize = try getSize(fd);
     const initialized = _len >= 1 << 16;
     const len = if (initialized) _len else @as(u64, 1 << 16);
@@ -37,7 +37,7 @@ pub fn init(fd: fd_t) !@This() {
 
     if (!initialized) {
         const blk = self.block();
-        blk.* = .{ .free_range = .{ .start = 2, .end = @intCast(@divExact(self.mem.len, 1 << 10)) }, .free_from = 2, .free_idx = 0, .root = 1 };
+        blk.* = .{ .free_from = 2, .free_idx = 0, .root = 1 };
         (try self.nodeAt(1)).* = .{};
     } else {
         try self.validate();
@@ -66,13 +66,15 @@ pub const OOB = if (check_oob) error{
 pub fn nodeAt(self: *@This(), idx: u24) OOB!*root.Node {
     const off = @as(usize, idx) << 10;
     if (check_oob) {
-        if (off > self.mem.len - 1024) return OOB.OutOfBounds;
+        if (off + 1024 > self.mem.len) return OOB.OutOfBounds;
     }
     return @as(*root.Node, @ptrCast(@alignCast(self.mem[off..][0 .. 1 << 10].ptr)));
 }
 
 /// Validation error
 const ValidateError = error{
+    /// The file is larger that 16 GiB which is not supported
+    FileTooLong,
     /// The file magic does not match to what was expected
     MagicMismatch,
     /// The file's version is too new. The software is out of date
@@ -80,43 +82,44 @@ const ValidateError = error{
     /// The endian-ness of the file mismatches the expected. Use switchEndian to change the endian-ness
     EndianMismatch,
     /// The file's free_from field
-    InvalidBoundsInFileFreeFrom,
+    OOBFreeFrom,
     /// The file's free_idx field
-    InvalidBoundsInFileFreeIdx,
+    OOBFreeIdx,
+    /// The root node lies out of bounds
+    OOBRootNode,
 };
 fn validate(self: *@This()) ValidateError!void {
     const VE = ValidateError;
+    if (self.mem.len > (1 << 34)) return VE.FileTooLong;
     const blk = self.block();
     if (!std.mem.eql(u8, &blk.magic, &MAGIC)) return VE.MagicMismatch;
+    if (blk.endian != Endian.default) return VE.EndianMismatch;
 
-    if (blk.version > VERSION) {
-        // FUTURE; also will need to handle endian-ness
-    } else if (blk.version < VERSION) {
+    if (blk.version < VERSION) {
+        // This will start erroring if the VERSION is incremented
+        @compileError("TODO: implement older version handling");
+    } else if (blk.version > VERSION) {
         return VE.UnsupportedVersion;
     }
 
-    if (blk.endian != Endian.default) {
-        return VE.EndianMismatch;
-    }
-
-    const max_idx = @divExact(self.mem.len, 1 << 10);
-    if (blk.free_range.start > max_idx or blk.free_range.end != max_idx) return VE.InvalidBoundsInFileFreeFrom;
-    if (blk.free_idx >= blk.free_from) return VE.InvalidBoundsInFileFreeList;
-    if (blk.root >= blk.free_from) return VE.InvalidBoundsInFileFreeIdx;
+    const max_idx = self.mem.len / (1 << 10);
+    if (blk.free_from < 2 or blk.free_from > max_idx) return VE.OOBFreeFrom;
+    if (blk.free_idx >= blk.free_from) return VE.OOBFreeIdx;
+    if (blk.root == 0 or blk.root >= blk.free_from) return VE.OOBRootNode;
 }
 
 pub fn block(self: *@This()) *Block {
     return .from(self.mem);
 }
 
-pub const SwitchEndianError = StatxError || std.posix.MMapError;
+pub const SwitchEndianError = TruncateError || StatxError || std.posix.MMapError;
 
 /// Changes the endian-ness and writes the result to the dest_fd
 /// Does not sync the dest file; that would be the caller's responsibility
-pub fn switchEndian(self: *@This(), dest_fd: fd_t) !void {
+pub fn switchEndian(self: *@This(), dest_fd: fd_t) SwitchEndianError!void {
     const _len, const blksize = try getSize(dest_fd);
     if (_len != self.mem.len) {
-        if (linux.ftruncate(self.fd, @intCast(self.mem.len)) != 0) return error.FileResizeFailed;
+        if (linux.ftruncate(dest_fd, @intCast(self.mem.len)) != 0) return TruncateError.ResizeFailed;
     }
 
     var dest: @This() = .{
@@ -139,7 +142,7 @@ pub fn switchEndian(self: *@This(), dest_fd: fd_t) !void {
 
     const is_native = self.block().isEndianNative();
     const till = if (is_native) self.block().free_from else @byteSwap(self.block().free_from);
-    for (0..till) |i| {
+    for (1..till) |i| {
         const node = self.nodeAt(@intCast(i)) catch unreachable;
         const dnode = dest.nodeAt(@intCast(i)) catch unreachable;
 
@@ -162,11 +165,11 @@ pub fn switchEndian(self: *@This(), dest_fd: fd_t) !void {
     }
 }
 
-pub const AcquireError = OOB || ResizeError;
+pub const AcquireError = OOB || ResizeError || error{FileTooLong};
 
 /// Acquire a node from the pool
 pub fn acquire(self: *@This()) AcquireError!u24 {
-    const blk = self.block();
+    var blk = self.block();
     if (blk.free_idx != 0) {
         const idx = blk.free_idx;
         const node = try self.nodeAt(@intCast(idx));
@@ -176,17 +179,23 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
 
     if (blk.free_from >= self.mem.len >> 10) {
         @branchHint(.unlikely);
+        if (self.mem.len + (1 << 16) > (1 << 34)) {
+            @branchHint(.cold);
+            if (self.mem.len < (1 << 34)) {
+                @branchHint(.cold);
+                try self.resize(self.mem.len + (1 << 16));
+            } else {
+                return AcquireError.FileTooLong;
+            }
+        }
         try self.resize(self.mem.len + (1 << 16));
-        blk.free_from = @intCast(self.mem.len);
+        // re-obtain block pointer after resize (mem may have moved)
+        blk = self.block();
     }
 
-    // re-obtain block pointer after resize (mem may have moved)
-    const blk2 = self.block();
-    // Update free_range.end if we resized
-    blk2.free_range.end = @intCast(self.mem.len >> 10);
-    std.debug.assert(blk2.free_from < self.mem.len >> 10);
-    defer blk2.free_from += 1;
-    return @intCast(blk2.free_from);
+    std.debug.assert(blk.free_from < self.mem.len >> 10);
+    defer blk.free_from += 1;
+    return @intCast(blk.free_from);
 }
 
 const TruncateError = error{ResizeFailed};
@@ -201,9 +210,15 @@ pub fn release(self: *@This(), idx: u24) void {
     const blk = self.block();
     if (idx == blk.free_from - 1) {
         @branchHint(.cold);
+        if (blk.free_from == 0) {
+            @branchHint(.cold);
+            return;
+        }
+
         blk.free_from -= 1;
     } else {
         const node = self.nodeAt(idx) catch unreachable;
+        // Since a node can't point to itself; this is a loop
         node.indexAt(0xff).set(idx);
         node.indexAt(0xfe).set(@intCast(blk.free_idx));
         blk.free_idx = idx;
@@ -213,7 +228,7 @@ pub fn release(self: *@This(), idx: u24) void {
 pub fn indexOf(self: *@This(), node: *root.Node) OOB!u24 {
     const int = @intFromPtr(node);
     const mem = @intFromPtr(self.mem.ptr);
-    if (int & 0b11_1111_1111 != 0) return OOB.OutOfBounds;
+    if ((int & 0b11_1111_1111) != 0) return OOB.OutOfBounds;
     // Overflow-safe bounds check
     if (int < mem) return OOB.OutOfBounds;
     const offset = int - mem;
@@ -237,14 +252,11 @@ const MAGIC = @as([14]u8, ("PERMBOX" ++ "RDXTRIE").*);
 const VERSION = 0;
 
 const Block = extern struct {
-    const Range = packed struct(u64) { start: u32, end: u32 };
     magic: [14]u8 = MAGIC,
     /// The endian-ness of the current file
     endian: Endian = .default,
     /// The version of the current file
     version: u8 = VERSION,
-    /// The range of free blocks
-    free_range: Range = .{ .start = 2, .end = 0 },
     /// All the blocks after this index are free
     free_from: u32 = 0,
     /// This block is free
@@ -289,8 +301,7 @@ test "Pool init and basic properties" {
     try testing.expectEqual(@as(u32, 1), blk.root);
 
     // Check free range
-    try testing.expectEqual(@as(u32, 2), blk.free_range.start);
-    try testing.expectEqual(@as(u32, 64), blk.free_range.end);
+    try testing.expectEqual(@as(u32, 2), blk.free_from);
 }
 
 test "Pool acquire increments free_from" {
@@ -426,7 +437,6 @@ test "Pool auto-resize on capacity hit" {
 
     try testing.expectEqual(@as(usize, 1 << 16), global.mem.len);
     try testing.expectEqual(@as(u32, 64), blk.free_from);
-    try testing.expectEqual(@as(u32, 64), blk.free_range.end);
 
     // This acquire should trigger a resize by 1 << 16 (64KB)
     const idx = try global.acquire();
@@ -438,7 +448,6 @@ test "Pool auto-resize on capacity hit" {
     // Check that the pool grew
     try testing.expectEqual(@as(usize, 1 << 17), global.mem.len);
     try testing.expectEqual(@as(u32, 65), blk2.free_from);
-    try testing.expectEqual(@as(u32, 128), blk2.free_range.end);
 
     // Ensure the new node is accessible and writable
     const node = try global.nodeAt(idx);
@@ -527,7 +536,6 @@ test "Pool full capacity cycle" {
     for (keys.items) |k| {
         global.release(k);
     }
-    allocated.deinit();
 
     // After releasing everything, if we allocate 100 again, it should work perfectly
     i = 0;

@@ -402,7 +402,7 @@ pub const Node = extern struct {
     }
 
     fn valcntbounded(self: *@This(), comptime less_than: comptime_int) u8 {
-        var bitsetcnt: u8 = @intCast(self.bitset.count());
+        var bitsetcnt = self.bitset.count();
         if (bitsetcnt >= less_than) return less_than;
         for (0..children_count) |i| {
             if (!self.bitset.isSet(i) and self.indexAt(@intCast(i)).get() != 0) {
@@ -413,7 +413,7 @@ pub const Node = extern struct {
                 }
             }
         }
-        return bitsetcnt;
+        return @intCast(bitsetcnt);
     }
 
     /// Finds the first child (subnode or inline data)
@@ -1266,6 +1266,7 @@ test "11. prefix/non-prefix combinations" {
 
 // --- 12. Random long paths ---
 test "12. random long paths" {
+    if (!builtin.fuzz) return error.SkipZigTest;
     try ensurePoolInitialized();
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(54321);
@@ -1316,6 +1317,8 @@ test "12. random long paths" {
 // --- 13. Repeated overwrite ---
 test "13. repeated overwrite" {
     try ensurePoolInitialized();
+    // Pre-allocate the path's nodes so subsequent adds are pure overwrites
+    try add("path", Mode.dir);
     const blk = Pool.global.block();
     const start_free_from = blk.free_from;
 
