@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 
+const posix = std.posix;
 const linux = std.os.linux;
 const fd_t = linux.fd_t;
 
@@ -19,7 +20,8 @@ mem: []align(page_size_min) u8,
 blksize: u32,
 
 pub const InitError = StatxError || TruncateError || MMapError || OOB || ValidateError;
-/// These must reside on the same fs; or atleast reside on fs's with same block sizes
+/// This struct now owns the fd and the fd will be released when upon deinit.
+/// If this errors; the fd remains valid
 pub fn init(fd: fd_t) InitError!@This() {
     const _len, const blksize = try getSize(fd);
     const initialized = _len >= 1 << 16;
@@ -34,6 +36,7 @@ pub fn init(fd: fd_t) InitError!@This() {
         .mem = try mapFd(fd, len),
         .blksize = blksize,
     };
+    errdefer posix.munmap(self.mem);
 
     if (!initialized) {
         const blk = self.block();
@@ -46,6 +49,12 @@ pub fn init(fd: fd_t) InitError!@This() {
     return self;
 }
 
+pub fn deinit(self: *@This()) void {
+    _ = linux.close(self.fd);
+    posix.munmap(self.mem);
+    self.* = undefined;
+}
+
 const StatxError = error{StatxFailed};
 fn getSize(fd: fd_t) !@Tuple(&.{ u64, u32 }) {
     var result: linux.Statx = undefined;
@@ -54,9 +63,9 @@ fn getSize(fd: fd_t) !@Tuple(&.{ u64, u32 }) {
     return .{ result.size, result.blksize };
 }
 
-const MMapError = std.posix.MMapError;
+const MMapError = posix.MMapError;
 fn mapFd(fd: fd_t, len: u64) MMapError![]align(page_size_min) u8 {
-    return try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+    return try posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
 }
 
 pub const OOB = if (check_oob) error{
@@ -90,7 +99,7 @@ const ValidateError = error{
 };
 fn validate(self: *@This()) ValidateError!void {
     const VE = ValidateError;
-    if (self.mem.len > (1 << 34)) return VE.FileTooLong;
+    if (self.mem.len > (1 << 34) - 1024) return VE.FileTooLong;
     const blk = self.block();
     if (!std.mem.eql(u8, &blk.magic, &MAGIC)) return VE.MagicMismatch;
     if (blk.endian != Endian.default) return VE.EndianMismatch;
@@ -112,7 +121,7 @@ pub fn block(self: *@This()) *Block {
     return .from(self.mem);
 }
 
-pub const SwitchEndianError = TruncateError || StatxError || std.posix.MMapError;
+pub const SwitchEndianError = TruncateError || StatxError || posix.MMapError;
 
 /// Changes the endian-ness and writes the result to the dest_fd
 /// Does not sync the dest file; that would be the caller's responsibility
@@ -128,7 +137,7 @@ pub fn switchEndian(self: *@This(), dest_fd: fd_t) SwitchEndianError!void {
         .blksize = blksize,
     };
 
-    defer std.posix.munmap(dest.mem);
+    defer posix.munmap(dest.mem);
 
     {
         var blk: Block = self.block().*;
@@ -179,35 +188,42 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
 
     if (blk.free_from >= self.mem.len >> 10) {
         @branchHint(.unlikely);
-        if (self.mem.len + (1 << 16) > (1 << 34)) {
+        if (self.mem.len + (1 << 16) > (1 << 34) - 1024) {
             @branchHint(.cold);
-            if (self.mem.len < (1 << 34)) {
-                @branchHint(.cold);
-                try self.resize(self.mem.len + (1 << 16));
-            } else {
+            if (self.mem.len >= (1 << 34) - 1024) {
+                @branchHint(.likely);
                 return AcquireError.FileTooLong;
+            } else {
+                @branchHint(.cold);
+                try self.resize((1 << 32) - 1024);
             }
+        } else {
+            try self.resize(self.mem.len + (1 << 16));
         }
-        try self.resize(self.mem.len + (1 << 16));
         // re-obtain block pointer after resize (mem may have moved)
         blk = self.block();
     }
 
-    std.debug.assert(blk.free_from < self.mem.len >> 10);
+    std.debug.assert(blk.free_from <= self.mem.len >> 10);
     defer blk.free_from += 1;
     return @intCast(blk.free_from);
 }
 
 const TruncateError = error{ResizeFailed};
-const ResizeError = TruncateError || std.posix.MRemapError;
+const ResizeError = TruncateError || posix.MRemapError;
 fn resize(self: *@This(), new_len: usize) !void {
     if (linux.ftruncate(self.fd, @intCast(new_len)) != 0) return ResizeError.ResizeFailed;
-    self.mem = try std.posix.mremap(self.mem.ptr, self.mem.len, new_len, .{ .MAYMOVE = true }, null);
+    self.mem = try posix.mremap(self.mem.ptr, self.mem.len, new_len, .{ .MAYMOVE = true }, null);
 }
 
 /// Release a node to the pool
-pub fn release(self: *@This(), idx: u24) void {
+pub fn release(self: *@This(), idx: u24) OOB!void {
     const blk = self.block();
+    if (check_oob) {
+        if (idx == 0 or idx == blk.root or idx >= blk.free_from) return OOB.OutOfBounds;
+        const node = self.nodeAt(idx) catch unreachable;
+        if (node.indexAt(0xff).get() == idx) return OOB.OutOfBounds;
+    }
     if (idx == blk.free_from - 1) {
         @branchHint(.cold);
         if (blk.free_from == 0) {
@@ -237,7 +253,7 @@ pub fn indexOf(self: *@This(), node: *root.Node) OOB!u24 {
 }
 
 pub fn sync(self: *@This()) !void {
-    return std.posix.msync(self.mem, linux.MSF.SYNC);
+    return posix.msync(self.mem, linux.MSF.SYNC);
 }
 
 const Endian = enum(u8) {
@@ -277,7 +293,6 @@ const Block = extern struct {
 // Pool Tests
 // =========================================================================
 
-const posix = std.posix;
 const testing = std.testing;
 
 // Helper to initialize a fresh pool for each test
@@ -331,11 +346,11 @@ test "Pool release to tail collapses free_from" {
 
     // Releasing in reverse order should just collapse free_from
     // without populating the free_idx linked list
-    global.release(idx2);
+    try global.release(idx2);
     try testing.expectEqual(@as(u32, 3), blk.free_from);
     try testing.expectEqual(@as(u32, 0), blk.free_idx);
 
-    global.release(idx1);
+    try global.release(idx1);
     try testing.expectEqual(@as(u32, 2), blk.free_from);
     try testing.expectEqual(@as(u32, 0), blk.free_idx);
 }
@@ -349,7 +364,7 @@ test "Pool release out of order uses free list (LIFO)" {
     _ = try global.acquire(); // 4
 
     // Release idx2. Not a tail, so it goes to free_idx
-    global.release(idx2);
+    try global.release(idx2);
     try testing.expectEqual(@as(u32, 5), blk.free_from);
     try testing.expectEqual(@as(u32, 3), blk.free_idx); // free_idx points to 3
 
@@ -358,7 +373,7 @@ test "Pool release out of order uses free list (LIFO)" {
     try testing.expectEqual(@as(u24, 0), free_node.indexAt(0xfe).get()); // Next free is 0
 
     // Release idx1. Not a tail, goes to free_idx
-    global.release(idx1);
+    try global.release(idx1);
     try testing.expectEqual(@as(u32, 5), blk.free_from);
     try testing.expectEqual(@as(u32, 2), blk.free_idx); // free_idx points to 2
 
@@ -534,7 +549,7 @@ test "Pool full capacity cycle" {
     while (it.next()) |k| try keys.append(testing.allocator, k.*);
 
     for (keys.items) |k| {
-        global.release(k);
+        try global.release(k);
     }
 
     // After releasing everything, if we allocate 100 again, it should work perfectly

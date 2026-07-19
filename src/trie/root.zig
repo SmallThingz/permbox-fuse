@@ -308,11 +308,6 @@ fn acquire() !u24 {
     return node_idx;
 }
 
-/// Release the node to the pool; does Not release all the nodes; only this one
-fn releaseOne(idx: u24) void {
-    Pool.global.release(idx);
-}
-
 fn fromIdx(idx: u24) Pool.OOB!*Node {
     return Pool.global.nodeAt(idx);
 }
@@ -326,7 +321,7 @@ fn releaseLine(start_idx: u24, comptime assert_inbounds: bool) if (assert_inboun
         const count = node.bitset.count();
         if (count == 0) { // Reached the end of the line
             @branchHint(.unlikely);
-            Pool.global.release(curr_idx);
+            Pool.global.release(curr_idx) catch |e| if (assert_inbounds) unreachable else return e;
             break;
         } else if (count > 1) { // If we encounter a fork in the "line", something went wrong.
             @branchHint(.cold);
@@ -335,7 +330,7 @@ fn releaseLine(start_idx: u24, comptime assert_inbounds: bool) if (assert_inboun
             @branchHint(.likely);
             const child_byte = @as(u8, @intCast(node.bitset.findFirstSet().?));
             const next_idx = node.indexAt(child_byte).get();
-            Pool.global.release(curr_idx);
+            Pool.global.release(curr_idx) catch |e| if (assert_inbounds) unreachable else return e;
             curr_idx = next_idx;
         }
     }
