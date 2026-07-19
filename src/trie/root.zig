@@ -11,103 +11,126 @@ const RadixInt = u8;
 
 pub fn add(_path: []const u8, data: Mode) !void {
     std.debug.assert(_path.len != 0);
-    const b = Pool.global.block();
     var path = _path;
-    var index_at_buf: [3]u8 = undefined;
-    std.mem.writeInt(u24, &index_at_buf, @intCast(b.root), native_endian);
-    var index_at: Node.IndexAt = .{ .at = 0, .arr = @ptrCast(&index_at_buf) };
-    defer b.root = std.mem.readInt(u24, &index_at_buf, native_endian);
-    var node = index_at.getNode() catch unreachable;
 
-    blk: switch (node.next(path)) {
-        .this => |idx| { // the entry already exists; only need to set data
-            if (node.bitset.isSet(idx)) {
-                const next = try node.indexAt(idx).getNode();
+    var curr_idx: u24 = @intCast(Pool.global.block().root);
+    var parent_idx: u24 = 0;
+    var parent_byte: u8 = 0;
+    var curr = try fromIdx(curr_idx);
+
+    while (true) switch (curr.next(path)) {
+        .this => |idx| {
+            if (curr.bitset.isSet(idx)) {
+                const next = try curr.indexAt(idx).getNode();
                 next.data = data;
             } else {
-                node.indexAt(idx).set(@as(u24, @as(u8, @bitCast(data))));
+                curr.indexAt(idx).set(@as(u24, @as(u8, @bitCast(data))));
             }
+            try Pool.global.sync();
+            return;
         },
         .next => |idx| { // Go to next node
-            path = path[node.radix_len + 1 ..];
+            path = path[curr.radix_len + 1 ..];
             std.debug.assert(path.len != 0);
-            index_at = node.indexAt(idx);
-            node = try index_at.getNode();
-            continue :blk node.next(path);
+
+            if (!curr.bitset.isSet(idx)) {
+                const inline_val = curr.indexAt(idx).get();
+                const new_idx = try create(path, data, inline_val);
+                curr = try fromIdx(curr_idx); // Re-fetch curr in case create() resized
+                Pool.global.sync() catch {};
+
+                // -> CRITICAL SECTION
+                curr.bitset.set(idx);
+                curr.indexAt(idx).set(new_idx);
+                // <- CRITICAL SECTION
+
+                Pool.global.sync() catch {};
+                return;
+            }
+
+            parent_idx = curr_idx;
+            parent_byte = idx;
+            curr_idx = curr.indexAt(idx).get();
+            curr = try fromIdx(curr_idx);
         },
         .diff => |idx| {
             const ogpath = path;
             path = path[idx + 1 ..];
 
-            const left_idx: u24 = init: {
-                const new_idx = try acquire();
-                const new = fromIdx(new_idx) catch unreachable;
-                new.radix_len = node.radix_len - idx - 1;
-                new.data = node.data; // Inherit data
-                @memcpy(new.radix_str[0..new.radix_len], node.radix_str[idx + 1 ..][0..new.radix_len]);
-                const boff = @offsetOf(Node, "bitset");
-                @memcpy(std.mem.asBytes(new)[boff..], std.mem.asBytes(node)[boff..]);
-                break :init new_idx;
-            };
-            errdefer releaseOne(left_idx);
+            const left_idx = try acquire();
+            errdefer Pool.global.release(left_idx) catch unreachable;
+            var left = fromIdx(left_idx) catch unreachable;
+            curr = fromIdx(curr_idx) catch unreachable;
+            left.radix_len = curr.radix_len - idx - 1;
+            left.data = curr.data;
+            @memcpy(left.radix_str[0..left.radix_len], curr.radix_str[idx + 1 .. curr.radix_len]);
+            left.bitset = curr.bitset;
+            left.idx_arr = curr.idx_arr;
 
-            const need_right = path.len != 0;
-            const right_idx: u24 = init: {
-                if (!need_right) break :init 0;
-                const new_idx = try acquire();
-                const new = fromIdx(new_idx) catch unreachable;
-                var current = new;
-                while (true) {
-                    current.radix_len = @min(path.len - 1, current.radix_str.len);
-                    current.data = .midway;
-                    @memcpy(current.radix_str[0..current.radix_len], path[0..current.radix_len]);
+            const top_idx = try acquire();
+            errdefer Pool.global.release(top_idx) catch unreachable;
+            var top = fromIdx(top_idx) catch unreachable;
+            curr = fromIdx(curr_idx) catch unreachable;
+            top.radix_len = idx;
+            top.data = .midway;
+            @memcpy(top.radix_str[0..idx], curr.radix_str[0..idx]);
+            top.bitset.set(curr.radix_str[idx]);
+            top.indexAt(curr.radix_str[idx]).set(left_idx);
 
-                    const next_idx = path[current.radix_len];
-                    path = path[current.radix_len + 1 ..];
-                    if (path.len == 0) {
-                        current.indexAt(next_idx).set(@as(u24, @as(u8, @bitCast(data))));
-                        break :init new_idx;
-                    }
-
-                    const new_next = try acquire();
-                    current.bitset.set(next_idx);
-                    current.indexAt(next_idx).set(new_next);
-                    current = fromIdx(new_next) catch unreachable;
-                }
-            };
-            errdefer {
-                if (need_right) releaseLine(right_idx, true);
+            if (path.len != 0) {
+                const right_idx = try create(path, data, 0);
+                top = fromIdx(top_idx) catch unreachable;
+                top.bitset.set(ogpath[idx]);
+                top.indexAt(ogpath[idx]).set(right_idx);
+            } else {
+                top.indexAt(ogpath[idx]).set(@as(u24, @as(u8, @bitCast(data))));
             }
 
-            const top_idx: u24 = init: {
-                const new_idx = try acquire();
-                const new = fromIdx(new_idx) catch unreachable;
-                new.radix_len = idx;
-                new.data = .midway; // Top is just a prefix
-                @memcpy(new.radix_str[0..idx], node.radix_str[0..idx]);
-                new.bitset.set(node.radix_str[idx]);
-                new.indexAt(node.radix_str[idx]).set(left_idx);
-
-                if (need_right) {
-                    new.bitset.set(ogpath[idx]);
-                    new.indexAt(ogpath[idx]).set(right_idx);
-                } else {
-                    new.indexAt(ogpath[idx]).set(@as(u24, @as(u8, @bitCast(data))));
-                }
-
-                break :init new_idx;
-            };
-            errdefer releaseOne(top_idx);
-
-            const og = index_at.get();
-            defer releaseOne(og);
-            try Pool.global.sync();
-
             // -> CRITICAL SECTION
-            index_at.set(top_idx);
+            if (parent_idx == 0) {
+                Pool.global.block().root = top_idx;
+            } else {
+                var parent_node = fromIdx(parent_idx) catch unreachable;
+                parent_node.indexAt(parent_byte).set(top_idx);
+            }
             // <- CRITICAL SECTION
-            try Pool.global.sync();
+
+            Pool.global.sync() catch {};
+            // Handle error some other way; the operation is success
+            Pool.global.release(curr_idx) catch {};
+            return;
         },
+    };
+}
+
+fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
+    const new_idx = try acquire();
+    errdefer releaseLine(new_idx, true);
+    
+    var current_idx = new_idx;
+    var current = fromIdx(current_idx) catch unreachable;
+    current.data = if (inline_val == 0) .midway else @bitCast(@as(u8, @truncate(inline_val)));
+
+    var curr_path = path;
+    while (true) {
+        current.radix_len = @min(curr_path.len - 1, current.radix_str.len);
+        @memcpy(current.radix_str[0..current.radix_len], curr_path[0..current.radix_len]);
+
+        const next_idx = curr_path[current.radix_len];
+        curr_path = curr_path[current.radix_len + 1 ..];
+        if (curr_path.len == 0) {
+            current.indexAt(next_idx).set(@as(u24, @as(u8, @bitCast(data))));
+            return new_idx;
+        }
+
+        const new_next = try acquire();
+        current = fromIdx(current_idx) catch unreachable;
+        current.bitset.set(next_idx);
+        current.indexAt(next_idx).set(new_next);
+
+        current_idx = new_next;
+        current = try fromIdx(current_idx);
+        current.data = .midway;
     }
 }
 

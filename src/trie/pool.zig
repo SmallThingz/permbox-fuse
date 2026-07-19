@@ -161,7 +161,8 @@ pub fn switchEndian(self: *@This(), dest_fd: fd_t) SwitchEndianError!void {
             continue;
         }
 
-        @memcpy(std.mem.asBytes(dnode)[0 .. node.radix_len + 2], std.mem.asBytes(node)[0 .. node.radix_len + 2]);
+        const len = @as(usize, node.radix_len) + 2;
+        @memcpy(std.mem.asBytes(dnode)[0..len], std.mem.asBytes(node)[0..len]);
         for (&dnode.bitset.masks, node.bitset.masks) |*d, s| d.* = @byteSwap(s);
         for (0..node.idx_arr.len / 3) |j| {
             const a = j * 3;
@@ -195,7 +196,7 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
                 return AcquireError.FileTooLong;
             } else {
                 @branchHint(.cold);
-                try self.resize((1 << 32) - 1024);
+                try self.resize((1 << 34) - 1024);
             }
         } else {
             try self.resize(self.mem.len + (1 << 16));
@@ -267,7 +268,7 @@ const MAGIC = @as([14]u8, ("PERMBOX" ++ "RDXTRIE").*);
 
 const VERSION = 0;
 
-const Block = extern struct {
+pub const Block = extern struct {
     magic: [14]u8 = MAGIC,
     /// The endian-ness of the current file
     endian: Endian = .default,
