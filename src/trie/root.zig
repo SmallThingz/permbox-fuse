@@ -106,7 +106,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
 fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
     const new_idx = try acquire();
     errdefer releaseLine(new_idx, true);
-    
+
     var current_idx = new_idx;
     var current = fromIdx(current_idx) catch unreachable;
     current.data = if (inline_val == 0) .midway else @bitCast(@as(u8, @truncate(inline_val)));
@@ -165,166 +165,112 @@ pub fn get(_path: []const u8) !?Mode {
 
 pub fn del(_path: []const u8) !Mode {
     std.debug.assert(_path.len != 0);
-    const b = Pool.global.block();
     var path = _path;
-    var index_at_buf: [3]u8 = undefined;
-    std.mem.writeInt(u24, &index_at_buf, @intCast(b.root), native_endian);
-    var index_at: Node.IndexAt = .{ .at = 0, .arr = @ptrCast(&index_at_buf) };
-    defer b.root = std.mem.readInt(u24, &index_at_buf, native_endian);
-    var node = index_at.getNode() catch unreachable;
-    var right_node_idx: ?u8 = null;
 
-    blk: switch (node.next(path)) {
+    var curr_idx: u24 = @intCast(Pool.global.block().root);
+    var parent_idx: u24 = 0;
+    var parent_byte: u8 = 0;
+
+    var top_idx: u24 = curr_idx;
+    var top_parent_idx: u24 = 0;
+    var top_parent_byte: u8 = 0;
+    var top_child_byte: ?u8 = null;
+
+    var curr = try fromIdx(curr_idx);
+
+    while (true) switch (curr.next(path)) {
         .this => |idx| {
-            // Delete the data
+            // Delete data
             const old_data: Mode = init: {
-                if (node.bitset.isSet(idx)) {
-                    const sub_idx = node.indexAt(idx).get();
+                if (curr.bitset.isSet(idx)) {
+                    const sub_idx = curr.indexAt(idx).get();
                     const sub = try fromIdx(sub_idx);
                     if (@as(u8, @bitCast(sub.data)) == 0) return error.NotFound;
                     const old = sub.data;
                     sub.data = .midway;
 
-                    // If sub is empty, remove it from node
+                    // If sub is empty, remove it from curr
                     if (sub.valcntbounded(1) == 0) {
                         // -> CRITICAL SECTION
-                        node.bitset.unset(idx);
-                        node.indexAt(idx).set(0);
+                        curr.bitset.unset(idx);
+                        curr.indexAt(idx).set(0);
                         // <- CRITICAL SECTION
-                        releaseOne(sub_idx);
+                        Pool.global.sync() catch {};
+                        Pool.global.release(sub_idx) catch {};
                     }
                     break :init old;
                 } else {
-                    const val = node.indexAt(idx).get();
+                    const val = curr.indexAt(idx).get();
                     if (val == 0) return error.NotFound;
-                    node.indexAt(idx).set(0);
+                    curr.indexAt(idx).set(0);
                     break :init @bitCast(@as(u8, @truncate(val)));
                 }
             };
 
-            // Prune `node` if it's empty and not the top node
-            if (right_node_idx) |r_idx| {
-                if (@as(u8, @bitCast(node.data)) == 0 and node.valcntbounded(1) == 0) {
-                    const top_node = try index_at.getNode();
-                    const right_idx = top_node.indexAt(r_idx).get();
-                    // -> CRITICAL SECTION
-                    top_node.bitset.unset(r_idx);
-                    top_node.indexAt(r_idx).set(0);
-                    // <- CRITICAL SECTION
-                    try releaseLine(right_idx, false);
+            // Prune `curr` if it's completely empty
+            if (@as(u8, @bitCast(curr.data)) == 0 and curr.valcntbounded(1) == 0) {
+                if (top_idx == curr_idx) {
+                    // curr is the top_node. Prune it from its parent.
+                    if (top_parent_idx != 0) {
+                        var top_parent = try fromIdx(top_parent_idx);
+                        top_parent.bitset.unset(top_parent_byte);
+                        top_parent.indexAt(top_parent_byte).set(0);
+                        Pool.global.sync() catch {};
+                        Pool.global.release(top_idx) catch {};
+                    }
+                } else {
+                    // curr is a descendant of top_node. Snip the chain and release it.
+                    var top_node = try fromIdx(top_idx);
+                    if (top_child_byte) |tcb| {
+                        const chain_head_idx = top_node.indexAt(tcb).get();
+                        top_node.bitset.unset(tcb);
+                        top_node.indexAt(tcb).set(0);
+                        try releaseLine(chain_head_idx, false);
+                    } else {
+                        // top_child_byte is null, meaning top_node is the head of the chain.
+                        const child = top_node.findFirstChild() orelse unreachable;
+                        const chain_head_idx = child.val;
+                        top_node.bitset.unset(child.idx);
+                        top_node.indexAt(child.idx).set(0);
+                        try releaseLine(chain_head_idx, false);
+                    }
                 }
             }
 
-            // Check top_node for merge or prune
-            const top_node = try index_at.getNode();
-            const top_valcnt = top_node.valcntbounded(2);
-
-            if (@as(u8, @bitCast(top_node.data)) == 0 and top_valcnt == 0) {
-                // removed the very last node
-                std.debug.assert(@intFromPtr(index_at.arr) == @intFromPtr(&index_at_buf));
-                return old_data;
-            }
-
-            // Top node has data
-            if (@as(u8, @bitCast(top_node.data)) != 0 or top_valcnt != 1) return old_data;
-
-            // Merge top_node with its single remaining child
-            const child = top_node.findFirstChild() orelse unreachable;
-            const left_byte_idx = child.idx;
-
-            if (!child.is_node) {
-                const child_data: Mode = @bitCast(@as(u8, @truncate(child.val)));
-                if (top_node.radix_len + 1 > top_node.radix_str.len) {
-                    return old_data;
-                }
-                top_node.radix_str[top_node.radix_len] = left_byte_idx;
-
-                // -> CRITICAL SECTION
-                top_node.data = child_data;
-                top_node.radix_len += 1;
-                top_node.indexAt(left_byte_idx).set(0);
-                // <- CRITICAL SECTION
-
-                return old_data;
-            }
-
-            const left_node_idx = child.val;
-            const left_node = try fromIdx(left_node_idx);
-
-            const top_len = top_node.radix_len;
-            const left_len = left_node.radix_len;
-            const new_len = @as(usize, top_len) + 1 + left_len;
-
-            if (new_len <= left_node.radix_str.len) {
-                const old_top_idx = index_at.get();
-
-                // -> CRITICAL SECTION
-                const offset = top_len + 1;
-                std.mem.copyBackwards(u8, left_node.radix_str[offset .. offset + left_len], left_node.radix_str[0..left_len]);
-                @memcpy(left_node.radix_str[0..top_len], top_node.radix_str[0..top_len]);
-                left_node.radix_str[top_len] = left_byte_idx;
-                left_node.radix_len = @intCast(new_len);
-                index_at.set(left_node_idx);
-                // <- CRITICAL SECTION
-
-                releaseOne(old_top_idx);
-                return old_data;
-            }
-
-            // TODO: we can and should merge this [shift strings up in a chain of these ] but skipping it for now
-            // Implementation: Shift as many bytes as possible from left_node up to top_node
-            // const capacity = top_node.radix_str.len;
-            // if (top_len < capacity) {
-            //     const absorb = capacity - top_len;
-            //     const K = absorb - 1;
-            //     const actual_K = @min(K, left_len);
-            //
-            //     top_node.radix_str[top_len] = left_byte_idx;
-            //     @memcpy(top_node.radix_str[top_len + 1 .. top_len + 1 + actual_K], left_node.radix_str[0..actual_K]);
-            //     top_node.radix_len = top_len + 1 + actual_K;
-            //
-            //     top_node.bitset.unset(left_byte_idx);
-            //     top_node.indexAt(left_byte_idx).set(0);
-            //
-            //     const new_left_byte_idx = left_node.radix_str[actual_K];
-            //     top_node.bitset.set(new_left_byte_idx);
-            //     top_node.indexAt(new_left_byte_idx).set(left_node_idx);
-            //
-            //     const new_left_len = left_len - (actual_K + 1);
-            //     std.mem.copyForwards(u8, left_node.radix_str[0..new_left_len], left_node.radix_str[actual_K + 1 .. left_len]);
-            //     left_node.radix_len = @intCast(new_left_len);
-            // }
+            Pool.global.sync() catch {};
             return old_data;
         },
         .next => |idx| {
-            if (!node.bitset.isSet(idx)) {
+            if (!curr.bitset.isSet(idx)) {
                 @branchHint(.cold);
                 return error.NotFound;
             }
 
-            const valcnt = node.valcntbounded(2);
-            if (valcnt > 1 or (valcnt == 1 and @as(u8, @bitCast(node.data)) != 0)) {
-                // Update top node (index_at) ONLY if current node is a fork or has data
-                index_at = node.indexAt(idx);
-                right_node_idx = null;
-            } else if (right_node_idx == null) {
-                // Node has 1 child and no data. Top node stays, right node is this child.
-                right_node_idx = idx;
+            const valcnt = curr.valcntbounded(2);
+            if (valcnt > 1 or (valcnt == 1 and @as(u8, @bitCast(curr.data)) != 0)) {
+                // curr becomes the new top_node. The child we step into is top_node's child.
+                top_idx = curr_idx;
+                top_parent_idx = parent_idx;
+                top_parent_byte = parent_byte;
+                top_child_byte = idx;
             }
 
-            path = path[node.radix_len + 1 ..];
-            node = try node.indexAt(idx).getNode();
-            continue :blk node.next(path);
+            path = path[curr.radix_len + 1 ..];
+
+            parent_idx = curr_idx;
+            parent_byte = idx;
+            curr_idx = curr.indexAt(idx).get();
+            curr = try fromIdx(curr_idx);
         },
         .diff => {
             @branchHint(.cold);
             return error.NotFound;
         },
-    }
+    };
 }
 
 /// Acquire a brand new node from the pool and init it with the required values
-fn acquire() !u24 {
+inline fn acquire() !u24 {
     const node_idx = try Pool.global.acquire();
     const node = fromIdx(node_idx) catch unreachable;
     node.* = .{};

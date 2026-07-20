@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const root = @import("root.zig");
+const trie = @import("trie.zig");
 
 const posix = std.posix;
 const linux = std.os.linux;
@@ -72,12 +72,12 @@ pub const OOB = if (check_oob) error{
     /// The file was invalid and would have done an out of bounds access
     OutOfBounds,
 } else error{};
-pub fn nodeAt(self: *@This(), idx: u24) OOB!*root.Node {
+pub fn nodeAt(self: *@This(), idx: u24) OOB!*trie.Node {
     const off = @as(usize, idx) << 10;
     if (check_oob) {
         if (off + 1024 > self.mem.len) return OOB.OutOfBounds;
     }
-    return @as(*root.Node, @ptrCast(@alignCast(self.mem[off..][0 .. 1 << 10].ptr)));
+    return @ptrCast(@alignCast(self.mem[off..][0 .. 1 << 10].ptr));
 }
 
 /// Validation error
@@ -242,7 +242,7 @@ pub fn release(self: *@This(), idx: u24) OOB!void {
     }
 }
 
-pub fn indexOf(self: *@This(), node: *root.Node) OOB!u24 {
+pub fn indexOf(self: *@This(), node: *trie.Node) OOB!u24 {
     const int = @intFromPtr(node);
     const mem = @intFromPtr(self.mem.ptr);
     if ((int & 0b11_1111_1111) != 0) return OOB.OutOfBounds;
@@ -435,7 +435,7 @@ test "Pool indexOf out of bounds" {
     try initTestPool();
 
     // Create a dummy node not in the pool
-    var dummy: root.Node = .{};
+    var dummy: trie.Node = .{};
 
     // Should return OutOfBounds because the pointer is outside mem
     try testing.expectError(error.OutOfBounds, global.indexOf(&dummy));
