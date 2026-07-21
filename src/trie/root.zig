@@ -134,12 +134,17 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
     }
 }
 
+
 pub fn get(_path: []const u8) !?Mode {
     var path = _path;
     if (path.len == 0) return null;
     var node = try fromIdx(@intCast(Pool.global.block().root));
 
-    blk: switch (node.next(path)) {
+    while (true) switch (node.next(path)) {
+        .exact => {
+            if (@as(u8, @bitCast(node.data)) == 0) return null;
+            return node.data;
+        },
         .this => |idx| {
             if (node.bitset.isSet(idx)) {
                 const sub = try node.indexAt(idx).getNode();
@@ -148,124 +153,15 @@ pub fn get(_path: []const u8) !?Mode {
             } else {
                 const val = node.indexAt(idx).get();
                 if (val == 0) return null;
-                return @bitCast(@as(u8, @truncate(val)));
+                return inlineToMode(val);
             }
         },
         .next => |idx| {
             if (!node.bitset.isSet(idx)) return null;
             path = path[node.radix_len + 1 ..];
             node = try node.indexAt(idx).getNode();
-            continue :blk node.next(path);
         },
-        .diff => {
-            return null;
-        },
-    }
-}
-
-pub fn del(_path: []const u8) !Mode {
-    std.debug.assert(_path.len != 0);
-    var path = _path;
-
-    var curr_idx: u24 = @intCast(Pool.global.block().root);
-    var parent_idx: u24 = 0;
-    var parent_byte: u8 = 0;
-
-    var top_idx: u24 = curr_idx;
-    var top_parent_idx: u24 = 0;
-    var top_parent_byte: u8 = 0;
-    var top_child_byte: ?u8 = null;
-
-    var curr = try fromIdx(curr_idx);
-
-    while (true) switch (curr.next(path)) {
-        .this => |idx| {
-            // Delete data
-            const old_data: Mode = init: {
-                if (curr.bitset.isSet(idx)) {
-                    const sub_idx = curr.indexAt(idx).get();
-                    const sub = try fromIdx(sub_idx);
-                    if (@as(u8, @bitCast(sub.data)) == 0) return error.NotFound;
-                    const old = sub.data;
-                    sub.data = .midway;
-
-                    // If sub is empty, remove it from curr
-                    if (sub.valcntbounded(1) == 0) {
-                        // -> CRITICAL SECTION
-                        curr.bitset.unset(idx);
-                        curr.indexAt(idx).set(0);
-                        // <- CRITICAL SECTION
-                        Pool.global.sync() catch {};
-                        Pool.global.release(sub_idx) catch {};
-                    }
-                    break :init old;
-                } else {
-                    const val = curr.indexAt(idx).get();
-                    if (val == 0) return error.NotFound;
-                    curr.indexAt(idx).set(0);
-                    break :init @bitCast(@as(u8, @truncate(val)));
-                }
-            };
-
-            // Prune `curr` if it's completely empty
-            if (@as(u8, @bitCast(curr.data)) == 0 and curr.valcntbounded(1) == 0) {
-                if (top_idx == curr_idx) {
-                    // curr is the top_node. Prune it from its parent.
-                    if (top_parent_idx != 0) {
-                        var top_parent = try fromIdx(top_parent_idx);
-                        top_parent.bitset.unset(top_parent_byte);
-                        top_parent.indexAt(top_parent_byte).set(0);
-                        Pool.global.sync() catch {};
-                        Pool.global.release(top_idx) catch {};
-                    }
-                } else {
-                    // curr is a descendant of top_node. Snip the chain and release it.
-                    var top_node = try fromIdx(top_idx);
-                    if (top_child_byte) |tcb| {
-                        const chain_head_idx = top_node.indexAt(tcb).get();
-                        top_node.bitset.unset(tcb);
-                        top_node.indexAt(tcb).set(0);
-                        try releaseLine(chain_head_idx, false);
-                    } else {
-                        // top_child_byte is null, meaning top_node is the head of the chain.
-                        const child = top_node.findFirstChild() orelse unreachable;
-                        const chain_head_idx = child.val;
-                        top_node.bitset.unset(child.idx);
-                        top_node.indexAt(child.idx).set(0);
-                        try releaseLine(chain_head_idx, false);
-                    }
-                }
-            }
-
-            Pool.global.sync() catch {};
-            return old_data;
-        },
-        .next => |idx| {
-            if (!curr.bitset.isSet(idx)) {
-                @branchHint(.cold);
-                return error.NotFound;
-            }
-
-            const valcnt = curr.valcntbounded(2);
-            if (valcnt > 1 or (valcnt == 1 and @as(u8, @bitCast(curr.data)) != 0)) {
-                // curr becomes the new top_node. The child we step into is top_node's child.
-                top_idx = curr_idx;
-                top_parent_idx = parent_idx;
-                top_parent_byte = parent_byte;
-                top_child_byte = idx;
-            }
-
-            path = path[curr.radix_len + 1 ..];
-
-            parent_idx = curr_idx;
-            parent_byte = idx;
-            curr_idx = curr.indexAt(idx).get();
-            curr = try fromIdx(curr_idx);
-        },
-        .diff => {
-            @branchHint(.cold);
-            return error.NotFound;
-        },
+        .diff => return null,
     };
 }
 
@@ -279,6 +175,18 @@ inline fn acquire() !u24 {
 
 fn fromIdx(idx: u24) Pool.OOB!*Node {
     return Pool.global.nodeAt(idx);
+}
+
+inline fn modeToInline(data: Mode) u24 {
+    return @as(u24, @as(u8, @bitCast(data)));
+}
+
+inline fn inlineToMode(val: u24) Mode {
+    return @bitCast(@as(u8, @truncate(val)));
+}
+
+inline fn isEmpty(node: *Node) bool {
+    return @as(u8, @bitCast(node.data)) == 0 and node.valcntbounded(1) == 0;
 }
 
 /// Releases a whole line of nodes starting from `start_idx`.
@@ -350,19 +258,24 @@ pub const Node = extern struct {
         next: u8,
         /// There was a difference bw the node's radix_str and your path at idx `diff`
         diff: u8,
+        /// This node itself contains the data inline
+        exact: void,
     };
     fn next(self: *@This(), path: []const u8) Next {
-        if (path.len == 1) {
-            @branchHint(.unlikely);
-            if (self.radix_len == 0) return .{ .this = path[0] };
-            return .{ .diff = 0 };
+        const shortest = @min(path.len, self.radix_len);
+        const maybe_consumed = mem.findDiff(u8, self.radix_str[0..shortest], path[0..shortest]);
+        if (maybe_consumed) |consumed| {
+            return .{ .diff = @intCast(consumed) };
         }
-        const maybe_consumed = mem.findDiff(u8, self.radix_str[0..self.radix_len], path[0 .. path.len - 1]);
-        if (maybe_consumed == null) return .{ .this = path[path.len - 1] };
-
-        const consumed = maybe_consumed.?;
-        if (consumed == self.radix_len) return .{ .next = path[self.radix_len] };
-        return .{ .diff = @as(u8, @intCast(consumed)) };
+        if (path.len == self.radix_len) return .exact;
+        if (path.len > self.radix_len) {
+            if (path.len - self.radix_len == 1) {
+                return .{ .this = path[self.radix_len] };
+            } else {
+                return .{ .next = path[self.radix_len] };
+            }
+        }
+        return .{ .diff = @intCast(path.len) };
     }
 
     fn valcntbounded(self: *@This(), comptime less_than: comptime_int) u8 {
@@ -400,6 +313,8 @@ const PathTooLong = error{
     /// The file was invalid or had overlong path.
     /// the only valid reason for this to happen is if the file was created by a version that supports longer paths.
     PathTooLong,
+    /// The trie itself is corrupted and requires repair
+    CorruptedTrie,
 };
 
 pub const BlkIdx = packed struct(u32) {

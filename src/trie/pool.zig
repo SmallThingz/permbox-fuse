@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const trie = @import("trie.zig");
+const trie = @import("root.zig");
 
 const posix = std.posix;
 const linux = std.os.linux;
