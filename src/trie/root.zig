@@ -19,31 +19,30 @@ pub fn add(_path: []const u8, data: Mode) !void {
     var curr = try fromIdx(curr_idx);
 
     while (true) switch (curr.next(path)) {
+        .exact => {
+            curr.data = data;
+            Pool.global.sync() catch {};
+            return;
+        },
         .this => |idx| {
             if (curr.bitset.isSet(idx)) {
                 const next = try curr.indexAt(idx).getNode();
                 next.data = data;
             } else {
-                curr.indexAt(idx).set(@as(u24, @as(u8, @bitCast(data))));
+                curr.indexAt(idx).set(modeToInline(data));
             }
-            try Pool.global.sync();
+            Pool.global.sync() catch {};
             return;
         },
-        .next => |idx| { // Go to next node
+        .next => |idx| {
             path = path[curr.radix_len + 1 ..];
-            std.debug.assert(path.len != 0);
 
             if (!curr.bitset.isSet(idx)) {
                 const inline_val = curr.indexAt(idx).get();
                 const new_idx = try create(path, data, inline_val);
-                curr = try fromIdx(curr_idx); // Re-fetch curr in case create() resized
-                Pool.global.sync() catch {};
-
-                // -> CRITICAL SECTION
+                curr = try fromIdx(curr_idx);
                 curr.bitset.set(idx);
                 curr.indexAt(idx).set(new_idx);
-                // <- CRITICAL SECTION
-
                 Pool.global.sync() catch {};
                 return;
             }
@@ -55,49 +54,53 @@ pub fn add(_path: []const u8, data: Mode) !void {
         },
         .diff => |idx| {
             const ogpath = path;
-            path = path[idx + 1 ..];
-
             const left_idx = try acquire();
-            errdefer Pool.global.release(left_idx) catch unreachable;
-            var left = fromIdx(left_idx) catch unreachable;
-            curr = fromIdx(curr_idx) catch unreachable;
+            errdefer Pool.global.release(left_idx) catch {};
+            var left = try fromIdx(left_idx);
+            curr = try fromIdx(curr_idx);
+
             left.radix_len = curr.radix_len - idx - 1;
             left.data = curr.data;
+            left.is_split = curr.is_split;
             @memcpy(left.radix_str[0..left.radix_len], curr.radix_str[idx + 1 .. curr.radix_len]);
             left.bitset = curr.bitset;
             left.idx_arr = curr.idx_arr;
 
             const top_idx = try acquire();
-            errdefer Pool.global.release(top_idx) catch unreachable;
-            var top = fromIdx(top_idx) catch unreachable;
-            curr = fromIdx(curr_idx) catch unreachable;
+            errdefer Pool.global.release(top_idx) catch {};
+            var top = try fromIdx(top_idx);
+            curr = try fromIdx(curr_idx);
+
             top.radix_len = idx;
             top.data = .midway;
+            top.is_split = true;
             @memcpy(top.radix_str[0..idx], curr.radix_str[0..idx]);
             top.bitset.set(curr.radix_str[idx]);
             top.indexAt(curr.radix_str[idx]).set(left_idx);
 
-            if (path.len != 0) {
-                const right_idx = try create(path, data, 0);
-                top = fromIdx(top_idx) catch unreachable;
-                top.bitset.set(ogpath[idx]);
-                top.indexAt(ogpath[idx]).set(right_idx);
+            top = try fromIdx(top_idx);
+            if (idx == ogpath.len) {
+                top.data = data;
             } else {
-                top.indexAt(ogpath[idx]).set(@as(u24, @as(u8, @bitCast(data))));
+                const new_path = ogpath[idx + 1 ..];
+                if (new_path.len != 0) {
+                    const right_idx = try create(new_path, data, 0);
+                    top.bitset.set(ogpath[idx]);
+                    top.indexAt(ogpath[idx]).set(right_idx);
+                } else {
+                    top.indexAt(ogpath[idx]).set(modeToInline(data));
+                }
             }
 
-            // -> CRITICAL SECTION
             if (parent_idx == 0) {
                 Pool.global.block().root = top_idx;
             } else {
-                var parent_node = fromIdx(parent_idx) catch unreachable;
+                var parent_node = try fromIdx(parent_idx);
                 parent_node.indexAt(parent_byte).set(top_idx);
             }
-            // <- CRITICAL SECTION
 
             Pool.global.sync() catch {};
-            // Handle error some other way; the operation is success
-            Pool.global.release(curr_idx) catch {};
+            try Pool.global.release(curr_idx);
             return;
         },
     };
@@ -108,25 +111,46 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
     errdefer releaseLine(new_idx, true);
 
     var current_idx = new_idx;
-    var current = fromIdx(current_idx) catch unreachable;
-    current.data = if (inline_val == 0) .midway else @bitCast(@as(u8, @truncate(inline_val)));
+    var current = try fromIdx(current_idx);
+    current.data = if (inline_val == 0) .midway else inlineToMode(inline_val);
 
     var curr_path = path;
-    while (true) {
-        current.radix_len = @min(curr_path.len - 1, current.radix_str.len);
-        @memcpy(current.radix_str[0..current.radix_len], curr_path[0..current.radix_len]);
+    if (inline_val != 0) {
+        current.radix_len = 0;
+        const next_byte = curr_path[0];
+        curr_path = curr_path[1..];
 
-        const next_idx = curr_path[current.radix_len];
-        curr_path = curr_path[current.radix_len + 1 ..];
         if (curr_path.len == 0) {
-            current.indexAt(next_idx).set(@as(u24, @as(u8, @bitCast(data))));
+            current.indexAt(next_byte).set(modeToInline(data));
             return new_idx;
         }
 
         const new_next = try acquire();
-        current = fromIdx(current_idx) catch unreachable;
-        current.bitset.set(next_idx);
-        current.indexAt(next_idx).set(new_next);
+        current = try fromIdx(current_idx);
+        current.bitset.set(next_byte);
+        current.indexAt(next_byte).set(new_next);
+
+        current_idx = new_next;
+        current = try fromIdx(current_idx);
+        current.data = .midway;
+    }
+
+    while (true) {
+        current.radix_len = @min(curr_path.len - 1, current.radix_str.len);
+        @memcpy(current.radix_str[0..current.radix_len], curr_path[0..current.radix_len]);
+
+        const next_byte = curr_path[current.radix_len];
+        curr_path = curr_path[current.radix_len + 1 ..];
+
+        if (curr_path.len == 0) {
+            current.indexAt(next_byte).set(modeToInline(data));
+            return new_idx;
+        }
+
+        const new_next = try acquire();
+        current = try fromIdx(current_idx);
+        current.bitset.set(next_byte);
+        current.indexAt(next_byte).set(new_next);
 
         current_idx = new_next;
         current = try fromIdx(current_idx);
@@ -134,6 +158,173 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
     }
 }
 
+pub fn del(_path: []const u8) !Mode {
+    std.debug.assert(_path.len != 0);
+    var path = _path;
+
+    var curr_idx: u24 = @intCast(Pool.global.block().root);
+    var curr = try fromIdx(curr_idx);
+
+    // FIX 1: Add missing declarations
+    var parent_idx: u24 = 0;
+    var parent_byte: u8 = 0;
+
+    var top_idx: u24 = curr_idx;
+    var top_parent_idx: u24 = 0;
+    var top_parent_byte: u8 = 0;
+    var top_child_byte: ?u8 = null;
+
+    const old_data: Mode = del: {
+        while (true) {
+            switch (curr.next(path)) {
+                .exact => {
+                    if (@as(u8, @bitCast(curr.data)) == 0) return error.NotFound;
+                    const old = curr.data;
+                    curr.data = .midway;
+                    break :del old;
+                },
+                .this => |idx| {
+                    if (curr.bitset.isSet(idx)) {
+                        const sub_idx = curr.indexAt(idx).get();
+                        const sub = try fromIdx(sub_idx);
+                        if (@as(u8, @bitCast(sub.data)) == 0) return error.NotFound;
+                        const old = sub.data;
+                        sub.data = .midway;
+
+                        if (isEmpty(sub)) {
+                            curr.bitset.unset(idx);
+                            curr.indexAt(idx).set(0);
+                            Pool.global.release(sub_idx) catch return error.CorruptedTrie;
+                        }
+                        break :del old;
+                    } else {
+                        const val = curr.indexAt(idx).get();
+                        if (val == 0) return error.NotFound;
+                        curr.indexAt(idx).set(0);
+                        break :del inlineToMode(val);
+                    }
+                },
+                .next => |idx| {
+                    if (!curr.bitset.isSet(idx)) return error.NotFound;
+
+                    const valcnt = curr.valcntbounded(2);
+                    if (valcnt > 1 or (valcnt == 1 and @as(u8, @bitCast(curr.data)) != 0)) {
+                        top_parent_idx = parent_idx;
+                        top_parent_byte = parent_byte;
+                        top_idx = curr_idx;
+                        top_child_byte = idx;
+                    } else if (top_child_byte == null) {
+                        top_child_byte = idx;
+                    }
+
+                    parent_idx = curr_idx;
+                    parent_byte = idx;
+
+                    path = path[curr.radix_len + 1 ..];
+                    curr_idx = curr.indexAt(idx).get();
+                    curr = try fromIdx(curr_idx);
+                    continue;
+                },
+                .diff => return error.NotFound,
+            }
+        }
+    };
+
+    // Prune empty nodes
+    var p_idx: u24 = 0;
+    var p_parent_idx: u24 = 0;
+    var p_parent_byte: u8 = 0;
+
+    while (true) {
+        const prune_node = try fromIdx(curr_idx);
+        if (!isEmpty(prune_node)) {
+            // FIX 2: Check prune_idx, not top_idx
+            p_idx = curr_idx;
+            if (curr_idx == top_idx) {
+                p_parent_idx = top_parent_idx;
+                p_parent_byte = top_parent_byte;
+            } else {
+                p_parent_idx = top_idx;
+                p_parent_byte = top_child_byte orelse 0;
+            }
+            break;
+        }
+
+        if (curr_idx == top_idx) {
+            if (top_parent_idx != 0) {
+                const top_parent = try fromIdx(top_parent_idx);
+                top_parent.bitset.unset(top_parent_byte);
+                top_parent.indexAt(top_parent_byte).set(0);
+                Pool.global.sync() catch {};
+                Pool.global.release(top_idx) catch return error.CorruptedTrie;
+            }
+            Pool.global.sync() catch {};
+            return old_data;
+        } else {
+            const top_node = try fromIdx(top_idx);
+            if (top_child_byte) |tcb| {
+                const chain_head_idx = top_node.indexAt(tcb).get();
+                top_node.bitset.unset(tcb);
+                top_node.indexAt(tcb).set(0);
+                Pool.global.sync() catch {};
+                releaseLine(chain_head_idx, false) catch return error.CorruptedTrie;
+            }
+            p_idx = top_idx;
+            p_parent_idx = top_parent_idx;
+            p_parent_byte = top_parent_byte;
+            break;
+        }
+    }
+
+    const prune_node = try fromIdx(p_idx);
+
+    // Rule A: Demote inline data promotion
+    if (prune_node.valcntbounded(1) == 0 and @as(u8, @bitCast(prune_node.data)) != 0 and prune_node.radix_len == 0) {
+        if (p_parent_idx != 0) {
+            const parent_node = try fromIdx(p_parent_idx);
+            parent_node.bitset.unset(p_parent_byte);
+            parent_node.indexAt(p_parent_byte).set(modeToInline(prune_node.data));
+            Pool.global.sync() catch {};
+            Pool.global.release(p_idx) catch return error.CorruptedTrie;
+            return old_data;
+        }
+    }
+
+    // Rule B: Standard string merge
+    if (prune_node.valcntbounded(2) == 1 and @as(u8, @bitCast(prune_node.data)) == 0 and prune_node.is_split) {
+        const child = prune_node.findFirstChild() orelse unreachable;
+        if (child.is_node) {
+            const child_byte = child.idx;
+            const left_node_idx = child.val;
+            const left_node = try fromIdx(left_node_idx);
+
+            const top_len = prune_node.radix_len;
+            const left_len = left_node.radix_len;
+            const new_len = @as(usize, top_len) + 1 + left_len;
+
+            if (new_len <= left_node.radix_str.len) {
+                const offset = top_len + 1;
+                std.mem.copyBackwards(u8, left_node.radix_str[offset .. offset + left_len], left_node.radix_str[0..left_len]);
+                @memcpy(left_node.radix_str[0..top_len], prune_node.radix_str[0..top_len]);
+                left_node.radix_str[top_len] = child_byte;
+                left_node.radix_len = @intCast(new_len);
+
+                if (p_parent_idx != 0) {
+                    const parent_node = try fromIdx(p_parent_idx);
+                    parent_node.indexAt(p_parent_byte).set(left_node_idx);
+                } else {
+                    Pool.global.block().root = left_node_idx;
+                }
+                Pool.global.sync() catch {};
+                Pool.global.release(p_idx) catch return error.CorruptedTrie;
+                return old_data;
+            }
+        }
+    }
+
+    Pool.global.sync() catch {};
+    return old_data;
+}
 
 pub fn get(_path: []const u8) !?Mode {
     var path = _path;
