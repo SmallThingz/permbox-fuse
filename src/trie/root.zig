@@ -13,6 +13,14 @@ pub fn add(_path: []const u8, data: Mode) !void {
     std.debug.assert(_path.len != 0);
     var path = _path;
 
+    if (Pool.global.block().root == 0) {
+        @branchHint(.cold);
+        const new_idx = try create(path, data, 0);
+        Pool.global.block().root = new_idx;
+        try Pool.global.sync();
+        return;
+    }
+
     var curr_idx: u24 = @intCast(Pool.global.block().root);
     var parent_idx: u24 = 0;
     var parent_byte: u8 = 0;
@@ -21,7 +29,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
     while (true) switch (curr.next(path)) {
         .exact => {
             curr.data = data;
-            Pool.global.sync() catch {};
+            try Pool.global.sync();
             return;
         },
         .this => |idx| {
@@ -31,7 +39,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
             } else {
                 curr.indexAt(idx).set(modeToInline(data));
             }
-            Pool.global.sync() catch {};
+            try Pool.global.sync();
             return;
         },
         .next => |idx| {
@@ -43,7 +51,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                 curr = try fromIdx(curr_idx);
                 curr.bitset.set(idx);
                 curr.indexAt(idx).set(new_idx);
-                Pool.global.sync() catch {};
+                try Pool.global.sync();
                 return;
             }
 
@@ -58,10 +66,9 @@ pub fn add(_path: []const u8, data: Mode) !void {
             errdefer Pool.global.release(left_idx) catch {};
             var left = try fromIdx(left_idx);
             curr = try fromIdx(curr_idx);
-
+            
             left.radix_len = curr.radix_len - idx - 1;
             left.data = curr.data;
-            left.is_split = curr.is_split;
             @memcpy(left.radix_str[0..left.radix_len], curr.radix_str[idx + 1 .. curr.radix_len]);
             left.bitset = curr.bitset;
             left.idx_arr = curr.idx_arr;
@@ -70,10 +77,9 @@ pub fn add(_path: []const u8, data: Mode) !void {
             errdefer Pool.global.release(top_idx) catch {};
             var top = try fromIdx(top_idx);
             curr = try fromIdx(curr_idx);
-
+            
             top.radix_len = idx;
             top.data = .midway;
-            top.is_split = true;
             @memcpy(top.radix_str[0..idx], curr.radix_str[0..idx]);
             top.bitset.set(curr.radix_str[idx]);
             top.indexAt(curr.radix_str[idx]).set(left_idx);
@@ -99,7 +105,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                 parent_node.indexAt(parent_byte).set(top_idx);
             }
 
-            Pool.global.sync() catch {};
+            try Pool.global.sync();
             try Pool.global.release(curr_idx);
             return;
         },
@@ -109,7 +115,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
 fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
     const new_idx = try acquire();
     errdefer releaseLine(new_idx, true);
-
+    
     var current_idx = new_idx;
     var current = try fromIdx(current_idx);
     current.data = if (inline_val == 0) .midway else inlineToMode(inline_val);
@@ -119,17 +125,17 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
         current.radix_len = 0;
         const next_byte = curr_path[0];
         curr_path = curr_path[1..];
-
+        
         if (curr_path.len == 0) {
             current.indexAt(next_byte).set(modeToInline(data));
             return new_idx;
         }
-
+        
         const new_next = try acquire();
         current = try fromIdx(current_idx);
         current.bitset.set(next_byte);
         current.indexAt(next_byte).set(new_next);
-
+        
         current_idx = new_next;
         current = try fromIdx(current_idx);
         current.data = .midway;
@@ -141,7 +147,7 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
 
         const next_byte = curr_path[current.radix_len];
         curr_path = curr_path[current.radix_len + 1 ..];
-
+        
         if (curr_path.len == 0) {
             current.indexAt(next_byte).set(modeToInline(data));
             return new_idx;
@@ -160,12 +166,16 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
 
 pub fn del(_path: []const u8) !Mode {
     std.debug.assert(_path.len != 0);
+    if (Pool.global.block().root == 0) {
+        @branchHint(.cold);
+        return error.NotFound;
+    }
+    
     var path = _path;
 
     var curr_idx: u24 = @intCast(Pool.global.block().root);
     var curr = try fromIdx(curr_idx);
 
-    // FIX 1: Add missing declarations
     var parent_idx: u24 = 0;
     var parent_byte: u8 = 0;
 
@@ -230,50 +240,59 @@ pub fn del(_path: []const u8) !Mode {
         }
     };
 
-    // Prune empty nodes
+    // Determine the highest non-empty node (p_idx) and its parent
     var p_idx: u24 = 0;
     var p_parent_idx: u24 = 0;
     var p_parent_byte: u8 = 0;
 
-    while (true) {
-        const prune_node = try fromIdx(curr_idx);
-        if (!isEmpty(prune_node)) {
-            // FIX 2: Check prune_idx, not top_idx
-            p_idx = curr_idx;
-            if (curr_idx == top_idx) {
-                p_parent_idx = top_parent_idx;
-                p_parent_byte = top_parent_byte;
-            } else {
-                p_parent_idx = top_idx;
-                p_parent_byte = top_child_byte orelse 0;
-            }
-            break;
-        }
-
+    if (!isEmpty(curr)) {
+        p_idx = curr_idx;
         if (curr_idx == top_idx) {
-            if (top_parent_idx != 0) {
-                const top_parent = try fromIdx(top_parent_idx);
-                top_parent.bitset.unset(top_parent_byte);
-                top_parent.indexAt(top_parent_byte).set(0);
-                Pool.global.sync() catch {};
-                Pool.global.release(top_idx) catch return error.CorruptedTrie;
-            }
-            Pool.global.sync() catch {};
-            return old_data;
-        } else {
-            const top_node = try fromIdx(top_idx);
-            if (top_child_byte) |tcb| {
-                const chain_head_idx = top_node.indexAt(tcb).get();
-                top_node.bitset.unset(tcb);
-                top_node.indexAt(tcb).set(0);
-                Pool.global.sync() catch {};
-                releaseLine(chain_head_idx, false) catch return error.CorruptedTrie;
-            }
-            p_idx = top_idx;
             p_parent_idx = top_parent_idx;
             p_parent_byte = top_parent_byte;
-            break;
+        } else {
+            p_parent_idx = top_idx;
+            p_parent_byte = top_child_byte orelse 0;
         }
+    } else if (curr_idx == top_idx) {
+        // top_idx itself is empty.
+        if (top_parent_idx != 0) {
+            const top_parent = try fromIdx(top_parent_idx);
+            top_parent.bitset.unset(top_parent_byte);
+            top_parent.indexAt(top_parent_byte).set(0);
+            Pool.global.sync() catch {};
+            Pool.global.release(top_idx) catch return error.CorruptedTrie;
+        } else {
+            // The root itself is empty. Release it and set root to 0.
+            Pool.global.sync() catch {};
+            Pool.global.release(top_idx) catch return error.CorruptedTrie;
+            Pool.global.block().root = 0;
+            Pool.global.sync() catch {};
+            return old_data;
+        }
+        return old_data; // No merge needed if the fork itself was pruned
+    } else {
+        // A descendant is empty. Snip the chain from top_node.
+        const top_node = try fromIdx(top_idx);
+        if (top_child_byte) |tcb| {
+            const chain_head_idx = top_node.indexAt(tcb).get();
+            top_node.bitset.unset(tcb);
+            top_node.indexAt(tcb).set(0);
+            Pool.global.sync() catch {};
+            releaseLine(chain_head_idx, false) catch return error.CorruptedTrie;
+        }
+        p_idx = top_idx;
+        p_parent_idx = top_parent_idx;
+        p_parent_byte = top_parent_byte;
+    }
+
+    // If the root itself became empty (e.g., lost its last child), clear it.
+    if (p_parent_idx == 0 and isEmpty(try fromIdx(p_idx))) {
+        Pool.global.sync() catch {};
+        Pool.global.release(p_idx) catch return error.CorruptedTrie;
+        Pool.global.block().root = 0;
+        Pool.global.sync() catch {};
+        return old_data;
     }
 
     const prune_node = try fromIdx(p_idx);
@@ -291,7 +310,7 @@ pub fn del(_path: []const u8) !Mode {
     }
 
     // Rule B: Standard string merge
-    if (prune_node.valcntbounded(2) == 1 and @as(u8, @bitCast(prune_node.data)) == 0 and prune_node.is_split) {
+    if (prune_node.valcntbounded(2) == 1 and @as(u8, @bitCast(prune_node.data)) == 0) {
         const child = prune_node.findFirstChild() orelse unreachable;
         if (child.is_node) {
             const child_byte = child.idx;
@@ -329,6 +348,11 @@ pub fn del(_path: []const u8) !Mode {
 pub fn get(_path: []const u8) !?Mode {
     var path = _path;
     if (path.len == 0) return null;
+    if (Pool.global.block().root == 0) {
+        @branchHint(.cold);
+        return null;
+    }
+    
     var node = try fromIdx(@intCast(Pool.global.block().root));
 
     while (true) switch (node.next(path)) {
