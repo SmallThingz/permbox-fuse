@@ -226,8 +226,14 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
     }
 
     std.debug.assert(blk.free_from <= self.mem.len >> 10);
-    defer blk.free_from += 1;
-    return @intCast(blk.free_from);
+    const idx: u24 = @intCast(blk.free_from);
+    const node = try self.nodeAt(idx);
+    // reset() can move the frontier back over nodes that used to be on the
+    // free list. They become sequential allocations again.
+    node.indexAt(0xff).set(0);
+    node.indexAt(0xfe).set(0);
+    blk.free_from += 1;
+    return idx;
 }
 
 const TruncateError = error{ResizeFailed};

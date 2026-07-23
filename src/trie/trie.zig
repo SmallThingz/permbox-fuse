@@ -14,6 +14,22 @@ fn lockIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
+/// Maps an existing trie file, or initializes an empty one when the file is
+/// shorter than the trie header. The trie owns `fd` after this succeeds.
+pub fn init(fd: std.c.fd_t) !void {
+    Pool.global = try Pool.init(fd);
+}
+
+pub fn deinit() void {
+    Pool.global.deinit();
+}
+
+pub fn reset() void {
+    trie_lock.lockUncancelable(lockIo());
+    defer trie_lock.unlock(lockIo());
+    Pool.global.reset();
+}
+
 /// Adds or replaces a path. The durable flush intentionally happens after the
 /// write lock is released: the in-memory mutation is already committed and an
 /// msync failure must not roll it back or hold up other trie users.
@@ -406,6 +422,22 @@ pub fn get(path: []const u8) !?Mode {
     trie_lock.lockSharedUncancelable(lockIo());
     defer trie_lock.unlockShared(lockIo());
     return getLocked(path);
+}
+
+/// Returns the exact rule or the nearest slash-delimited ancestor rule.
+/// The whole walk shares one read-side critical section.
+pub fn getLongestPrefix(path: []const u8) !?Mode {
+    trie_lock.lockSharedUncancelable(lockIo());
+    defer trie_lock.unlockShared(lockIo());
+
+    if (path.len == 0 or path[0] != '/') return null;
+    var prefix = path;
+    while (true) {
+        if (try getLocked(prefix)) |mode| return mode;
+        if (prefix.len == 1) return null;
+        const slash = std.mem.lastIndexOfScalar(u8, prefix, '/') orelse return null;
+        prefix = if (slash == 0) "/" else prefix[0..slash];
+    }
 }
 
 fn getLocked(_path: []const u8) !?Mode {
