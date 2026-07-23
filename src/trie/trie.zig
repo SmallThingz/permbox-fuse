@@ -3,13 +3,30 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mem = @import("mem.zig");
 const Pool = @import("pool.zig");
+const log = @import("log.zig");
 
 const native_endian = builtin.cpu.arch.endian();
-const max_depth = 1 << 12;
 const children_count = 1 << 8;
-const RadixInt = u8;
 
-pub fn add(_path: []const u8, data: Mode) !void {
+var trie_lock: std.Io.RwLock = .init;
+
+fn lockIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// Adds or replaces a path. The durable flush intentionally happens after the
+/// write lock is released: the in-memory mutation is already committed and an
+/// msync failure must not roll it back or hold up other trie users.
+pub fn add(path: []const u8, data: Mode) !void {
+    {
+        trie_lock.lockUncancelable(lockIo());
+        defer trie_lock.unlock(lockIo());
+        try addLocked(path, data);
+    }
+    syncAndLog();
+}
+
+fn addLocked(_path: []const u8, data: Mode) !void {
     std.debug.assert(_path.len != 0);
     var path = _path;
 
@@ -17,7 +34,6 @@ pub fn add(_path: []const u8, data: Mode) !void {
         @branchHint(.cold);
         const new_idx = try create(path, data, 0);
         Pool.global.block().root = new_idx;
-        try Pool.global.sync();
         return;
     }
 
@@ -29,7 +45,6 @@ pub fn add(_path: []const u8, data: Mode) !void {
     while (true) switch (curr.next(path)) {
         .exact => {
             curr.data = data;
-            try Pool.global.sync();
             return;
         },
         .this => |idx| {
@@ -41,7 +56,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                     // Create intermediate node N for this shorter path,
                     // link old subnode under N at its first radix byte.
                     const n_idx = try acquire();
-                    errdefer Pool.global.release(n_idx) catch {};
+                    errdefer releaseAndLog(n_idx, "unpublished prefix node");
                     sub = fromIdx(sub_idx) catch unreachable;
                     var n = try fromIdx(n_idx);
                     n.data = data;
@@ -52,7 +67,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
 
                     sub.radix_len -= 1;
                     if (sub.radix_len > 0) {
-                        std.mem.copyBackwards(u8, sub.radix_str[0..sub.radix_len], sub.radix_str[1..sub.radix_len + 1]);
+                        std.mem.copyForwards(u8, sub.radix_str[0..sub.radix_len], sub.radix_str[1 .. sub.radix_len + 1]);
                     }
 
                     curr = fromIdx(curr_idx) catch unreachable;
@@ -63,7 +78,6 @@ pub fn add(_path: []const u8, data: Mode) !void {
             } else {
                 curr.indexAt(idx).set(modeToInline(data));
             }
-            try Pool.global.sync();
             return;
         },
         .next => |idx| {
@@ -75,7 +89,6 @@ pub fn add(_path: []const u8, data: Mode) !void {
                 curr = try fromIdx(curr_idx);
                 curr.bitset.set(idx);
                 curr.indexAt(idx).set(new_idx);
-                try Pool.global.sync();
                 return;
             }
 
@@ -87,10 +100,10 @@ pub fn add(_path: []const u8, data: Mode) !void {
         .diff => |idx| {
             const ogpath = path;
             const left_idx = try acquire();
-            errdefer Pool.global.release(left_idx) catch {};
+            errdefer releaseAndLog(left_idx, "unpublished split child");
             var left = try fromIdx(left_idx);
             curr = try fromIdx(curr_idx);
-            
+
             left.radix_len = curr.radix_len - idx - 1;
             left.data = curr.data;
             @memcpy(left.radix_str[0..left.radix_len], curr.radix_str[idx + 1 .. curr.radix_len]);
@@ -98,10 +111,10 @@ pub fn add(_path: []const u8, data: Mode) !void {
             left.idx_arr = curr.idx_arr;
 
             const top_idx = try acquire();
-            errdefer Pool.global.release(top_idx) catch {};
+            errdefer releaseAndLog(top_idx, "unpublished split parent");
             var top = try fromIdx(top_idx);
             curr = try fromIdx(curr_idx);
-            
+
             top.radix_len = idx;
             top.data = .midway;
             @memcpy(top.radix_str[0..idx], curr.radix_str[0..idx]);
@@ -130,8 +143,7 @@ pub fn add(_path: []const u8, data: Mode) !void {
                 parent_node.indexAt(parent_byte).set(top_idx);
             }
 
-            try Pool.global.sync();
-            try Pool.global.release(curr_idx);
+            releaseAndLog(curr_idx, "replaced radix node");
             return;
         },
     };
@@ -139,8 +151,9 @@ pub fn add(_path: []const u8, data: Mode) !void {
 
 fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
     const new_idx = try acquire();
-    errdefer releaseLine(new_idx, true);
-    
+    errdefer releaseLine(new_idx) catch |err|
+        log.err("failed to reclaim unpublished trie chain at node {d}: {t}", .{ new_idx, err });
+
     var current_idx = new_idx;
     var current = try fromIdx(current_idx);
     current.data = if (inline_val == 0) .midway else inlineToMode(inline_val);
@@ -150,17 +163,17 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
         current.radix_len = 0;
         const next_byte = curr_path[0];
         curr_path = curr_path[1..];
-        
+
         if (curr_path.len == 0) {
             current.indexAt(next_byte).set(modeToInline(data));
             return new_idx;
         }
-        
+
         const new_next = try acquire();
         current = try fromIdx(current_idx);
         current.bitset.set(next_byte);
         current.indexAt(next_byte).set(new_next);
-        
+
         current_idx = new_next;
         current = try fromIdx(current_idx);
         current.data = .midway;
@@ -172,7 +185,7 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
 
         const next_byte = curr_path[current.radix_len];
         curr_path = curr_path[current.radix_len + 1 ..];
-        
+
         if (curr_path.len == 0) {
             current.indexAt(next_byte).set(modeToInline(data));
             return new_idx;
@@ -189,13 +202,24 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
     }
 }
 
-pub fn del(_path: []const u8) !Mode {
+/// Removes a path and returns its previous value.
+pub fn del(path: []const u8) !Mode {
+    const old_data = locked: {
+        trie_lock.lockUncancelable(lockIo());
+        defer trie_lock.unlock(lockIo());
+        break :locked try delLocked(path);
+    };
+    syncAndLog();
+    return old_data;
+}
+
+fn delLocked(_path: []const u8) !Mode {
     std.debug.assert(_path.len != 0);
     if (Pool.global.block().root == 0) {
         @branchHint(.cold);
         return error.NotFound;
     }
-    
+
     var path = _path;
 
     var curr_idx: u24 = @intCast(Pool.global.block().root);
@@ -230,7 +254,7 @@ pub fn del(_path: []const u8) !Mode {
                         if (isEmpty(sub)) {
                             curr.bitset.unset(idx);
                             curr.indexAt(idx).set(0);
-                            Pool.global.release(sub_idx) catch return error.CorruptedTrie;
+                            releaseAndLog(sub_idx, "empty terminal node");
                         }
                         break :del old;
                     } else {
@@ -290,14 +314,11 @@ pub fn del(_path: []const u8) !Mode {
             const top_parent = try fromIdx(top_parent_idx);
             top_parent.bitset.unset(top_parent_byte);
             top_parent.indexAt(top_parent_byte).set(0);
-            Pool.global.sync() catch {};
-            Pool.global.release(top_idx) catch return error.CorruptedTrie;
+            releaseAndLog(top_idx, "empty branch node");
         } else {
             // The root itself is empty. Release it and set root to 0.
-            Pool.global.sync() catch {};
-            Pool.global.release(top_idx) catch return error.CorruptedTrie;
             Pool.global.block().root = 0;
-            Pool.global.sync() catch {};
+            releaseAndLog(top_idx, "empty root node");
             return old_data;
         }
         return old_data; // No merge needed if the fork itself was pruned
@@ -308,8 +329,8 @@ pub fn del(_path: []const u8) !Mode {
             const chain_head_idx = top_node.indexAt(tcb).get();
             top_node.bitset.unset(tcb);
             top_node.indexAt(tcb).set(0);
-            Pool.global.sync() catch {};
-            releaseLine(chain_head_idx, false) catch return error.CorruptedTrie;
+            releaseLine(chain_head_idx) catch |err|
+                log.err("failed to reclaim detached trie chain at node {d}: {t}", .{ chain_head_idx, err });
         }
         p_idx = top_idx;
         p_parent_idx = top_parent_idx;
@@ -318,10 +339,8 @@ pub fn del(_path: []const u8) !Mode {
 
     // If the root itself became empty (e.g., lost its last child), clear it.
     if (p_parent_idx == 0 and isEmpty(try fromIdx(p_idx))) {
-        Pool.global.sync() catch {};
-        Pool.global.release(p_idx) catch return error.CorruptedTrie;
         Pool.global.block().root = 0;
-        Pool.global.sync() catch {};
+        releaseAndLog(p_idx, "empty root node");
         return old_data;
     }
 
@@ -333,8 +352,7 @@ pub fn del(_path: []const u8) !Mode {
             const parent_node = try fromIdx(p_parent_idx);
             parent_node.bitset.unset(p_parent_byte);
             parent_node.indexAt(p_parent_byte).set(modeToInline(prune_node.data));
-            Pool.global.sync() catch {};
-            Pool.global.release(p_idx) catch return error.CorruptedTrie;
+            releaseAndLog(p_idx, "inline-demoted node");
             return old_data;
         }
     }
@@ -347,42 +365,57 @@ pub fn del(_path: []const u8) !Mode {
             const left_node_idx = child.val;
             const left_node = try fromIdx(left_node_idx);
 
+            // A non-leaf child still relies on `.this` routing for its own
+            // entries. Prepending radix bytes would turn those lookups into an
+            // `.exact` match at the wrong node.
+            if (left_node.valcntbounded(1) != 0) return old_data;
+
             const top_len = prune_node.radix_len;
             const left_len = left_node.radix_len;
             const new_len = @as(usize, top_len) + 1 + left_len;
 
             if (new_len <= left_node.radix_str.len) {
+                // Resolve every fallible pointer before changing either node so
+                // an invalid parent cannot leave the child half-merged.
+                const parent_node = if (p_parent_idx != 0)
+                    try fromIdx(p_parent_idx)
+                else
+                    null;
+
                 const offset = top_len + 1;
                 std.mem.copyBackwards(u8, left_node.radix_str[offset .. offset + left_len], left_node.radix_str[0..left_len]);
                 @memcpy(left_node.radix_str[0..top_len], prune_node.radix_str[0..top_len]);
                 left_node.radix_str[top_len] = child_byte;
                 left_node.radix_len = @intCast(new_len);
 
-                if (p_parent_idx != 0) {
-                    const parent_node = try fromIdx(p_parent_idx);
-                    parent_node.indexAt(p_parent_byte).set(left_node_idx);
+                if (parent_node) |parent| {
+                    parent.indexAt(p_parent_byte).set(left_node_idx);
                 } else {
                     Pool.global.block().root = left_node_idx;
                 }
-                Pool.global.sync() catch {};
-                Pool.global.release(p_idx) catch return error.CorruptedTrie;
+                releaseAndLog(p_idx, "merged radix node");
                 return old_data;
             }
         }
     }
 
-    Pool.global.sync() catch {};
     return old_data;
 }
 
-pub fn get(_path: []const u8) !?Mode {
+pub fn get(path: []const u8) !?Mode {
+    trie_lock.lockSharedUncancelable(lockIo());
+    defer trie_lock.unlockShared(lockIo());
+    return getLocked(path);
+}
+
+fn getLocked(_path: []const u8) !?Mode {
     var path = _path;
     if (path.len == 0) return null;
     if (Pool.global.block().root == 0) {
         @branchHint(.cold);
         return null;
     }
-    
+
     var node = try fromIdx(@intCast(Pool.global.block().root));
 
     while (true) switch (node.next(path)) {
@@ -411,6 +444,20 @@ pub fn get(_path: []const u8) !?Mode {
     };
 }
 
+fn syncAndLog() void {
+    // A shared lock keeps the mmap stable against a writer-triggered mremap
+    // while still allowing concurrent lookups during the slow flush.
+    trie_lock.lockSharedUncancelable(lockIo());
+    defer trie_lock.unlockShared(lockIo());
+    Pool.global.sync() catch |err|
+        log.err("failed to persist committed trie update: {t}", .{err});
+}
+
+fn releaseAndLog(idx: u24, comptime reason: []const u8) void {
+    Pool.global.release(idx) catch |err|
+        log.err("failed to reclaim {s} {d}: {t}", .{ reason, idx, err });
+}
+
 /// Acquire a brand new node from the pool and init it with the required values
 inline fn acquire() !u24 {
     const node_idx = try Pool.global.acquire();
@@ -420,25 +467,25 @@ inline fn acquire() !u24 {
 }
 
 fn fromIdx(idx: u24) Pool.OOB!*Node {
-    return Pool.global.nodeAt(idx);
+    return Pool.global.activeNodeAt(idx);
 }
 
 fn dumpNode(idx: u24, visited: *std.AutoHashMap(u24, void), depth: usize) !void {
     if (idx == 0) return;
-    
+
     const gop = try visited.getOrPut(idx);
     if (gop.found_existing) return;
-    
+
     const node = try fromIdx(idx);
-    
+
     // Safe indenting: up to 40 levels deep (80 spaces)
     const indent_buf = " " ** 80;
     const indent = indent_buf[0..@min(depth * 2, indent_buf.len)];
-    
+
     std.debug.print("{s}node[{d}]: radix_len={d} data={x:0>2} radix_str='", .{
         indent, idx, node.radix_len, @as(u8, @bitCast(node.data)),
     });
-    
+
     const rlen = @min(node.radix_len, 40);
     for (node.radix_str[0..rlen]) |c| {
         if (c >= 32 and c < 127) {
@@ -447,7 +494,7 @@ fn dumpNode(idx: u24, visited: *std.AutoHashMap(u24, void), depth: usize) !void 
             std.debug.print("\\x{x:0>2}", .{c});
         }
     }
-    
+
     std.debug.print("' bitset=", .{});
     var first = true;
     var bit_iter = node.bitset.iterator(.{});
@@ -457,7 +504,7 @@ fn dumpNode(idx: u24, visited: *std.AutoHashMap(u24, void), depth: usize) !void 
         first = false;
         std.debug.print("'{c}'->{d}", .{ byte, node.indexAt(byte).get() });
     }
-    
+
     std.debug.print(" inlines:", .{});
     for (0..256) |i| {
         const byte: u8 = @intCast(i);
@@ -473,7 +520,7 @@ fn dumpNode(idx: u24, visited: *std.AutoHashMap(u24, void), depth: usize) !void 
         }
     }
     std.debug.print("\n", .{});
-    
+
     // Recurse into children
     bit_iter = node.bitset.iterator(.{});
     while (bit_iter.next()) |b| {
@@ -495,24 +542,24 @@ inline fn isEmpty(node: *Node) bool {
 }
 
 /// Releases a whole line of nodes starting from `start_idx`.
-/// Assumes every node in the chain has exactly 1 child, except the last one which has 0.
-fn releaseLine(start_idx: u24, comptime assert_inbounds: bool) if (assert_inbounds) void else (Pool.OOB || PathTooLong)!void {
+/// Every node in the chain must have at most one subnode.
+fn releaseLine(start_idx: u24) (Pool.OOB || error{CorruptedTrie})!void {
     var curr_idx = start_idx;
     while (true) {
-        const node = if (assert_inbounds) fromIdx(curr_idx) catch unreachable else try fromIdx(curr_idx);
+        const node = try fromIdx(curr_idx);
         const count = node.bitset.count();
         if (count == 0) { // Reached the end of the line
             @branchHint(.unlikely);
-            Pool.global.release(curr_idx) catch |e| if (assert_inbounds) unreachable else return e;
+            try Pool.global.release(curr_idx);
             break;
         } else if (count > 1) { // If we encounter a fork in the "line", something went wrong.
             @branchHint(.cold);
-            if (assert_inbounds) unreachable else return error.PathTooLong;
+            return error.CorruptedTrie;
         } else { // count == 1: find the single child, release current, and step down
             @branchHint(.likely);
             const child_byte = @as(u8, @intCast(node.bitset.findFirstSet().?));
             const next_idx = node.indexAt(child_byte).get();
-            Pool.global.release(curr_idx) catch |e| if (assert_inbounds) unreachable else return e;
+            try Pool.global.release(curr_idx);
             curr_idx = next_idx;
         }
     }
@@ -612,14 +659,6 @@ pub const Node = extern struct {
         }
         return null;
     }
-};
-
-const PathTooLong = error{
-    /// The file was invalid or had overlong path.
-    /// the only valid reason for this to happen is if the file was created by a version that supports longer paths.
-    PathTooLong,
-    /// The trie itself is corrupted and requires repair
-    CorruptedTrie,
 };
 
 pub const BlkIdx = packed struct(u32) {
@@ -808,9 +847,9 @@ test "trie randomized fuzz test" {
                 try expectModeEqual(rv, t.?);
             } else {
                 if (t != null) {
-                    std.debug.print("\nFAIL: path '{s}' del'd but get returns {any}\n", .{p, t});
+                    std.debug.print("\nFAIL: path '{s}' del'd but get returns {any}\n", .{ p, t });
                     const blk = Pool.global.block();
-                    std.debug.print("pool root={d} free_from={d} free_idx={d}\n", .{blk.root, blk.free_from, blk.free_idx});
+                    std.debug.print("pool root={d} free_from={d} free_idx={d}\n", .{ blk.root, blk.free_from, blk.free_idx });
                     // print tree
                     var vi = std.AutoHashMap(u24, void).init(std.testing.allocator);
                     defer vi.deinit();
@@ -1495,20 +1534,20 @@ test "12. random long paths" {
 
         if (i % 1000 == 0) {
             try checkStructuralInvariants();
+            var verify = ref.iterator();
+            while (verify.next()) |entry| {
+                const actual = try get(entry.key_ptr.*);
+                try testing.expect(actual != null);
+                try expectModeEqual(entry.value_ptr.*, actual.?);
+            }
         }
     }
 
     // Cleanup
     var it = ref.iterator();
     while (it.next()) |entry| {
-        if (del(entry.key_ptr.*)) |_| {
-            gpa.free(entry.key_ptr.*);
-        } else |err| {
-            std.debug.print("\nFAIL cleanup: path", .{});
-            for (entry.key_ptr.*) |b| std.debug.print(" {x:0>2}", .{b});
-            std.debug.print(" err={}\n", .{err});
-            gpa.free(entry.key_ptr.*);
-        }
+        _ = try del(entry.key_ptr.*);
+        gpa.free(entry.key_ptr.*);
     }
     try checkStructuralInvariants();
 }
@@ -1531,4 +1570,43 @@ test "13. repeated overwrite" {
     // No new nodes should have been allocated
     try testing.expectEqual(start_free_from, blk.free_from);
     _ = try del("path");
+}
+
+test "concurrent readers and writers preserve trie invariants" {
+    try ensurePoolInitialized();
+
+    const Worker = struct {
+        fn run(first_byte: u8, failed: *std.atomic.Value(bool)) void {
+            var path = [2]u8{ first_byte, 0 };
+            for (0..250) |i| {
+                path[1] = @truncate(i);
+                add(&path, Mode.dir) catch {
+                    failed.store(true, .release);
+                    return;
+                };
+                const actual = get(&path) catch {
+                    failed.store(true, .release);
+                    return;
+                };
+                if (actual == null) {
+                    failed.store(true, .release);
+                    return;
+                }
+                _ = del(&path) catch {
+                    failed.store(true, .release);
+                    return;
+                };
+            }
+        }
+    };
+
+    var failed: std.atomic.Value(bool) = .init(false);
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ @as(u8, @intCast(i)), &failed });
+    }
+    for (threads) |thread| thread.join();
+
+    try testing.expect(!failed.load(.acquire));
+    try checkStructuralInvariants();
 }

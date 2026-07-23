@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const trie = @import("trie.zig");
+const log = @import("log.zig");
 
 const posix = std.posix;
 const linux = std.os.linux;
@@ -53,7 +54,8 @@ pub fn reset(self: *@This()) void {
     blk.root = 0;
     blk.free_from = 1;
     blk.free_idx = 0;
-    self.resize(1 << 16) catch {};
+    self.resize(1 << 16) catch |err|
+        log.err("failed to shrink reset pool: {t}", .{err});
 }
 
 pub fn deinit(self: *@This()) void {
@@ -82,9 +84,17 @@ pub const OOB = if (check_oob) error{
 pub fn nodeAt(self: *@This(), idx: u24) OOB!*trie.Node {
     const off = @as(usize, idx) << 10;
     if (check_oob) {
-        if (idx <= self.block().free_from) return OOB.OutOfBounds;
+        if (idx == 0 or idx >= self.mem.len >> 10) return OOB.OutOfBounds;
     }
     return @ptrCast(@alignCast(self.mem[off..][0 .. 1 << 10].ptr));
+}
+
+/// Returns an allocated node that is not currently on the free list.
+pub fn activeNodeAt(self: *@This(), idx: u24) OOB!*trie.Node {
+    if (idx == 0 or idx >= self.block().free_from) return OOB.OutOfBounds;
+    const node = try self.nodeAt(idx);
+    if (node.indexAt(0xff).get() == idx) return OOB.OutOfBounds;
+    return node;
 }
 
 /// Validation error
@@ -192,6 +202,8 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
         const idx = blk.free_idx;
         const node = try self.nodeAt(@intCast(idx));
         blk.free_idx = node.indexAt(0xfe).get();
+        node.indexAt(0xff).set(0);
+        node.indexAt(0xfe).set(0);
         return @intCast(idx);
     }
 
@@ -236,11 +248,6 @@ pub fn release(self: *@This(), idx: u24) OOB!void {
 
     if (idx == blk.free_from - 1) {
         @branchHint(.cold);
-        if (idx == blk.root or blk.free_from < 2) {
-            @branchHint(.cold);
-            self.reset();
-            return;
-        }
         blk.free_from -= 1;
     } else {
         const node = self.nodeAt(idx) catch unreachable;
@@ -501,7 +508,7 @@ test "Pool re-initialization validates" {
     const idx = try global.acquire();
     const node = try global.nodeAt(idx);
     node.radix_len = 77;
-    
+
     // Set root to idx so validate() doesn't call reset() and wipe the pool
     global.block().root = idx;
 
