@@ -82,7 +82,7 @@ pub const OOB = if (check_oob) error{
 pub fn nodeAt(self: *@This(), idx: u24) OOB!*trie.Node {
     const off = @as(usize, idx) << 10;
     if (check_oob) {
-        if (off + 1024 > self.mem.len) return OOB.OutOfBounds;
+        if (idx <= self.block().free_from) return OOB.OutOfBounds;
     }
     return @ptrCast(@alignCast(self.mem[off..][0 .. 1 << 10].ptr));
 }
