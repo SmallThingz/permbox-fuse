@@ -275,11 +275,13 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
 
     std.debug.assert(blk.free_from <= self.mem.len >> 10);
     const idx: u24 = @intCast(blk.free_from);
-    const node = try self.nodeAt(idx);
-    // reset() can move the frontier back over nodes that used to be on the
-    // free list. They become sequential allocations again.
-    node.indexAt(0xff).set(0);
-    node.indexAt(0xfe).set(0);
+    if (check_oob) {
+        // reset() can move the frontier back over nodes that used to be on the free list.
+        // They become sequential allocations again.
+        // Need to reset these else activeNodeAt assertion may fail
+        const node = self.nodeAt(idx) catch unreachable;
+        node.indexAt(0xff).set(0);
+    }
     blk.free_from += 1;
     return idx;
 }
@@ -324,20 +326,10 @@ pub fn release(self: *@This(), idx: u24) OOB!void {
     }
 }
 
-pub fn indexOf(self: *@This(), node: *trie.Node) OOB!u24 {
-    const int = @intFromPtr(node);
-    const mem = @intFromPtr(self.mem.ptr);
-    if ((int & 0b11_1111_1111) != 0) return OOB.OutOfBounds;
-    // Overflow-safe bounds check
-    if (int < mem) return OOB.OutOfBounds;
-    const offset = int - mem;
-    if (offset > self.mem.len - 1024) return OOB.OutOfBounds;
-    return @intCast(offset >> 10);
-}
-
 pub fn sync(self: *@This()) !void {
     return posix.msync(self.mem, linux.MSF.SYNC) catch |e| {
         log.warn("failed to sync file; error={}, fd={}, ptr={x}, len={}", .{e, self.fd, @intFromPtr(self.mem.ptr), self.mem.len});
+        return e;
     };
 }
 
@@ -477,30 +469,6 @@ test "Pool release out of order uses free list (LIFO)" {
     try testing.expectEqual(@as(u32, 5), blk.free_from);
 }
 
-test "Pool nodeAt and indexOf inverse" {
-    try initTestPool();
-
-    const idx1 = try global.acquire();
-    const idx2 = try global.acquire();
-
-    const node1 = try global.nodeAt(idx1);
-    const node2 = try global.nodeAt(idx2);
-
-    // Write some dummy data to make sure pointers are distinct and valid
-    node1.radix_len = 11;
-    node2.radix_len = 22;
-
-    const ret_idx1 = try global.indexOf(node1);
-    const ret_idx2 = try global.indexOf(node2);
-
-    try testing.expectEqual(idx1, ret_idx1);
-    try testing.expectEqual(idx2, ret_idx2);
-
-    // Verify data integrity
-    try testing.expectEqual(@as(u8, 11), (try global.nodeAt(idx1)).radix_len);
-    try testing.expectEqual(@as(u8, 22), (try global.nodeAt(idx2)).radix_len);
-}
-
 test "Pool nodeAt out of bounds" {
     try initTestPool();
 
@@ -510,16 +478,6 @@ test "Pool nodeAt out of bounds" {
     // 63 should be valid
     const node = try global.nodeAt(63);
     _ = node;
-}
-
-test "Pool indexOf out of bounds" {
-    try initTestPool();
-
-    // Create a dummy node not in the pool
-    var dummy: trie.Node = .{};
-
-    // Should return OutOfBounds because the pointer is outside mem
-    try testing.expectError(error.OutOfBounds, global.indexOf(&dummy));
 }
 
 test "Pool auto-resize on capacity hit" {
