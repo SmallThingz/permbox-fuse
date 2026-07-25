@@ -17,6 +17,7 @@ pub fn err(comptime format: []const u8, args: anytype) void {
 /// it is uncertain whether something has gone wrong or not, but the
 /// circumstances would be worth investigating.
 pub fn warn(comptime format: []const u8, args: anytype) void {
+    @branchHint(.unlikely);
     if (enabled) log(.warn, format, args);
 }
 
