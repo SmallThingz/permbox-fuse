@@ -9,15 +9,23 @@ const native_endian = builtin.cpu.arch.endian();
 const children_count = 1 << 8;
 
 var trie_lock: std.Io.RwLock = .init;
+var trie_io: std.Io = std.Io.Threaded.global_single_threaded.io();
 
 fn lockIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return trie_io;
 }
 
 /// Maps an existing trie file, or initializes an empty one when the file is
 /// shorter than the trie header. The trie owns `fd` after this succeeds.
 pub fn init(fd: std.c.fd_t) !void {
+    return initIo(std.Io.Threaded.global_single_threaded.io(), fd);
+}
+
+/// Variant for embedding applications. All trie synchronization participates
+/// in the caller's I/O runtime.
+pub fn initIo(io: std.Io, fd: std.c.fd_t) !void {
     Pool.global = try Pool.init(fd);
+    trie_io = io;
 }
 
 pub fn deinit() void {

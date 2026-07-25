@@ -11,8 +11,6 @@ const check_oob = true;
 
 const page_size_min = std.heap.page_size_min;
 
-pub var global: @This() = undefined;
-
 /// fd for block_mem
 fd: fd_t,
 /// The mem for the blox
@@ -60,8 +58,8 @@ pub fn reset(self: *@This()) void {
 }
 
 pub fn deinit(self: *@This()) void {
-    _ = linux.close(self.fd);
     posix.munmap(self.mem);
+    _ = linux.close(self.fd);
     self.* = undefined;
 }
 
@@ -373,17 +371,18 @@ pub const Block = extern struct {
 const testing = std.testing;
 
 // Helper to initialize a fresh pool for each test
-fn initTestPool() !void {
+fn initTestPool() !@This() {
     const fd = try posix.memfd_create("pool-test", 0);
-    global = try init(fd);
+    return try init(fd);
 }
 
 test "Pool init and basic properties" {
-    try initTestPool();
-    const blk = global.block();
+    var pool = try initTestPool();
+    defer pool.deinit();
+    const blk = pool.block();
 
     // Initial size should be 1 << 16 (64KB) -> 64 nodes of 1KB each
-    try testing.expectEqual(@as(usize, 1 << 16), global.mem.len);
+    try testing.expectEqual(@as(usize, 1 << 16), pool.mem.len);
 
     // Check block metadata
     try testing.expectEqualStrings("PERMBOXRDXTRIE", &blk.magic);
@@ -394,186 +393,196 @@ test "Pool init and basic properties" {
 }
 
 test "Pool acquire increments free_from" {
-    try initTestPool();
-    const blk = global.block();
+    var pool = try initTestPool();
+    defer pool.deinit();
+    const blk = pool.block();
 
-    const idx1 = try global.acquire();
+    const idx1 = try pool.acquire();
     try testing.expectEqual(@as(u24, 1), idx1);
     try testing.expectEqual(@as(u32, 2), blk.free_from);
 
-    const idx2 = try global.acquire();
+    const idx2 = try pool.acquire();
     try testing.expectEqual(@as(u24, 2), idx2);
     try testing.expectEqual(@as(u32, 3), blk.free_from);
 
     // Ensure the acquired nodes are zeroed/initialized
-    const node1 = try global.nodeAt(idx1);
+    const node1 = try pool.nodeAt(idx1);
     try testing.expectEqual(@as(u8, 0), node1.radix_len);
 }
 
 test "Pool release to tail collapses free_from" {
-    try initTestPool();
-    const blk = global.block();
+    var pool = try initTestPool();
+    defer pool.deinit();
+    const blk = pool.block();
 
-    const idx1 = try global.acquire(); // 1
-    const idx2 = try global.acquire(); // 2
+    const idx1 = try pool.acquire(); // 1
+    const idx2 = try pool.acquire(); // 2
     try testing.expectEqual(@as(u32, 3), blk.free_from);
 
     // Releasing in reverse order should just collapse free_from
     // without populating the free_idx linked list
-    try global.release(idx2);
+    try pool.release(idx2);
     try testing.expectEqual(@as(u32, 2), blk.free_from);
     try testing.expectEqual(@as(u32, 0), blk.free_idx);
 
-    try global.release(idx1);
+    try pool.release(idx1);
     try testing.expectEqual(@as(u32, 1), blk.free_from);
     try testing.expectEqual(@as(u32, 0), blk.free_idx);
 }
 
 test "Pool release out of order uses free list (LIFO)" {
-    try initTestPool();
-    const blk = global.block();
+    var pool = try initTestPool();
+    defer pool.deinit();
+    const blk = pool.block();
 
-    const idx1 = try global.acquire(); // 1
-    const idx2 = try global.acquire(); // 2
-    _ = try global.acquire(); // 3
+    const idx1 = try pool.acquire(); // 1
+    const idx2 = try pool.acquire(); // 2
+    _ = try pool.acquire(); // 3
 
     // Release idx2. Not a tail, so it goes to free_idx
-    try global.release(idx2);
+    try pool.release(idx2);
     try testing.expectEqual(@as(u32, 4), blk.free_from);
     try testing.expectEqual(@as(u32, 2), blk.free_idx); // free_idx points to 2
 
     // Verify the free list node linkage
-    const free_node = try global.nodeAt(2);
+    const free_node = try pool.nodeAt(2);
     try testing.expectEqual(@as(u24, 0), free_node.indexAt(0xfe).get()); // Next free is 0
 
     // Release idx1. Not a tail, goes to free_idx
-    try global.release(idx1);
+    try pool.release(idx1);
     try testing.expectEqual(@as(u32, 4), blk.free_from);
     try testing.expectEqual(@as(u32, 1), blk.free_idx); // free_idx points to 1
 
-    const free_node2 = try global.nodeAt(1);
+    const free_node2 = try pool.nodeAt(1);
     try testing.expectEqual(@as(u24, 2), free_node2.indexAt(0xfe).get()); // Next free is 2
 
     // Acquire should now reuse from the free list (LIFO)
-    const r1 = try global.acquire();
+    const r1 = try pool.acquire();
     try testing.expectEqual(@as(u24, 1), r1);
     try testing.expectEqual(@as(u32, 2), blk.free_idx);
 
-    const r2 = try global.acquire();
+    const r2 = try pool.acquire();
     try testing.expectEqual(@as(u24, 2), r2);
     try testing.expectEqual(@as(u32, 0), blk.free_idx);
 
     // Next acquire should go back to expanding free_from
-    const r3 = try global.acquire();
+    const r3 = try pool.acquire();
     try testing.expectEqual(@as(u24, 4), r3);
     try testing.expectEqual(@as(u32, 5), blk.free_from);
 }
 
 test "Pool nodeAt out of bounds" {
-    try initTestPool();
+    var pool = try initTestPool();
+    defer pool.deinit();
 
     // Initial capacity is 64 nodes (indices 0..63)
-    try testing.expectError(error.OutOfBounds, global.nodeAt(64));
+    try testing.expectError(error.OutOfBounds, pool.nodeAt(64));
 
     // 63 should be valid
-    const node = try global.nodeAt(63);
+    const node = try pool.nodeAt(63);
     _ = node;
 }
 
 test "Pool auto-resize on capacity hit" {
-    try initTestPool();
-    const blk = global.block();
+    var pool = try initTestPool();
+    defer pool.deinit();
+    const blk = pool.block();
 
     // Exhaust initial 64KB capacity (63 usable nodes, 0 is block)
     var i: u24 = 0;
     while (i < 63) : (i += 1) {
-        _ = try global.acquire();
+        _ = try pool.acquire();
     }
 
-    try testing.expectEqual(@as(usize, 1 << 16), global.mem.len);
+    try testing.expectEqual(@as(usize, 1 << 16), pool.mem.len);
     try testing.expectEqual(@as(u32, 64), blk.free_from);
 
     // This acquire should trigger a resize by 1 << 16 (64KB)
-    const idx = try global.acquire();
+    const idx = try pool.acquire();
     try testing.expectEqual(@as(u24, 64), idx);
 
     // Re-obtain block pointer after resize (blk from before resize is stale)
-    const blk2 = global.block();
+    const blk2 = pool.block();
 
     // Check that the pool grew
-    try testing.expectEqual(@as(usize, 1 << 17), global.mem.len);
+    try testing.expectEqual(@as(usize, 1 << 17), pool.mem.len);
     try testing.expectEqual(@as(u32, 65), blk2.free_from);
 
     // Ensure the new node is accessible and writable
-    const node = try global.nodeAt(idx);
+    const node = try pool.nodeAt(idx);
     node.radix_len = 99;
-    try testing.expectEqual(@as(u8, 99), (try global.nodeAt(idx)).radix_len);
+    try testing.expectEqual(@as(u8, 99), (try pool.nodeAt(idx)).radix_len);
 }
 
 test "Pool multiple resizes" {
-    try initTestPool();
+    var pool = try initTestPool();
+    defer pool.deinit();
 
     // Allocate 200 nodes to force multiple resizes (64 -> 128 -> 256 nodes)
     var i: u24 = 0;
     while (i < 200) : (i += 1) {
-        const idx = try global.acquire();
-        const node = try global.nodeAt(idx);
+        const idx = try pool.acquire();
+        const node = try pool.nodeAt(idx);
         node.radix_len = @intCast(i & 0xFF);
     }
 
-    try testing.expectEqual(@as(usize, 1 << 18), global.mem.len); // 256KB
-    try testing.expectEqual(@as(u32, 201), global.block().free_from);
+    try testing.expectEqual(@as(usize, 1 << 18), pool.mem.len); // 256KB
+    try testing.expectEqual(@as(u32, 201), pool.block().free_from);
 
     // Verify data integrity for a few nodes
-    try testing.expectEqual(@as(u8, 50), (try global.nodeAt(51)).radix_len); // idx = 50 + 1
-    try testing.expectEqual(@as(u8, 150), (try global.nodeAt(151)).radix_len); // idx = 150 + 1
+    try testing.expectEqual(@as(u8, 50), (try pool.nodeAt(51)).radix_len); // idx = 50 + 1
+    try testing.expectEqual(@as(u8, 150), (try pool.nodeAt(151)).radix_len); // idx = 150 + 1
 }
 
 test "Pool re-initialization validates" {
-    try initTestPool();
-    const idx = try global.acquire();
-    const node = try global.nodeAt(idx);
+    var pool = try initTestPool();
+    const idx = try pool.acquire();
+    const node = try pool.nodeAt(idx);
     node.radix_len = 77;
 
     // Set root to idx so validate() doesn't call reset() and wipe the pool
-    global.block().root = idx;
+    pool.block().root = idx;
 
-    try global.sync();
+    try pool.sync();
 
-    // Capture fd, drop global, and re-init
-    const fd = global.fd;
-    std.posix.munmap(global.mem);
-    global = undefined;
+    // Capture fd, drop pool, and re-init
+    const fd = pool.fd;
+    std.posix.munmap(pool.mem);
+    pool = undefined;
 
-    global = try init(fd);
-    const blk = global.block();
+    var pool2 = try init(fd);
+    defer pool2.deinit();
+    const blk = pool2.block();
     try testing.expectEqual(@as(u32, 2), blk.free_from);
-    try testing.expectEqual(@as(u8, 77), (try global.nodeAt(idx)).radix_len);
+    try testing.expectEqual(@as(u8, 77), (try pool2.nodeAt(idx)).radix_len);
 }
 
 test "Pool switchEndian" {
-    try initTestPool();
+    var pool = try initTestPool();
+    defer pool.deinit();
     const dest_fd = try posix.memfd_create("pool-test-dest", 0);
+    defer _ = linux.close(dest_fd);
 
     // Write some data
-    const idx = try global.acquire();
-    const node = try global.nodeAt(idx);
+    const idx = try pool.acquire();
+    const node = try pool.nodeAt(idx);
     node.radix_len = 42;
 
     // Switch endian
-    try global.switchEndian(dest_fd);
+    try pool.switchEndian(dest_fd);
 
     // Map dest manually to check results
     const dest_mem = try std.posix.mmap(null, 1 << 16, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, dest_fd, 0);
     defer std.posix.munmap(dest_mem);
 
     const dest_blk: *Block = @ptrCast(@alignCast(dest_mem.ptr));
-    try testing.expect(global.block().endian != dest_blk.endian);
+    try testing.expect(pool.block().endian != dest_blk.endian);
     try testing.expectEqualStrings("PERMBOXRDXTRIE", &dest_blk.magic);
 }
 
 test "Pool full capacity cycle" {
-    try initTestPool();
+    var pool = try initTestPool();
+    defer pool.deinit();
 
     var allocated = std.AutoHashMap(u24, void).init(testing.allocator);
     defer allocated.deinit();
@@ -581,7 +590,7 @@ test "Pool full capacity cycle" {
     // Fill completely to capacity and a bit beyond
     var i: u24 = 0;
     while (i < 100) : (i += 1) {
-        const idx = try global.acquire();
+        const idx = try pool.acquire();
         try allocated.put(idx, {});
     }
 
@@ -592,12 +601,12 @@ test "Pool full capacity cycle" {
     while (it.next()) |k| try keys.append(testing.allocator, k.*);
 
     for (keys.items) |k| {
-        try global.release(k);
+        try pool.release(k);
     }
 
     // After releasing everything, if we allocate 100 again, it should work perfectly
     i = 0;
     while (i < 100) : (i += 1) {
-        _ = try global.acquire();
+        _ = try pool.acquire();
     }
 }
