@@ -17,29 +17,31 @@ pub var global: @This() = undefined;
 fd: fd_t,
 /// The mem for the blox
 mem: []align(page_size_min) u8,
-/// The block size of the fs that this file is on
-blksize: u32,
 
 pub const InitError = StatxError || TruncateError || MMapError || OOB || ValidateError;
 /// This struct now owns the fd and the fd will be released when upon deinit.
 /// If this errors; the fd remains valid
 pub fn init(fd: fd_t) InitError!@This() {
-    const _len, const blksize = try getSize(fd);
+    const _len = try getSize(fd);
     const initialized = _len >= 1 << 16;
     const len = if (initialized) _len else @as(u64, 1 << 16);
 
     if (!initialized) {
-        if (linux.ftruncate(fd, @intCast(len)) != 0) return TruncateError.ResizeFailed;
+        @branchHint(.unlikely);
+        if (linux.ftruncate(fd, @intCast(len)) != 0) {
+            log.err("file needed truncation but resize failed; fd={}, oldsize={}, newsize={}", .{fd, _len, len});
+            return TruncateError.ResizeFailed;
+        }
     }
 
     var self: @This() = .{
         .fd = fd,
         .mem = try mapFd(fd, len),
-        .blksize = blksize,
     };
     errdefer posix.munmap(self.mem);
 
     if (!initialized) {
+        @branchHint(.unlikely);
         const blk = self.block();
         blk.* = .{ .free_from = 1, .free_idx = 0, .root = 0 };
     } else {
@@ -54,8 +56,7 @@ pub fn reset(self: *@This()) void {
     blk.root = 0;
     blk.free_from = 1;
     blk.free_idx = 0;
-    self.resize(1 << 16) catch |err|
-        log.err("failed to shrink reset pool: {t}", .{err});
+    self.resize(1 << 16) catch |err| log.err("failed to shrink reset pool; error={t}, fd={}, memlen={}", .{err, self.fd, self.mem.len});
 }
 
 pub fn deinit(self: *@This()) void {
@@ -65,16 +66,22 @@ pub fn deinit(self: *@This()) void {
 }
 
 const StatxError = error{StatxFailed};
-fn getSize(fd: fd_t) !@Tuple(&.{ u64, u32 }) {
+fn getSize(fd: fd_t) !u64 {
     var result: linux.Statx = undefined;
     const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &result);
-    if (rc != 0) return StatxError.StatxFailed;
-    return .{ result.size, result.blksize };
+    if (rc != 0) {
+        log.err("statx failed; errno={}, fd={}", .{linux.errno(rc), fd});
+        return StatxError.StatxFailed;
+    }
+    return result.size;
 }
 
 const MMapError = posix.MMapError;
 fn mapFd(fd: fd_t, len: u64) MMapError![]align(page_size_min) u8 {
-    return try posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+    return posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0) catch |e| {
+        log.err("mmap failed; errno={}, fd={}, len={}", .{e, fd, len});
+        return e;
+    };
 }
 
 pub const OOB = if (check_oob) error{
@@ -84,16 +91,25 @@ pub const OOB = if (check_oob) error{
 pub fn nodeAt(self: *@This(), idx: u24) OOB!*trie.Node {
     const off = @as(usize, idx) << 10;
     if (check_oob) {
-        if (idx == 0 or idx >= self.mem.len >> 10) return OOB.OutOfBounds;
+        if (idx == 0 or idx >= self.mem.len >> 10) {
+            log.err("oob node; index={}, fd={}, memlen={}", .{idx, self.fd, self.mem.len});
+            return OOB.OutOfBounds;
+        }
     }
     return @ptrCast(@alignCast(self.mem[off..][0 .. 1 << 10].ptr));
 }
 
 /// Returns an allocated node that is not currently on the free list.
 pub fn activeNodeAt(self: *@This(), idx: u24) OOB!*trie.Node {
-    if (idx == 0 or idx >= self.block().free_from) return OOB.OutOfBounds;
+    if (idx == 0 or idx >= self.block().free_from) {
+        log.err("oob node; index={}, fd={}, memlen={}", .{idx, self.fd, self.mem.len});
+        return OOB.OutOfBounds;
+    }
     const node = try self.nodeAt(idx);
-    if (node.indexAt(0xff).get() == idx) return OOB.OutOfBounds;
+    if (node.indexAt(0xff).get() == idx) {
+        log.err("tried to access free'd node as active; index={}, freefrom={}, memlen={}", .{idx, self.block().free_from, self.mem.len});
+        return OOB.OutOfBounds;
+    }
     return node;
 }
 
@@ -105,6 +121,8 @@ const ValidateError = error{
     MagicMismatch,
     /// The file's version is too new. The software is out of date
     UnsupportedVersion,
+    /// The endian-ness of the file has an invalid value that is not in the enum at all
+    InvalidEndian,
     /// The endian-ness of the file mismatches the expected. Use switchEndian to change the endian-ness
     EndianMismatch,
     /// The file's free_from field
@@ -116,22 +134,46 @@ const ValidateError = error{
 };
 fn validate(self: *@This()) ValidateError!void {
     const VE = ValidateError;
-    if (self.mem.len > (1 << 34) - 1024) return VE.FileTooLong;
+    if (self.mem.len > (1 << 34) - 1024) {
+        log.err("file larger than 16GiB - 1KiB; max={}, size={}", .{(1 << 34) - 1024, self.mem.len});
+        return VE.FileTooLong;
+    }
     const blk = self.block();
-    if (!std.mem.eql(u8, &blk.magic, &MAGIC)) return VE.MagicMismatch;
-    if (blk.endian != Endian.default) return VE.EndianMismatch;
+    if (!std.mem.eql(u8, &blk.magic, &MAGIC)) {
+        log.err("file header does not match; got={x}, want={x}", .{blk.magic, MAGIC});
+        return VE.MagicMismatch;
+    }
+    const echar = @as(*const u8, @ptrCast(&blk.endian)).*;
+    if (echar != @intFromEnum(Endian.big) and echar != @intFromEnum(Endian.little)) {
+        log.err("file endian-ness enum has invalid valued; file={}, valid={},{}", .{echar, @intFromEnum(Endian.big), @intFromEnum(Endian.little)});
+        return VE.InvalidEndian;
+    }
+    if (blk.endian != Endian.default) {
+        log.err("file endian-ness does not match machine; file={}, machine={}", .{blk.endian, Endian.default});
+        return VE.EndianMismatch;
+    }
 
     if (blk.version < VERSION) {
         // This will start erroring if the VERSION is incremented
         @compileError("TODO: implement older version handling");
     } else if (blk.version > VERSION) {
+        log.err("file's version value is higher than version of the program; file={}, program={}", .{blk.version, VERSION});
         return VE.UnsupportedVersion;
     }
 
     const max_idx = self.mem.len / (1 << 10);
-    if (blk.free_from < 1 or blk.free_from > max_idx) return VE.OOBFreeFrom;
-    if (blk.free_idx >= blk.free_from) return VE.OOBFreeIdx;
-    if (blk.root >= blk.free_from) return VE.OOBRootNode;
+    if (blk.free_from < 1 or blk.free_from > max_idx) {
+        log.err("file's free_from is out of bounds; free_from={}, fd={}, memlen={}", .{blk.free_from, self.fd, self.mem.len});
+        return VE.OOBFreeFrom;
+    }
+    if (blk.free_idx >= blk.free_from) {
+        log.err("file's free_idx index is out of bounds; free_idx={}, fd={}, memlen={}", .{blk.free_idx, self.fd, self.mem.len});
+        return VE.OOBFreeIdx;
+    }
+    if (blk.root >= blk.free_from) {
+        log.err("file's root node is out of bounds; root={}, fd={}, memlen={}", .{blk.root, self.fd, self.mem.len});
+        return VE.OOBRootNode;
+    }
     if (blk.root == 0) self.reset();
 }
 
@@ -144,15 +186,17 @@ pub const SwitchEndianError = TruncateError || StatxError || posix.MMapError;
 /// Changes the endian-ness and writes the result to the dest_fd
 /// Does not sync the dest file; that would be the caller's responsibility
 pub fn switchEndian(self: *@This(), dest_fd: fd_t) SwitchEndianError!void {
-    const _len, const blksize = try getSize(dest_fd);
+    const _len = try getSize(dest_fd);
     if (_len != self.mem.len) {
-        if (linux.ftruncate(dest_fd, @intCast(self.mem.len)) != 0) return TruncateError.ResizeFailed;
+        if (linux.ftruncate(dest_fd, @intCast(self.mem.len)) != 0) {
+            log.err("file needed truncation but resize failed; fd={}, oldsize={}, newsize={}", .{dest_fd, _len, self.mem.len});
+            return TruncateError.ResizeFailed;
+        }
     }
 
     var dest: @This() = .{
         .fd = dest_fd,
         .mem = try mapFd(dest_fd, self.mem.len),
-        .blksize = blksize,
     };
 
     defer posix.munmap(dest.mem);
@@ -213,10 +257,14 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
             @branchHint(.cold);
             if (self.mem.len >= (1 << 34) - 1024) {
                 @branchHint(.likely);
+                log.err("unable to acquire node as the file is already max size; fd={}, oldsize={}", .{self.fd, self.mem.len});
                 return AcquireError.FileTooLong;
             } else {
                 @branchHint(.cold);
-                try self.resize((1 << 34) - 1024);
+                self.resize((1 << 34) - 1024) catch |e| {
+                    log.err("failed to resize file to max size; error={}, fd={}, oldsize={}", .{e, self.fd, self.mem.len});
+                    return e;
+                };
             }
         } else {
             try self.resize(self.mem.len + (1 << 16));
@@ -239,17 +287,29 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
 const TruncateError = error{ResizeFailed};
 const ResizeError = TruncateError || posix.MRemapError;
 fn resize(self: *@This(), new_len: usize) !void {
-    if (linux.ftruncate(self.fd, @intCast(new_len)) != 0) return ResizeError.ResizeFailed;
-    self.mem = try posix.mremap(self.mem.ptr, self.mem.len, new_len, .{ .MAYMOVE = true }, null);
+    if (linux.ftruncate(self.fd, @intCast(new_len)) != 0) {
+        log.err("failed to resize file; fd={}, oldlen={}, newlen={}", .{self.fd, self.mem.len, new_len});
+        return ResizeError.ResizeFailed;
+    }
+    self.mem = posix.mremap(self.mem.ptr, self.mem.len, new_len, .{ .MAYMOVE = true }, null) catch |e| {
+        log.err("failed to remap file after resize; error={}, fd={}, oldlen={}, newlen={}", .{e, self.fd, self.mem.len, new_len});
+        return e;
+    };
 }
 
 /// Release a node to the pool
 pub fn release(self: *@This(), idx: u24) OOB!void {
     const blk = self.block();
     if (comptime check_oob) {
-        if (idx == 0 or idx >= blk.free_from) return OOB.OutOfBounds;
+        if (idx == 0 or idx >= blk.free_from) {
+            log.err("tried to release an index beyond freefrom; index={}, free_from={}", .{idx, blk.free_from});
+            return OOB.OutOfBounds;
+        }
         const node = try self.nodeAt(idx);
-        if (node.indexAt(0xff).get() == idx) return OOB.OutOfBounds;
+        if (node.indexAt(0xff).get() == idx) {
+            log.err("tried to release an already released node; index={}, free_from={}", .{idx, blk.free_from});
+            return OOB.OutOfBounds;
+        }
     }
 
     if (idx == blk.free_from - 1) {
@@ -276,7 +336,9 @@ pub fn indexOf(self: *@This(), node: *trie.Node) OOB!u24 {
 }
 
 pub fn sync(self: *@This()) !void {
-    return posix.msync(self.mem, linux.MSF.SYNC);
+    return posix.msync(self.mem, linux.MSF.SYNC) catch |e| {
+        log.warn("failed to sync file; error={}, fd={}, ptr={x}, len={}", .{e, self.fd, @intFromPtr(self.mem.ptr), self.mem.len});
+    };
 }
 
 const Endian = enum(u8) {
