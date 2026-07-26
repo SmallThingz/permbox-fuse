@@ -32,7 +32,7 @@ pub fn add(me: *@This(), path: []const u8, data: Mode) !void {
         me.lock.lockUncancelable(me.io);
         defer me.lock.unlock(me.io);
         me.trie.add(path, data) catch |e| {
-            log.err(@src(), "error while adding/setting the tire node data: error={}, path={s}, data={}", .{e, path, data});
+            log.err(@src(), "error while adding/setting the tire node data: error={}, path={s}, data={}", .{ e, path, data });
             return e;
         };
     }
@@ -45,7 +45,7 @@ pub fn del(me: *@This(), path: []const u8) !Mode {
         me.lock.lockUncancelable(me.io);
         defer me.lock.unlock(me.io);
         break :old me.trie.del(path) catch |e| {
-            log.err(@src(), "error while removing the tire node data: error={}, path={s}", .{e, path});
+            log.err(@src(), "error while removing the tire node data: error={}, path={s}", .{ e, path });
             return e;
         };
     };
