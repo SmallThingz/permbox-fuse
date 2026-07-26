@@ -1,4 +1,5 @@
-//! This has the implementation of the trie that tracks the permissions
+//! Trie data-structure implementation (pool-backed, no locking).
+//! Locking is handled by root.zig.
 const std = @import("std");
 const builtin = @import("builtin");
 const mem = @import("mem.zig");
@@ -8,63 +9,44 @@ const log = @import("log.zig");
 const native_endian = builtin.cpu.arch.endian();
 const children_count = 1 << 8;
 
-var trie_lock: std.Io.RwLock = .init;
-var trie_io: std.Io = std.Io.Threaded.global_single_threaded.io();
-
-fn lockIo() std.Io {
-    return trie_io;
-}
+/// The pool backing this trie.
+pool: Pool = undefined,
+const Trie = @This();
 
 /// Maps an existing trie file, or initializes an empty one when the file is
 /// shorter than the trie header. The trie owns `fd` after this succeeds.
-pub fn init(fd: std.c.fd_t) !void {
-    return initIo(std.Io.Threaded.global_single_threaded.io(), fd);
+pub fn init(fd: std.c.fd_t) !@This() {
+    return .{ .pool = try Pool.init(fd) };
 }
 
-/// Variant for embedding applications. All trie synchronization participates
-/// in the caller's I/O runtime.
-pub fn initIo(io: std.Io, fd: std.c.fd_t) !void {
-    Pool.global = try Pool.init(fd);
-    trie_io = io;
+pub fn deinit(self: *@This()) void {
+    self.pool.deinit();
 }
 
-pub fn deinit() void {
-    Pool.global.deinit();
+pub fn reset(self: *@This()) void {
+    self.pool.reset();
 }
 
-pub fn reset() void {
-    trie_lock.lockUncancelable(lockIo());
-    defer trie_lock.unlock(lockIo());
-    Pool.global.reset();
+pub fn sync(self: *@This()) !void {
+    try self.pool.sync();
 }
 
-/// Adds or replaces a path. The durable flush intentionally happens after the
-/// write lock is released: the in-memory mutation is already committed and an
-/// msync failure must not roll it back or hold up other trie users.
-pub fn add(path: []const u8, data: Mode) !void {
-    {
-        trie_lock.lockUncancelable(lockIo());
-        defer trie_lock.unlock(lockIo());
-        try addLocked(path, data);
-    }
-    syncAndLog();
-}
-
-fn addLocked(_path: []const u8, data: Mode) !void {
+/// Insert or replace a path. No locking & the caller must sync after calling.
+pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
     std.debug.assert(_path.len != 0);
     var path = _path;
 
-    if (Pool.global.block().root == 0) {
+    if (self.pool.block().root == 0) {
         @branchHint(.cold);
-        const new_idx = try create(path, data, 0);
-        Pool.global.block().root = new_idx;
+        const new_idx = try self.create(path, data, 0);
+        self.pool.block().root = new_idx;
         return;
     }
 
-    var curr_idx: u24 = @intCast(Pool.global.block().root);
+    var curr_idx: u24 = @intCast(self.pool.block().root);
     var parent_idx: u24 = 0;
     var parent_byte: u8 = 0;
-    var curr = try fromIdx(curr_idx);
+    var curr = try self.fromIdx(curr_idx);
 
     while (true) switch (curr.next(path)) {
         .exact => {
@@ -74,15 +56,15 @@ fn addLocked(_path: []const u8, data: Mode) !void {
         .this => |idx| {
             if (curr.bitset.isSet(idx)) {
                 const sub_idx = curr.indexAt(idx).get();
-                var sub = try fromIdx(sub_idx);
+                var sub = try self.fromIdx(sub_idx);
                 if (sub.radix_len > 0) {
                     // Split: path ends here but subnode has more radix.
                     // Create intermediate node N for this shorter path,
                     // link old subnode under N at its first radix byte.
-                    const n_idx = try acquire();
-                    errdefer releaseAndLog(n_idx, "unpublished prefix node");
-                    sub = fromIdx(sub_idx) catch unreachable;
-                    var n = try fromIdx(n_idx);
+                    const n_idx = try self.acquire();
+                    errdefer self.releaseAndLog(n_idx, "unpublished prefix node");
+                    sub = self.fromIdx(sub_idx) catch unreachable;
+                    var n = try self.fromIdx(n_idx);
                     n.data = data;
 
                     const first_byte = sub.radix_str[0];
@@ -94,7 +76,7 @@ fn addLocked(_path: []const u8, data: Mode) !void {
                         std.mem.copyForwards(u8, sub.radix_str[0..sub.radix_len], sub.radix_str[1 .. sub.radix_len + 1]);
                     }
 
-                    curr = fromIdx(curr_idx) catch unreachable;
+                    curr = self.fromIdx(curr_idx) catch unreachable;
                     curr.indexAt(idx).set(n_idx);
                 } else {
                     sub.data = data;
@@ -109,8 +91,8 @@ fn addLocked(_path: []const u8, data: Mode) !void {
 
             if (!curr.bitset.isSet(idx)) {
                 const inline_val = curr.indexAt(idx).get();
-                const new_idx = try create(path, data, inline_val);
-                curr = try fromIdx(curr_idx);
+                const new_idx = try self.create(path, data, inline_val);
+                curr = try self.fromIdx(curr_idx);
                 curr.bitset.set(idx);
                 curr.indexAt(idx).set(new_idx);
                 return;
@@ -119,14 +101,14 @@ fn addLocked(_path: []const u8, data: Mode) !void {
             parent_idx = curr_idx;
             parent_byte = idx;
             curr_idx = curr.indexAt(idx).get();
-            curr = try fromIdx(curr_idx);
+            curr = try self.fromIdx(curr_idx);
         },
         .diff => |idx| {
             const ogpath = path;
-            const left_idx = try acquire();
-            errdefer releaseAndLog(left_idx, "unpublished split child");
-            var left = try fromIdx(left_idx);
-            curr = try fromIdx(curr_idx);
+            const left_idx = try self.acquire();
+            errdefer self.releaseAndLog(left_idx, "unpublished split child");
+            var left = try self.fromIdx(left_idx);
+            curr = try self.fromIdx(curr_idx);
 
             left.radix_len = curr.radix_len - idx - 1;
             left.data = curr.data;
@@ -134,10 +116,10 @@ fn addLocked(_path: []const u8, data: Mode) !void {
             left.bitset = curr.bitset;
             left.idx_arr = curr.idx_arr;
 
-            const top_idx = try acquire();
-            errdefer releaseAndLog(top_idx, "unpublished split parent");
-            var top = try fromIdx(top_idx);
-            curr = try fromIdx(curr_idx);
+            const top_idx = try self.acquire();
+            errdefer self.releaseAndLog(top_idx, "unpublished split parent");
+            var top = try self.fromIdx(top_idx);
+            curr = try self.fromIdx(curr_idx);
 
             top.radix_len = idx;
             top.data = .midway;
@@ -145,14 +127,14 @@ fn addLocked(_path: []const u8, data: Mode) !void {
             top.bitset.set(curr.radix_str[idx]);
             top.indexAt(curr.radix_str[idx]).set(left_idx);
 
-            top = try fromIdx(top_idx);
+            top = try self.fromIdx(top_idx);
             if (idx == ogpath.len) {
                 top.data = data;
             } else {
                 const new_path = ogpath[idx + 1 ..];
                 if (new_path.len != 0) {
-                    const right_idx = try create(new_path, data, 0);
-                    top = try fromIdx(top_idx);
+                    const right_idx = try self.create(new_path, data, 0);
+                    top = try self.fromIdx(top_idx);
                     top.bitset.set(ogpath[idx]);
                     top.indexAt(ogpath[idx]).set(right_idx);
                 } else {
@@ -161,25 +143,25 @@ fn addLocked(_path: []const u8, data: Mode) !void {
             }
 
             if (parent_idx == 0) {
-                Pool.global.block().root = top_idx;
+                self.pool.block().root = top_idx;
             } else {
-                var parent_node = try fromIdx(parent_idx);
+                var parent_node = try self.fromIdx(parent_idx);
                 parent_node.indexAt(parent_byte).set(top_idx);
             }
 
-            releaseAndLog(curr_idx, "replaced radix node");
+            self.releaseAndLog(curr_idx, "replaced radix node");
             return;
         },
     };
 }
 
-fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
-    const new_idx = try acquire();
-    errdefer releaseLine(new_idx) catch |err|
+pub fn create(self: *@This(), path: []const u8, data: Mode, inline_val: u24) !u24 {
+    const new_idx = try self.acquire();
+    errdefer self.releaseLine(new_idx) catch |err|
         log.err("failed to reclaim unpublished trie chain at node {d}: {t}", .{ new_idx, err });
 
     var current_idx = new_idx;
-    var current = try fromIdx(current_idx);
+    var current = try self.fromIdx(current_idx);
     current.data = if (inline_val == 0) .midway else inlineToMode(inline_val);
 
     var curr_path = path;
@@ -193,13 +175,13 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
             return new_idx;
         }
 
-        const new_next = try acquire();
-        current = try fromIdx(current_idx);
+        const new_next = try self.acquire();
+        current = try self.fromIdx(current_idx);
         current.bitset.set(next_byte);
         current.indexAt(next_byte).set(new_next);
 
         current_idx = new_next;
-        current = try fromIdx(current_idx);
+        current = try self.fromIdx(current_idx);
         current.data = .midway;
     }
 
@@ -215,39 +197,30 @@ fn create(path: []const u8, data: Mode, inline_val: u24) !u24 {
             return new_idx;
         }
 
-        const new_next = try acquire();
-        current = try fromIdx(current_idx);
+        const new_next = try self.acquire();
+        current = try self.fromIdx(current_idx);
         current.bitset.set(next_byte);
         current.indexAt(next_byte).set(new_next);
 
         current_idx = new_next;
-        current = try fromIdx(current_idx);
+        current = try self.fromIdx(current_idx);
         current.data = .midway;
     }
 }
 
 /// Removes a path and returns its previous value.
-pub fn del(path: []const u8) !Mode {
-    const old_data = locked: {
-        trie_lock.lockUncancelable(lockIo());
-        defer trie_lock.unlock(lockIo());
-        break :locked try delLocked(path);
-    };
-    syncAndLog();
-    return old_data;
-}
-
-fn delLocked(_path: []const u8) !Mode {
+/// Remove a path. The caller must synchronise.
+pub fn del(self: *@This(), _path: []const u8) !Mode {
     std.debug.assert(_path.len != 0);
-    if (Pool.global.block().root == 0) {
+    if (self.pool.block().root == 0) {
         @branchHint(.cold);
         return error.NotFound;
     }
 
     var path = _path;
 
-    var curr_idx: u24 = @intCast(Pool.global.block().root);
-    var curr = try fromIdx(curr_idx);
+    var curr_idx: u24 = @intCast(self.pool.block().root);
+    var curr = try self.fromIdx(curr_idx);
 
     var parent_idx: u24 = 0;
     var parent_byte: u8 = 0;
@@ -269,7 +242,7 @@ fn delLocked(_path: []const u8) !Mode {
                 .this => |idx| {
                     if (curr.bitset.isSet(idx)) {
                         const sub_idx = curr.indexAt(idx).get();
-                        const sub = try fromIdx(sub_idx);
+                        const sub = try self.fromIdx(sub_idx);
                         if (sub.radix_len > 0) return error.NotFound;
                         if (@as(u8, @bitCast(sub.data)) == 0) return error.NotFound;
                         const old = sub.data;
@@ -278,7 +251,7 @@ fn delLocked(_path: []const u8) !Mode {
                         if (isEmpty(sub)) {
                             curr.bitset.unset(idx);
                             curr.indexAt(idx).set(0);
-                            releaseAndLog(sub_idx, "empty terminal node");
+                            self.releaseAndLog(sub_idx, "empty terminal node");
                         }
                         break :del old;
                     } else {
@@ -306,7 +279,7 @@ fn delLocked(_path: []const u8) !Mode {
 
                     path = path[curr.radix_len + 1 ..];
                     curr_idx = curr.indexAt(idx).get();
-                    curr = try fromIdx(curr_idx);
+                    curr = try self.fromIdx(curr_idx);
                     continue;
                 },
                 .diff => return error.NotFound,
@@ -314,9 +287,9 @@ fn delLocked(_path: []const u8) !Mode {
         }
     };
 
-    // Refresh curr pointer in case any Pool.global.release() inside the
+    // Refresh curr pointer in case any self.pool.release() inside the
     // del: block triggered a reset (extremely rare - requires cycle).
-    curr = try fromIdx(curr_idx);
+    curr = try self.fromIdx(curr_idx);
 
     // Determine the highest non-empty node (p_idx) and its parent
     var p_idx: u24 = 0;
@@ -335,25 +308,25 @@ fn delLocked(_path: []const u8) !Mode {
     } else if (curr_idx == top_idx) {
         // top_idx itself is empty.
         if (top_parent_idx != 0) {
-            const top_parent = try fromIdx(top_parent_idx);
+            const top_parent = try self.fromIdx(top_parent_idx);
             top_parent.bitset.unset(top_parent_byte);
             top_parent.indexAt(top_parent_byte).set(0);
-            releaseAndLog(top_idx, "empty branch node");
+            self.releaseAndLog(top_idx, "empty branch node");
         } else {
             // The root itself is empty. Release it and set root to 0.
-            Pool.global.block().root = 0;
-            releaseAndLog(top_idx, "empty root node");
+            self.pool.block().root = 0;
+            self.releaseAndLog(top_idx, "empty root node");
             return old_data;
         }
         return old_data; // No merge needed if the fork itself was pruned
     } else {
         // A descendant is empty. Snip the chain from top_node.
-        const top_node = try fromIdx(top_idx);
+        const top_node = try self.fromIdx(top_idx);
         if (top_child_byte) |tcb| {
             const chain_head_idx = top_node.indexAt(tcb).get();
             top_node.bitset.unset(tcb);
             top_node.indexAt(tcb).set(0);
-            releaseLine(chain_head_idx) catch |err|
+            self.releaseLine(chain_head_idx) catch |err|
                 log.err("failed to reclaim detached trie chain at node {d}: {t}", .{ chain_head_idx, err });
         }
         p_idx = top_idx;
@@ -362,21 +335,21 @@ fn delLocked(_path: []const u8) !Mode {
     }
 
     // If the root itself became empty (e.g., lost its last child), clear it.
-    if (p_parent_idx == 0 and isEmpty(try fromIdx(p_idx))) {
-        Pool.global.block().root = 0;
-        releaseAndLog(p_idx, "empty root node");
+    if (p_parent_idx == 0 and isEmpty(try self.fromIdx(p_idx))) {
+        self.pool.block().root = 0;
+        self.releaseAndLog(p_idx, "empty root node");
         return old_data;
     }
 
-    const prune_node = try fromIdx(p_idx);
+    const prune_node = try self.fromIdx(p_idx);
 
     // Rule A: Demote inline data promotion
     if (prune_node.valcntbounded(1) == 0 and @as(u8, @bitCast(prune_node.data)) != 0 and prune_node.radix_len == 0) {
         if (p_parent_idx != 0) {
-            const parent_node = try fromIdx(p_parent_idx);
+            const parent_node = try self.fromIdx(p_parent_idx);
             parent_node.bitset.unset(p_parent_byte);
             parent_node.indexAt(p_parent_byte).set(modeToInline(prune_node.data));
-            releaseAndLog(p_idx, "inline-demoted node");
+            self.releaseAndLog(p_idx, "inline-demoted node");
             return old_data;
         }
     }
@@ -387,7 +360,7 @@ fn delLocked(_path: []const u8) !Mode {
         if (child.is_node) {
             const child_byte = child.idx;
             const left_node_idx = child.val;
-            const left_node = try fromIdx(left_node_idx);
+            const left_node = try self.fromIdx(left_node_idx);
 
             // A non-leaf child still relies on `.this` routing for its own
             // entries. Prepending radix bytes would turn those lookups into an
@@ -402,7 +375,7 @@ fn delLocked(_path: []const u8) !Mode {
                 // Resolve every fallible pointer before changing either node so
                 // an invalid parent cannot leave the child half-merged.
                 const parent_node = if (p_parent_idx != 0)
-                    try fromIdx(p_parent_idx)
+                    try self.fromIdx(p_parent_idx)
                 else
                     null;
 
@@ -415,9 +388,9 @@ fn delLocked(_path: []const u8) !Mode {
                 if (parent_node) |parent| {
                     parent.indexAt(p_parent_byte).set(left_node_idx);
                 } else {
-                    Pool.global.block().root = left_node_idx;
+                    self.pool.block().root = left_node_idx;
                 }
-                releaseAndLog(p_idx, "merged radix node");
+                self.releaseAndLog(p_idx, "merged radix node");
                 return old_data;
             }
         }
@@ -426,37 +399,15 @@ fn delLocked(_path: []const u8) !Mode {
     return old_data;
 }
 
-pub fn get(path: []const u8) !?Mode {
-    trie_lock.lockSharedUncancelable(lockIo());
-    defer trie_lock.unlockShared(lockIo());
-    return getLocked(path);
-}
-
-/// Returns the exact rule or the nearest slash-delimited ancestor rule.
-/// The whole walk shares one read-side critical section.
-pub fn getLongestPrefix(path: []const u8) !?Mode {
-    trie_lock.lockSharedUncancelable(lockIo());
-    defer trie_lock.unlockShared(lockIo());
-
-    if (path.len == 0 or path[0] != '/') return null;
-    var prefix = path;
-    while (true) {
-        if (try getLocked(prefix)) |mode| return mode;
-        if (prefix.len == 1) return null;
-        const slash = std.mem.lastIndexOfScalar(u8, prefix, '/') orelse return null;
-        prefix = if (slash == 0) "/" else prefix[0..slash];
-    }
-}
-
-fn getLocked(_path: []const u8) !?Mode {
+pub fn get(self: *@This(), _path: []const u8) !?Mode {
     var path = _path;
     if (path.len == 0) return null;
-    if (Pool.global.block().root == 0) {
+    if (self.pool.block().root == 0) {
         @branchHint(.cold);
         return null;
     }
 
-    var node = try fromIdx(@intCast(Pool.global.block().root));
+    var node = try self.fromIdx(@intCast(self.pool.block().root));
 
     while (true) switch (node.next(path)) {
         .exact => {
@@ -465,7 +416,7 @@ fn getLocked(_path: []const u8) !?Mode {
         },
         .this => |idx| {
             if (node.bitset.isSet(idx)) {
-                const sub = try node.indexAt(idx).getNode();
+                const sub = try node.indexAt(idx).getNode(self);
                 if (sub.radix_len > 0) return null;
                 if (@as(u8, @bitCast(sub.data)) == 0) return null;
                 return sub.data;
@@ -478,95 +429,39 @@ fn getLocked(_path: []const u8) !?Mode {
         .next => |idx| {
             if (!node.bitset.isSet(idx)) return null;
             path = path[node.radix_len + 1 ..];
-            node = try node.indexAt(idx).getNode();
+            node = try node.indexAt(idx).getNode(self);
         },
         .diff => return null,
     };
 }
 
-fn syncAndLog() void {
-    // A shared lock keeps the mmap stable against a writer-triggered mremap
-    // while still allowing concurrent lookups during the slow flush.
-    trie_lock.lockSharedUncancelable(lockIo());
-    defer trie_lock.unlockShared(lockIo());
-    Pool.global.sync() catch |err|
-        log.err("failed to persist committed trie update: {t}", .{err});
+/// Returns the exact rule or the nearest slash-delimited ancestor rule.
+pub fn getLongestPrefix(self: *@This(), path: []const u8) !?Mode {
+    if (path.len == 0 or path[0] != '/') return null;
+    var prefix = path;
+    while (true) {
+        if (try self.get(prefix)) |mode| return mode;
+        if (prefix.len == 1) return null;
+        const slash = std.mem.lastIndexOfScalar(u8, prefix, '/') orelse return null;
+        prefix = if (slash == 0) "/" else prefix[0..slash];
+    }
 }
 
-fn releaseAndLog(idx: u24, comptime reason: []const u8) void {
-    Pool.global.release(idx) catch |err|
+fn releaseAndLog(self: *@This(), idx: u24, comptime reason: []const u8) void {
+    self.pool.release(idx) catch |err|
         log.err("failed to reclaim {s} {d}: {t}", .{ reason, idx, err });
 }
 
 /// Acquire a brand new node from the pool and init it with the required values
-inline fn acquire() !u24 {
-    const node_idx = try Pool.global.acquire();
-    const node = fromIdx(node_idx) catch unreachable;
+pub fn acquire(self: *@This()) !u24 {
+    const node_idx = try self.pool.acquire();
+    const node = self.fromIdx(node_idx) catch unreachable;
     node.* = .{};
     return node_idx;
 }
 
-fn fromIdx(idx: u24) Pool.OOB!*Node {
-    return Pool.global.activeNodeAt(idx);
-}
-
-fn dumpNode(idx: u24, visited: *std.AutoHashMap(u24, void), depth: usize) !void {
-    if (idx == 0) return;
-
-    const gop = try visited.getOrPut(idx);
-    if (gop.found_existing) return;
-
-    const node = try fromIdx(idx);
-
-    // Safe indenting: up to 40 levels deep (80 spaces)
-    const indent_buf = " " ** 80;
-    const indent = indent_buf[0..@min(depth * 2, indent_buf.len)];
-
-    std.debug.print("{s}node[{d}]: radix_len={d} data={x:0>2} radix_str='", .{
-        indent, idx, node.radix_len, @as(u8, @bitCast(node.data)),
-    });
-
-    const rlen = @min(node.radix_len, 40);
-    for (node.radix_str[0..rlen]) |c| {
-        if (c >= 32 and c < 127) {
-            std.debug.print("{c}", .{c});
-        } else {
-            std.debug.print("\\x{x:0>2}", .{c});
-        }
-    }
-
-    std.debug.print("' bitset=", .{});
-    var first = true;
-    var bit_iter = node.bitset.iterator(.{});
-    while (bit_iter.next()) |b| {
-        const byte: u8 = @intCast(b);
-        if (!first) std.debug.print(",", .{});
-        first = false;
-        std.debug.print("'{c}'->{d}", .{ byte, node.indexAt(byte).get() });
-    }
-
-    std.debug.print(" inlines:", .{});
-    for (0..256) |i| {
-        const byte: u8 = @intCast(i);
-        if (!node.bitset.isSet(byte)) {
-            const v = node.indexAt(byte).get();
-            if (v != 0) {
-                if (byte >= 32 and byte < 127) {
-                    std.debug.print(" '{c}'={x:0>6}", .{ byte, v });
-                } else {
-                    std.debug.print(" {x:0>2}={x:0>6}", .{ byte, v });
-                }
-            }
-        }
-    }
-    std.debug.print("\n", .{});
-
-    // Recurse into children
-    bit_iter = node.bitset.iterator(.{});
-    while (bit_iter.next()) |b| {
-        const byte: u8 = @intCast(b);
-        try dumpNode(node.indexAt(byte).get(), visited, depth + 1);
-    }
+pub fn fromIdx(self: *@This(), idx: u24) Pool.OOB!*Node {
+    return self.pool.activeNodeAt(idx);
 }
 
 inline fn modeToInline(data: Mode) u24 {
@@ -583,14 +478,14 @@ inline fn isEmpty(node: *Node) bool {
 
 /// Releases a whole line of nodes starting from `start_idx`.
 /// Every node in the chain must have at most one subnode.
-fn releaseLine(start_idx: u24) (Pool.OOB || error{CorruptedTrie})!void {
+fn releaseLine(self: *@This(), start_idx: u24) (Pool.OOB || error{CorruptedTrie})!void {
     var curr_idx = start_idx;
     while (true) {
-        const node = try fromIdx(curr_idx);
+        const node = try self.fromIdx(curr_idx);
         const count = node.bitset.count();
         if (count == 0) { // Reached the end of the line
             @branchHint(.unlikely);
-            try Pool.global.release(curr_idx);
+            try self.pool.release(curr_idx);
             break;
         } else if (count > 1) { // If we encounter a fork in the "line", something went wrong.
             @branchHint(.cold);
@@ -599,7 +494,7 @@ fn releaseLine(start_idx: u24) (Pool.OOB || error{CorruptedTrie})!void {
             @branchHint(.likely);
             const child_byte = @as(u8, @intCast(node.bitset.findFirstSet().?));
             const next_idx = node.indexAt(child_byte).get();
-            try Pool.global.release(curr_idx);
+            try self.pool.release(curr_idx);
             curr_idx = next_idx;
         }
     }
@@ -631,8 +526,8 @@ pub const Node = extern struct {
             return std.mem.readInt(u24, me.arr[me.at..][0..3], native_endian);
         }
 
-        pub fn getNode(me: @This()) !*Node {
-            return fromIdx(me.get());
+        pub fn getNode(me: @This(), trie: *Trie) !*Node {
+            return trie.fromIdx(me.get());
         }
 
         pub fn set(me: @This(), val: u24) void {
@@ -757,13 +652,72 @@ fn expectModeEqual(expected: Mode, actual: Mode) !void {
     try testing.expectEqual(@as(u8, @bitCast(expected)), @as(u8, @bitCast(actual)));
 }
 
-fn ensurePoolInitialized() !void {
+fn ensurePoolInitialized() !@This() {
     const fd = try std.posix.memfd_create("permbox-test-pool", 0);
-    Pool.global = try Pool.init(fd);
+    return try init(fd);
+}
+
+fn dumpNode(self: *@This(), idx: u24, visited: *std.AutoHashMap(u24, void), depth: usize) !void {
+    if (idx == 0) return;
+
+    const gop = try visited.getOrPut(idx);
+    if (gop.found_existing) return;
+
+    const node = try self.fromIdx(idx);
+
+    // Safe indenting: up to 40 levels deep (80 spaces)
+    const indent_buf = " " ** 80;
+    const indent = indent_buf[0..@min(depth * 2, indent_buf.len)];
+
+    std.debug.print("{s}node[{d}]: radix_len={d} data={x:0>2} radix_str='", .{
+        indent, idx, node.radix_len, @as(u8, @bitCast(node.data)),
+    });
+
+    const rlen = @min(node.radix_len, 40);
+    for (node.radix_str[0..rlen]) |c| {
+        if (c >= 32 and c < 127) {
+            std.debug.print("{c}", .{c});
+        } else {
+            std.debug.print("\\x{x:0>2}", .{c});
+        }
+    }
+
+    std.debug.print("' bitset=", .{});
+    var first = true;
+    var bit_iter = node.bitset.iterator(.{});
+    while (bit_iter.next()) |b| {
+        const byte: u8 = @intCast(b);
+        if (!first) std.debug.print(",", .{});
+        first = false;
+        std.debug.print("'{c}'->{d}", .{ byte, node.indexAt(byte).get() });
+    }
+
+    std.debug.print(" inlines:", .{});
+    for (0..256) |i| {
+        const byte: u8 = @intCast(i);
+        if (!node.bitset.isSet(byte)) {
+            const v = node.indexAt(byte).get();
+            if (v != 0) {
+                if (byte >= 32 and byte < 127) {
+                    std.debug.print(" '{c}'={x:0>6}", .{ byte, v });
+                } else {
+                    std.debug.print(" {x:0>2}={x:0>6}", .{ byte, v });
+                }
+            }
+        }
+    }
+    std.debug.print("\n", .{});
+
+    // Recurse into children
+    bit_iter = node.bitset.iterator(.{});
+    while (bit_iter.next()) |b| {
+        const byte: u8 = @intCast(b);
+        try self.dumpNode(node.indexAt(byte).get(), visited, depth + 1);
+    }
 }
 
 test "trie exhaustive subsets (add, get, overwrite, del)" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
 
     // Generate all paths with chars 'a' and 'b' up to length 3
@@ -790,20 +744,20 @@ test "trie exhaustive subsets (add, get, overwrite, del)" {
         // 1. Add all paths in this subset
         for (0..14) |i| {
             if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                try add(paths[i], Mode.dir);
+                try trie.add(paths[i], Mode.dir);
             }
         }
 
         // 2. Overwrite all paths in this subset with a different mode
         for (0..14) |i| {
             if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                try add(paths[i], Mode.file);
+                try trie.add(paths[i], Mode.file);
             }
         }
 
         // 3. Verify gets
         for (0..14) |i| {
-            const res = try get(paths[i]);
+            const res = try trie.get(paths[i]);
             if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
                 try testing.expect(res != null);
                 try expectModeEqual(Mode.file, res.?);
@@ -815,14 +769,14 @@ test "trie exhaustive subsets (add, get, overwrite, del)" {
         // 4. Delete all paths in this subset
         for (0..14) |i| {
             if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                const old = try del(paths[i]);
+                const old = try trie.del(paths[i]);
                 try expectModeEqual(Mode.file, old);
             }
         }
 
         // 5. Verify all are null after deletion
         for (0..14) |i| {
-            const res = try get(paths[i]);
+            const res = try trie.get(paths[i]);
             try testing.expectEqual(@as(?Mode, null), res);
         }
     }
@@ -830,7 +784,7 @@ test "trie exhaustive subsets (add, get, overwrite, del)" {
 
 test "trie randomized fuzz test" {
     // if (!builtin.fuzz) return error.SkipZigTest;
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(12345);
     const random = prng.random();
@@ -862,38 +816,38 @@ test "trie randomized fuzz test" {
 
         if (op == 0) {
             // Add dir
-            try add(path, Mode.dir);
+            try trie.add(path, Mode.dir);
             try ref.put(path, Mode.dir);
         } else if (op == 1) {
             // Add file
-            try add(path, Mode.file);
+            try trie.add(path, Mode.file);
             try ref.put(path, Mode.file);
         } else {
             // Del
             if (ref.get(path)) |_| {
-                _ = try del(path);
+                _ = try trie.del(path);
                 _ = ref.remove(path);
             } else {
-                try testing.expectError(error.NotFound, del(path));
+                try testing.expectError(error.NotFound, trie.del(path));
             }
         }
 
         // Verify all paths against the reference map
         for (paths) |p| {
             const r = ref.get(p);
-            const t = try get(p);
+            const t = try trie.get(p);
             if (r) |rv| {
                 try testing.expect(t != null);
                 try expectModeEqual(rv, t.?);
             } else {
                 if (t != null) {
                     std.debug.print("\nFAIL: path '{s}' del'd but get returns {any}\n", .{ p, t });
-                    const blk = Pool.global.block();
+                    const blk = trie.pool.block();
                     std.debug.print("pool root={d} free_from={d} free_idx={d}\n", .{ blk.root, blk.free_from, blk.free_idx });
                     // print tree
                     var vi = std.AutoHashMap(u24, void).init(std.testing.allocator);
                     defer vi.deinit();
-                    try dumpNode(@intCast(blk.root), &vi, 0);
+                    // dumpNode removed
                 }
                 try testing.expectEqual(@as(?Mode, null), t);
             }
@@ -902,7 +856,7 @@ test "trie randomized fuzz test" {
 }
 
 test "trie deep path string limit and partial shift" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
 
     // The trie's radix_str capacity is 222 bytes.
@@ -926,47 +880,47 @@ test "trie deep path string limit and partial shift" {
     p3[200] = 'c';
     @memset(p3[201..], 'a');
 
-    try add(p1, Mode.dir);
-    try add(p2, Mode.dir);
-    try add(p3, Mode.dir);
+    try trie.add(p1, Mode.dir);
+    try trie.add(p2, Mode.dir);
+    try trie.add(p3, Mode.dir);
 
-    try expectModeEqual(Mode.dir, (try get(p1)).?);
-    try expectModeEqual(Mode.dir, (try get(p2)).?);
-    try expectModeEqual(Mode.dir, (try get(p3)).?);
+    try expectModeEqual(Mode.dir, (try trie.get(p1)).?);
+    try expectModeEqual(Mode.dir, (try trie.get(p2)).?);
+    try expectModeEqual(Mode.dir, (try trie.get(p3)).?);
 
     // Delete p2. This will trigger the partial shift logic
     // because top_len (200) + 1 + left_len (30) = 231 > 222
-    _ = try del(p2);
+    _ = try trie.del(p2);
 
-    try testing.expectEqual(@as(?Mode, null), try get(p2));
-    try expectModeEqual(Mode.dir, (try get(p1)).?);
-    try expectModeEqual(Mode.dir, (try get(p3)).?);
+    try testing.expectEqual(@as(?Mode, null), try trie.get(p2));
+    try expectModeEqual(Mode.dir, (try trie.get(p1)).?);
+    try expectModeEqual(Mode.dir, (try trie.get(p3)).?);
 
     // Delete p1. This triggers the partial shift logic again
-    _ = try del(p1);
+    _ = try trie.del(p1);
 
-    try testing.expectEqual(@as(?Mode, null), try get(p1));
-    try expectModeEqual(Mode.dir, (try get(p3)).?);
+    try testing.expectEqual(@as(?Mode, null), try trie.get(p1));
+    try expectModeEqual(Mode.dir, (try trie.get(p3)).?);
 
     // Delete p3
-    _ = try del(p3);
-    try testing.expectEqual(@as(?Mode, null), try get(p3));
+    _ = try trie.del(p3);
+    try testing.expectEqual(@as(?Mode, null), try trie.get(p3));
 }
 
 test "trie delete non-existent and empty" {
-    try ensurePoolInitialized();
-    try testing.expectError(error.NotFound, del("a"));
+    var trie = try ensurePoolInitialized();
+    try testing.expectError(error.NotFound, trie.del("a"));
 
-    try add("a", Mode.dir);
-    try testing.expectError(error.NotFound, del("b"));
-    try testing.expectError(error.NotFound, del("aa"));
+    try trie.add("a", Mode.dir);
+    try testing.expectError(error.NotFound, trie.del("b"));
+    try testing.expectError(error.NotFound, trie.del("aa"));
 
-    _ = try del("a");
-    try testing.expectError(error.NotFound, del("a"));
+    _ = try trie.del("a");
+    try testing.expectError(error.NotFound, trie.del("a"));
 }
 
 test "trie procedural forward and backward insertion/deletion" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
 
     // Generate all paths with chars 'a' and 'b' up to length 5
@@ -990,12 +944,12 @@ test "trie procedural forward and backward insertion/deletion" {
     // 1. Forward Insertion
     // ==========================================
     for (paths) |p| {
-        try add(p, Mode.dir);
+        try trie.add(p, Mode.dir);
     }
 
     // Verify all were inserted
     for (paths) |p| {
-        const res = try get(p);
+        const res = try trie.get(p);
         try testing.expect(res != null);
         try expectModeEqual(Mode.dir, res.?);
     }
@@ -1006,13 +960,13 @@ test "trie procedural forward and backward insertion/deletion" {
     // Delete every 3rd path to force arbitrary middle deletions and merges
     for (0..paths.len) |i| {
         if (i % 3 == 0) {
-            _ = try del(paths[i]);
+            _ = try trie.del(paths[i]);
         }
     }
 
     // Verify deleted are gone, and others remain
     for (0..paths.len) |i| {
-        const res = try get(paths[i]);
+        const res = try trie.get(paths[i]);
         if (i % 3 == 0) {
             try testing.expectEqual(@as(?Mode, null), res);
         } else {
@@ -1026,12 +980,12 @@ test "trie procedural forward and backward insertion/deletion" {
     // ==========================================
     for (0..paths.len) |i| {
         if (i % 3 == 0) {
-            try add(paths[i], Mode.file);
+            try trie.add(paths[i], Mode.file);
         }
     }
 
     for (0..paths.len) |i| {
-        const res = try get(paths[i]);
+        const res = try trie.get(paths[i]);
         if (i % 3 == 0) {
             try testing.expect(res != null);
             try expectModeEqual(Mode.file, res.?);
@@ -1045,11 +999,11 @@ test "trie procedural forward and backward insertion/deletion" {
     // 4. Delete All Forward
     // ==========================================
     for (paths) |p| {
-        _ = try del(p);
+        _ = try trie.del(p);
     }
 
     for (paths) |p| {
-        try testing.expectEqual(@as(?Mode, null), try get(p));
+        try testing.expectEqual(@as(?Mode, null), try trie.get(p));
     }
 
     // ==========================================
@@ -1058,14 +1012,14 @@ test "trie procedural forward and backward insertion/deletion" {
     var i: usize = paths.len;
     while (i > 0) {
         i -= 1;
-        try add(paths[i], Mode.dir);
+        try trie.add(paths[i], Mode.dir);
     }
 
     // Verify all were inserted backward
     i = paths.len;
     while (i > 0) {
         i -= 1;
-        const res = try get(paths[i]);
+        const res = try trie.get(paths[i]);
         try testing.expect(res != null);
         try expectModeEqual(Mode.dir, res.?);
     }
@@ -1076,14 +1030,14 @@ test "trie procedural forward and backward insertion/deletion" {
     i = paths.len;
     while (i > 0) {
         i -= 1;
-        _ = try del(paths[i]);
+        _ = try trie.del(paths[i]);
 
         // Ensure the deleted one is gone
-        try testing.expectEqual(@as(?Mode, null), try get(paths[i]));
+        try testing.expectEqual(@as(?Mode, null), try trie.get(paths[i]));
 
         // Ensure all previous items in the array still exist
         for (0..i) |j| {
-            const res = try get(paths[j]);
+            const res = try trie.get(paths[j]);
             try testing.expect(res != null);
             try expectModeEqual(Mode.dir, res.?);
         }
@@ -1091,7 +1045,7 @@ test "trie procedural forward and backward insertion/deletion" {
 }
 
 test "trie deep path chains (length 4)" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
 
     // Generate all paths up to length 4 (2+4+8+16 = 30 paths)
@@ -1112,38 +1066,38 @@ test "trie deep path chains (length 4)" {
 
     // Add all deep paths
     for (paths) |p| {
-        try add(p, Mode.dir);
+        try trie.add(p, Mode.dir);
     }
 
     // Verify all exist
     for (paths) |p| {
-        const res = try get(p);
+        const res = try trie.get(p);
         try testing.expect(res != null);
         try expectModeEqual(Mode.dir, res.?);
     }
 
     // Delete in forward order (shortest to longest)
     for (paths) |p| {
-        _ = try del(p);
-        const res = try get(p);
+        _ = try trie.del(p);
+        const res = try trie.get(p);
         try testing.expectEqual(@as(?Mode, null), res);
     }
 
     // Re-add and delete in reverse order (longest to shortest)
     for (paths) |p| {
-        try add(p, Mode.file);
+        try trie.add(p, Mode.file);
     }
 
     var i: usize = paths.len;
     while (i > 0) {
         i -= 1;
-        _ = try del(paths[i]);
-        const res = try get(paths[i]);
+        _ = try trie.del(paths[i]);
+        const res = try trie.get(paths[i]);
         try testing.expectEqual(@as(?Mode, null), res);
 
         // Ensure earlier items still exist
         for (0..i) |j| {
-            const r = try get(paths[j]);
+            const r = try trie.get(paths[j]);
             try testing.expect(r != null);
             try expectModeEqual(Mode.file, r.?);
         }
@@ -1151,7 +1105,7 @@ test "trie deep path chains (length 4)" {
 }
 
 test "trie edge cases and merges" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     // Test adding and removing paths that cause repeated splits and merges
     const p1 = "a";
     const p2 = "ab";
@@ -1159,34 +1113,34 @@ test "trie edge cases and merges" {
     const p4 = "abab";
     const p5 = "ababa";
 
-    try add(p1, Mode.dir);
-    try add(p2, Mode.dir);
-    try add(p3, Mode.dir);
-    try add(p4, Mode.dir);
-    try add(p5, Mode.dir);
+    try trie.add(p1, Mode.dir);
+    try trie.add(p2, Mode.dir);
+    try trie.add(p3, Mode.dir);
+    try trie.add(p4, Mode.dir);
+    try trie.add(p5, Mode.dir);
 
     // Delete from the middle
-    _ = try del(p3);
-    try testing.expectEqual(@as(?Mode, null), try get(p3));
-    try testing.expect(try get(p4) != null);
-    try testing.expect(try get(p5) != null);
+    _ = try trie.del(p3);
+    try testing.expectEqual(@as(?Mode, null), try trie.get(p3));
+    try testing.expect(try trie.get(p4) != null);
+    try testing.expect(try trie.get(p5) != null);
 
     // Re-add it
-    try add(p3, Mode.file);
-    try testing.expect(try get(p3) != null);
+    try trie.add(p3, Mode.file);
+    try testing.expect(try trie.get(p3) != null);
 
     // Delete all
-    _ = try del(p1);
-    _ = try del(p2);
-    _ = try del(p3);
-    _ = try del(p4);
-    _ = try del(p5);
+    _ = try trie.del(p1);
+    _ = try trie.del(p2);
+    _ = try trie.del(p3);
+    _ = try trie.del(p4);
+    _ = try trie.del(p5);
 
-    try testing.expectEqual(@as(?Mode, null), try get(p1));
-    try testing.expectEqual(@as(?Mode, null), try get(p2));
-    try testing.expectEqual(@as(?Mode, null), try get(p3));
-    try testing.expectEqual(@as(?Mode, null), try get(p4));
-    try testing.expectEqual(@as(?Mode, null), try get(p5));
+    try testing.expectEqual(@as(?Mode, null), try trie.get(p1));
+    try testing.expectEqual(@as(?Mode, null), try trie.get(p2));
+    try testing.expectEqual(@as(?Mode, null), try trie.get(p3));
+    try testing.expectEqual(@as(?Mode, null), try trie.get(p4));
+    try testing.expectEqual(@as(?Mode, null), try trie.get(p5));
 }
 
 // --- Permutation Helper ---
@@ -1211,28 +1165,28 @@ fn nextPermutation(comptime T: type, array: []T) bool {
 }
 
 // --- Structural & Allocation Invariants ---
-fn checkAllocationInvariant() !void {
-    const blk = Pool.global.block();
+fn checkAllocationInvariant(trie: *@This()) !void {
+    const blk = trie.pool.block();
     if (blk.free_from > 2) {
         try testing.expect(blk.free_idx == 0 or blk.free_idx < blk.free_from);
     }
     try testing.expect(blk.root < blk.free_from);
 }
 
-fn checkStructuralInvariants() !void {
+fn checkStructuralInvariants(trie: *@This()) !void {
     const gpa = testing.allocator;
     var visited = std.AutoHashMap(u24, void).init(gpa);
     defer visited.deinit();
 
-    const blk = Pool.global.block();
-    try visitNode(@intCast(blk.root), &visited);
+    const blk = trie.pool.block();
+    try visitNode(trie, @intCast(blk.root), &visited);
 
     // Count free list size
     var free_count: u32 = 0;
     var curr_free = blk.free_idx;
     while (curr_free != 0) {
         free_count += 1;
-        const node = try Pool.global.nodeAt(@intCast(curr_free));
+        const node = try trie.pool.nodeAt(@intCast(curr_free));
         curr_free = node.indexAt(0xfe).get();
     }
 
@@ -1240,25 +1194,25 @@ fn checkStructuralInvariants() !void {
     try testing.expectEqual(@as(u32, @intCast(visited.count())) + free_count + 1, blk.free_from);
 }
 
-fn visitNode(idx: u24, visited: *std.AutoHashMap(u24, void)) !void {
+fn visitNode(trie: *@This(), idx: u24, visited: *std.AutoHashMap(u24, void)) !void {
     if (idx == 0) return;
     if (visited.contains(idx)) return error.CycleDetected;
     try visited.put(idx, {});
 
-    const node = try Pool.global.nodeAt(idx);
+    const node = try trie.pool.nodeAt(idx);
     if (node.radix_len > node.radix_str.len) return error.RadixLenTooLarge;
 
     var iter = node.bitset.iterator(.{});
     while (iter.next()) |i| {
         const child_idx = node.indexAt(@intCast(i)).get();
         if (child_idx == 0) return error.BitSetChildIsZero;
-        try visitNode(child_idx, visited);
+        try visitNode(trie, child_idx, visited);
     }
 }
 
 // --- 1. Exhaust every insertion permutation ---
 test "1. exhaustive insertion permutations" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const paths = [_][]const u8{ "a", "ab", "aba", "abb", "abc" };
     var perm = [_]usize{ 0, 1, 2, 3, 4 };
 
@@ -1266,52 +1220,52 @@ test "1. exhaustive insertion permutations" {
     while (first or nextPermutation(usize, &perm)) {
         first = false;
         // Clear trie
-        for (paths) |p| _ = del(p) catch {};
+        for (paths) |p| _ = trie.del(p) catch {};
 
-        for (perm) |i| try add(paths[i], Mode.dir);
-        for (paths) |p| try testing.expect(try get(p) != null);
+        for (perm) |i| try trie.add(paths[i], Mode.dir);
+        for (paths) |p| try testing.expect(try trie.get(p) != null);
 
         var j: usize = perm.len;
         while (j > 0) {
             j -= 1;
-            _ = try del(paths[perm[j]]);
+            _ = try trie.del(paths[perm[j]]);
         }
 
-        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try get(p));
+        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try trie.get(p));
 
-        try checkStructuralInvariants();
-        try checkAllocationInvariant();
+        try checkStructuralInvariants(&trie);
+        try checkAllocationInvariant(&trie);
     }
 }
 
 // --- 2. Exhaust every delete permutation ---
 test "2. exhaustive delete permutations" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const paths = [_][]const u8{ "a", "ab", "aba", "abb", "abc" };
     var perm = [_]usize{ 0, 1, 2, 3, 4 };
 
-    for (paths) |p| try add(p, Mode.dir);
+    for (paths) |p| try trie.add(p, Mode.dir);
 
     var first = true;
     while (first or nextPermutation(usize, &perm)) {
         first = false;
         // Reset trie
-        for (paths) |p| _ = del(p) catch {};
-        for (paths) |p| try add(p, Mode.dir);
+        for (paths) |p| _ = trie.del(p) catch {};
+        for (paths) |p| try trie.add(p, Mode.dir);
 
         for (perm) |i| {
-            _ = try del(paths[i]);
+            _ = try trie.del(paths[i]);
         }
 
-        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try get(p));
-        try checkStructuralInvariants();
-        try checkAllocationInvariant();
+        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try trie.get(p));
+        try checkStructuralInvariants(&trie);
+        try checkAllocationInvariant(&trie);
     }
 }
 
 // --- 3. Exhaust every split point ---
 test "3. exhaust every split point" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
 
     for (0..30) |split_idx| {
@@ -1324,73 +1278,73 @@ test "3. exhaust every split point" {
         @memset(p2, 'a');
         p2[split_idx] = 'b';
 
-        try add(p1, Mode.dir);
-        try add(p2, Mode.file);
+        try trie.add(p1, Mode.dir);
+        try trie.add(p2, Mode.file);
 
-        try expectModeEqual(Mode.dir, (try get(p1)).?);
-        try expectModeEqual(Mode.file, (try get(p2)).?);
+        try expectModeEqual(Mode.dir, (try trie.get(p1)).?);
+        try expectModeEqual(Mode.file, (try trie.get(p2)).?);
 
-        _ = try del(p1);
-        _ = try del(p2);
+        _ = try trie.del(p1);
+        _ = try trie.del(p2);
 
-        try checkStructuralInvariants();
-        try checkAllocationInvariant();
+        try checkStructuralInvariants(&trie);
+        try checkAllocationInvariant(&trie);
     }
 }
 
 // --- 4. Root replacement torture ---
 test "4. root replacement torture" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const paths = [_][]const u8{ "a", "ab", "abc", "abcd", "abcde" };
 
-    for (paths) |p| try add(p, Mode.dir);
+    for (paths) |p| try trie.add(p, Mode.dir);
     // Delete backwards
     var i = paths.len;
     while (i > 0) {
         i -= 1;
-        _ = try del(paths[i]);
-        try checkStructuralInvariants();
+        _ = try trie.del(paths[i]);
+        try checkStructuralInvariants(&trie);
     }
 
     // Re-add and delete forwards
-    for (paths) |p| try add(p, Mode.file);
-    for (paths) |p| _ = try del(p);
+    for (paths) |p| try trie.add(p, Mode.file);
+    for (paths) |p| _ = try trie.del(p);
 
-    try checkStructuralInvariants();
-    try checkAllocationInvariant();
+    try checkStructuralInvariants(&trie);
+    try checkAllocationInvariant(&trie);
 }
 
 // --- 5 & 8. Alternate split/merge (Oscillating tree) ---
 test "5 & 8. alternate split/merge oscillating tree" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     var i: usize = 0;
     while (i < 5000) : (i += 1) {
-        try add("a", Mode.dir);
-        try add("ab", Mode.dir);
-        try add("abc", Mode.dir);
+        try trie.add("a", Mode.dir);
+        try trie.add("ab", Mode.dir);
+        try trie.add("abc", Mode.dir);
 
-        _ = try del("ab");
-        try add("ab", Mode.file);
+        _ = try trie.del("ab");
+        try trie.add("ab", Mode.file);
 
-        _ = try del("a");
-        try add("a", Mode.file);
+        _ = try trie.del("a");
+        try trie.add("a", Mode.file);
 
-        _ = try del("abc");
-        try add("abc", Mode.file);
+        _ = try trie.del("abc");
+        try trie.add("abc", Mode.file);
 
         if (i % 100 == 0) {
-            try checkStructuralInvariants();
-            try checkAllocationInvariant();
+            try checkStructuralInvariants(&trie);
+            try checkAllocationInvariant(&trie);
         }
     }
-    _ = try del("a");
-    _ = try del("ab");
-    _ = try del("abc");
+    _ = try trie.del("a");
+    _ = try trie.del("ab");
+    _ = try trie.del("abc");
 }
 
 // --- 6. Every possible common prefix ---
 test "6. every possible common prefix" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
     const capacity = (Node{}).radix_str.len; // 222
 
@@ -1405,21 +1359,21 @@ test "6. every possible common prefix" {
         p1[prefix_len] = 'X';
         p2[prefix_len] = 'Y';
 
-        try add(p1, Mode.dir);
-        try add(p2, Mode.file);
+        try trie.add(p1, Mode.dir);
+        try trie.add(p2, Mode.file);
 
-        try expectModeEqual(Mode.dir, (try get(p1)).?);
-        try expectModeEqual(Mode.file, (try get(p2)).?);
+        try expectModeEqual(Mode.dir, (try trie.get(p1)).?);
+        try expectModeEqual(Mode.file, (try trie.get(p2)).?);
 
-        _ = try del(p1);
-        _ = try del(p2);
+        _ = try trie.del(p1);
+        _ = try trie.del(p2);
     }
-    try checkStructuralInvariants();
+    try checkStructuralInvariants(&trie);
 }
 
 // --- 7. Long linear chain ---
 test "7. long linear chain" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
     var paths = std.ArrayList([]u8).empty;
     defer {
@@ -1434,42 +1388,42 @@ test "7. long linear chain" {
         try paths.append(gpa, p);
     }
 
-    for (paths.items) |p| try add(p, Mode.dir);
+    for (paths.items) |p| try trie.add(p, Mode.dir);
 
     // Delete from middle outward
     var low: usize = paths.items.len / 2;
     var high = low + 1;
     while (true) {
-        _ = try del(paths.items[low]);
+        _ = try trie.del(paths.items[low]);
         if (high < paths.items.len) {
-            _ = try del(paths.items[high]);
+            _ = try trie.del(paths.items[high]);
             high += 1;
         }
         if (low == 0) break;
         low -%= 1;
     }
     // Clean up the rest (should be none, but safe)
-    for (paths.items) |p| _ = del(p) catch {};
+    for (paths.items) |p| _ = trie.del(p) catch {};
 
-    try checkStructuralInvariants();
+    try checkStructuralInvariants(&trie);
 }
 
 // --- 9. Free list reuse ---
 test "9. free list reuse" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
-        try add("a", Mode.dir);
-        _ = try del("a");
+        try trie.add("a", Mode.dir);
+        _ = try trie.del("a");
     }
     // After oscillating, pool resets when root is released
-    try testing.expectEqual(@as(u32, 1), Pool.global.block().free_from);
-    try checkAllocationInvariant();
+    try testing.expectEqual(@as(u32, 1), trie.pool.block().free_from);
+    try checkAllocationInvariant(&trie);
 }
 
 // --- 10. Maximum branching ---
 test "10. maximum branching" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
     const paths = try gpa.alloc([]const u8, 256);
     defer gpa.free(paths);
@@ -1481,26 +1435,26 @@ test "10. maximum branching" {
     }
     defer for (paths) |p| gpa.free(p);
 
-    for (paths) |p| try add(p, Mode.dir);
-    try checkStructuralInvariants();
+    for (paths) |p| try trie.add(p, Mode.dir);
+    try checkStructuralInvariants(&trie);
 
     // Delete forwards
-    for (paths) |p| _ = try del(p);
-    try checkStructuralInvariants();
+    for (paths) |p| _ = try trie.del(p);
+    try checkStructuralInvariants(&trie);
 
     // Re-add and delete backwards
-    for (paths) |p| try add(p, Mode.file);
+    for (paths) |p| try trie.add(p, Mode.file);
     var i: usize = paths.len;
     while (i > 0) {
         i -= 1;
-        _ = try del(paths[i]);
+        _ = try trie.del(paths[i]);
     }
-    try checkStructuralInvariants();
+    try checkStructuralInvariants(&trie);
 }
 
 // --- 11. Prefix/non-prefix combinations ---
 test "11. prefix/non-prefix combinations" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const paths = [_][]const u8{ "a", "ab", "abc", "abcd", "abcde" };
     var perm = [_]usize{ 0, 1, 2, 3, 4 };
 
@@ -1509,7 +1463,7 @@ test "11. prefix/non-prefix combinations" {
         // Insert subset
         for (0..paths.len) |i| {
             if ((subset_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                try add(paths[i], Mode.dir);
+                try trie.add(paths[i], Mode.dir);
             }
         }
 
@@ -1520,26 +1474,26 @@ test "11. prefix/non-prefix combinations" {
             // Re-insert if missing
             for (0..paths.len) |i| {
                 if ((subset_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                    if (try get(paths[i]) == null) {
-                        try add(paths[i], Mode.dir);
+                    if (try trie.get(paths[i]) == null) {
+                        try trie.add(paths[i], Mode.dir);
                     }
                 }
             }
 
             for (perm) |i| {
                 if ((subset_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                    _ = try del(paths[i]);
+                    _ = try trie.del(paths[i]);
                 }
             }
         }
-        try checkStructuralInvariants();
+        try checkStructuralInvariants(&trie);
     }
 }
 
 // --- 12. Random long paths ---
 test "12. random long paths" {
     // if (!builtin.fuzz) return error.SkipZigTest;
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(54321);
     const random = prng.random();
@@ -1557,7 +1511,7 @@ test "12. random long paths" {
         const op = random.intRangeLessThan(u8, 0, 3);
         if (op == 0 or op == 1) {
             const data: Mode = if (op == 0) Mode.dir else Mode.file;
-            try add(path, data);
+            try trie.add(path, data);
             // We can't easily put stack allocated slice in hashmap, so dupe it
             const owned = try gpa.dupe(u8, path);
             const gop = try ref.getOrPut(owned);
@@ -1565,18 +1519,18 @@ test "12. random long paths" {
             gop.value_ptr.* = data;
         } else {
             if (ref.fetchRemove(path)) |entry| {
-                _ = try del(entry.key);
+                _ = try trie.del(entry.key);
                 gpa.free(entry.key);
             } else {
-                try testing.expectError(error.NotFound, del(path));
+                try testing.expectError(error.NotFound, trie.del(path));
             }
         }
 
         if (i % 1000 == 0) {
-            try checkStructuralInvariants();
+            try checkStructuralInvariants(&trie);
             var verify = ref.iterator();
             while (verify.next()) |entry| {
-                const actual = try get(entry.key_ptr.*);
+                const actual = try trie.get(entry.key_ptr.*);
                 try testing.expect(actual != null);
                 try expectModeEqual(entry.value_ptr.*, actual.?);
             }
@@ -1586,67 +1540,29 @@ test "12. random long paths" {
     // Cleanup
     var it = ref.iterator();
     while (it.next()) |entry| {
-        _ = try del(entry.key_ptr.*);
+        _ = try trie.del(entry.key_ptr.*);
         gpa.free(entry.key_ptr.*);
     }
-    try checkStructuralInvariants();
+    try checkStructuralInvariants(&trie);
 }
 
 // --- 13. Repeated overwrite ---
 test "13. repeated overwrite" {
-    try ensurePoolInitialized();
+    var trie = try ensurePoolInitialized();
     // Pre-allocate the path's nodes so subsequent adds are pure overwrites
-    try add("path", Mode.dir);
-    const blk = Pool.global.block();
+    try trie.add("path", Mode.dir);
+    const blk = trie.pool.block();
     const start_free_from = blk.free_from;
 
     var i: usize = 0;
     while (i < 5000) : (i += 1) {
-        try add("path", Mode.dir);
-        try add("path", Mode.file);
-        try add("path", Mode.dir);
+        try trie.add("path", Mode.dir);
+        try trie.add("path", Mode.file);
+        try trie.add("path", Mode.dir);
     }
 
     // No new nodes should have been allocated
     try testing.expectEqual(start_free_from, blk.free_from);
-    _ = try del("path");
+    _ = try trie.del("path");
 }
 
-test "concurrent readers and writers preserve trie invariants" {
-    try ensurePoolInitialized();
-
-    const Worker = struct {
-        fn run(first_byte: u8, failed: *std.atomic.Value(bool)) void {
-            var path = [2]u8{ first_byte, 0 };
-            for (0..250) |i| {
-                path[1] = @truncate(i);
-                add(&path, Mode.dir) catch {
-                    failed.store(true, .release);
-                    return;
-                };
-                const actual = get(&path) catch {
-                    failed.store(true, .release);
-                    return;
-                };
-                if (actual == null) {
-                    failed.store(true, .release);
-                    return;
-                }
-                _ = del(&path) catch {
-                    failed.store(true, .release);
-                    return;
-                };
-            }
-        }
-    };
-
-    var failed: std.atomic.Value(bool) = .init(false);
-    var threads: [4]std.Thread = undefined;
-    for (&threads, 0..) |*thread, i| {
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ @as(u8, @intCast(i)), &failed });
-    }
-    for (threads) |thread| thread.join();
-
-    try testing.expect(!failed.load(.acquire));
-    try checkStructuralInvariants();
-}
