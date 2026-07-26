@@ -29,6 +29,22 @@ pub fn evaluate(path: []const u8) !?Mode {
     return permtrie.getLongestPrefix(path);
 }
 
+/// Stores an explicit rule. Callers coordinating open-handle snapshots must
+/// hold their policy write lock around this operation.
+pub fn set(path: []const u8, mode: Mode) !void {
+    try permtrie.add(path, mode);
+}
+
+/// Removes an explicit rule and returns it.
+pub fn remove(path: []const u8) !Mode {
+    return permtrie.del(path);
+}
+
+/// Returns only an explicit rule, without ancestor inheritance.
+pub fn get(path: []const u8) !?Mode {
+    return permtrie.get(path);
+}
+
 /// Path is visible in the namespace (raw or virtual).
 pub inline fn isAccessible(path: []const u8) !bool {
     const mode = (try evaluate(path)) orelse return false;
