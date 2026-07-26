@@ -1,5 +1,6 @@
 const std = @import("std");
 const permfuse = @import("permfuse");
+const terminal = @import("terminal.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
@@ -15,12 +16,7 @@ pub fn getLogger(comptime module_name: []const u8) type {
             comptime format: []const u8,
             args: anytype,
         ) void {
-            std.log.defaultLog(
-                level,
-                .default,
-                "(" ++ module_name ++ ") {s}:{d}:{d} in {s}: " ++ format,
-                .{ src.file, src.line, src.column, src.fn_name } ++ args,
-            );
+            terminal.log(module_name, src, level, format, args);
         }
     };
 }
@@ -38,7 +34,8 @@ const MountContext = struct {
             .io_uring = self.io_uring,
             .arguments = self.arguments,
         }) catch |err| {
-            std.debug.print("permfuse: mount failed: {t}\n", .{err});
+            terminal.label(terminal.bright_red, "mount failed: ");
+            std.debug.print("{t}\n", .{err});
             self.failed.store(true, .release);
         };
         self.finished.store(true, .release);
@@ -58,7 +55,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer config.deinit();
 
     std.Io.Dir.cwd().createDirPath(init.io, config.mountpoint) catch |err| {
-        std.debug.print("permfuse: cannot create mountpoint {s}: {t}\n", .{ config.mountpoint, err });
+        terminal.label(terminal.bright_red, "error: ");
+        std.debug.print("cannot create mountpoint {s}: {t}\n", .{ config.mountpoint, err });
         return 1;
     };
 
@@ -69,7 +67,8 @@ pub fn main(init: std.process.Init) !u8 {
         .state_path = config.state,
         .passthrough = config.passthrough,
     }) catch |err| {
-        std.debug.print("permfuse: initialization failed: {t}\n", .{err});
+        terminal.label(terminal.bright_red, "initialization failed: ");
+        std.debug.print("{t}\n", .{err});
         return 1;
     };
     defer driver.deinit();
@@ -94,11 +93,9 @@ pub fn main(init: std.process.Init) !u8 {
         mount_thread.join();
     };
 
-    std.debug.print(
-        "permfuse: mounting {s} at {s}\n" ++
-            "permfuse: type 'help' for live policy commands\n",
-        .{ config.backing, config.mountpoint },
-    );
+    terminal.label(terminal.bright_green, "mounted configuration\n");
+    std.debug.print("  backing    {s}\n  mountpoint {s}\n", .{ config.backing, config.mountpoint });
+    terminal.label(terminal.dim, "  type 'help' for live policy commands\n");
 
     var line_ptr: [*c]u8 = null;
     var line_capacity: usize = 0;
@@ -107,15 +104,17 @@ pub fn main(init: std.process.Init) !u8 {
         if (mount_context.finished.load(.acquire) and !joined) {
             mount_thread.join();
             joined = true;
-            std.debug.print("permfuse: mount loop has stopped\n", .{});
+            terminal.label(terminal.yellow, "mount loop stopped\n");
         }
-        std.debug.print("permfuse> ", .{});
+        terminal.label(terminal.cyan, "permfuse");
+        terminal.label(terminal.dim, " > ");
         const length = c.getline(&line_ptr, &line_capacity, c.stdin);
         if (length < 0) break;
         const line = std.mem.trim(u8, line_ptr[0..@intCast(length)], " \t\r\n");
         if (line.len == 0) continue;
         const keep_running = executeCommand(init, &driver, line, joined) catch |err| {
-            std.debug.print("error: {t}\n", .{err});
+            terminal.label(terminal.bright_red, "error: ");
+            std.debug.print("{t}\n", .{err});
             continue;
         };
         if (!keep_running) break;
@@ -161,23 +160,27 @@ fn executeCommand(
         const flags_start = skipWords(line, 2) orelse return error.MissingFlags;
         const mode = try permfuse.parseModeText(flags_start);
         try driver.setRule(path, mode);
-        std.debug.print("updated {s}\n", .{path});
+        terminal.label(terminal.bright_green, "updated  ");
+        std.debug.print("{s}\n", .{path});
     } else if (std.mem.eql(u8, command, "del")) {
         const path = words.next() orelse return error.MissingPath;
         _ = try driver.removeRule(path);
-        std.debug.print("removed {s}\n", .{path});
+        terminal.label(terminal.yellow, "removed  ");
+        std.debug.print("{s}\n", .{path});
     } else if (std.mem.eql(u8, command, "load")) {
         const path = words.next() orelse return error.MissingFile;
         const text = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(16 * 1024 * 1024));
         defer init.gpa.free(text);
         try driver.replacePolicyFromText(init.gpa, text);
-        std.debug.print("loaded {s}\n", .{path});
+        terminal.label(terminal.bright_green, "loaded   ");
+        std.debug.print("{s}\n", .{path});
     } else if (std.mem.eql(u8, command, "save")) {
         const path = words.next() orelse return error.MissingFile;
         const text = try driver.policyToText(init.gpa);
         defer init.gpa.free(text);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = text });
-        std.debug.print("saved {s}\n", .{path});
+        terminal.label(terminal.bright_green, "saved    ");
+        std.debug.print("{s}\n", .{path});
     } else if (std.mem.eql(u8, command, "unmount")) {
         driver.requestUnmount();
     } else if (std.mem.eql(u8, command, "apply")) {
@@ -191,6 +194,7 @@ fn executeCommand(
             .max_files = limit,
             .remove_applied = remove,
         });
+        terminal.label(terminal.bright_green, "overlay  ");
         std.debug.print("applied={}, skipped={}, remaining={}\n", .{
             result.applied,
             result.skipped,
@@ -234,27 +238,36 @@ fn printMode(mode: ?permfuse.Mode) void {
 }
 
 fn printHelp() void {
+    terminal.label(terminal.bright_blue, "Policy\n");
     std.debug.print(
-        \\Commands:
-        \\  show                         print the complete fs block
-        \\  get PATH                     show exact and effective rules
-        \\  set PATH FLAGS               insert or replace a live rule
-        \\  del PATH                     remove an explicit rule
-        \\  load FILE                    replace policy from an fs block
-        \\  save FILE                    save policy as an fs block
-        \\  unmount                      stop the active mount
-        \\  apply [MAX_FILES] [remove]   apply overlay data after unmount
-        \\  quit                         unmount and exit
-        \\
-    , .{});
+        "  show                         print the complete fs block\n" ++
+            "  get PATH                     show exact and effective rules\n" ++
+            "  set PATH FLAGS               insert or replace a live rule\n" ++
+            "  del PATH                     remove an explicit rule\n" ++
+            "  load FILE                    replace policy from an fs block\n" ++
+            "  save FILE                    save policy as an fs block\n",
+        .{},
+    );
+    terminal.label(terminal.bright_blue, "Mount and overlay\n");
+    std.debug.print(
+        "  unmount                      stop the active mount\n" ++
+            "  apply [MAX_FILES] [remove]   apply overlay data after unmount\n" ++
+            "  quit                         unmount and exit\n",
+        .{},
+    );
 }
 
 fn printUsage(err: anyerror) void {
+    terminal.label(terminal.bright_red, "error: ");
     std.debug.print(
-        "permfuse: {t}\n" ++
-            "usage: permfuse --backing=/absolute/root --policy=/absolute/trie " ++
+        "{t}\n",
+        .{err},
+    );
+    terminal.label(terminal.bright_blue, "usage\n  ");
+    std.debug.print(
+        "permfuse --backing=/absolute/root --policy=/absolute/trie " ++
             "[--state=/absolute/session] [--no-io-uring] [--no-passthrough] " ++
             "/absolute/mountpoint [FUSE options]\n",
-        .{err},
+        .{},
     );
 }

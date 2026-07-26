@@ -1,5 +1,6 @@
 const std = @import("std");
 const permfuse = @import("permfuse");
+const terminal = @import("terminal.zig");
 
 pub fn getLogger(comptime module_name: []const u8) type {
     return struct {
@@ -9,12 +10,7 @@ pub fn getLogger(comptime module_name: []const u8) type {
             comptime format: []const u8,
             args: anytype,
         ) void {
-            std.log.defaultLog(
-                level,
-                .default,
-                "(" ++ module_name ++ ") {s}:{d}:{d} in {s}: " ++ format,
-                .{ src.file, src.line, src.column, src.fn_name } ++ args,
-            );
+            terminal.log(module_name, src, level, format, args);
         }
     };
 }
