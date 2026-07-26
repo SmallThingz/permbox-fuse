@@ -79,12 +79,15 @@ pub const Session = struct {
             c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC,
         );
         if (root_fd < 0) {
-            if (!create or posixErrno(-1) != c.ENOENT) {
-                log.err(@src(), "open session root failed; path={s}, create={}, errno={}", .{ path, create, posixErrno(-1) });
+            const open_errno: c_int = @intFromEnum(std.posix.errno(root_fd));
+            if (!create or open_errno != c.ENOENT) {
+                log.err(@src(), "open session root failed; path={s}, create={}, errno={}", .{ path, create, open_errno });
                 return error.Io;
             }
-            if (c.mkdir(path.ptr, 0o700) != 0 and posixErrno(-1) != c.EEXIST) {
-                log.err(@src(), "mkdir session root failed; path={s}, errno={}", .{ path, posixErrno(-1) });
+            const mkdir_rc = c.mkdir(path.ptr, 0o700);
+            const mkdir_errno: c_int = @intFromEnum(std.posix.errno(mkdir_rc));
+            if (mkdir_rc != 0 and mkdir_errno != c.EEXIST) {
+                log.err(@src(), "mkdir session root failed; path={s}, errno={}", .{ path, mkdir_errno });
                 return error.Io;
             }
         }
@@ -93,7 +96,7 @@ pub const Session = struct {
             c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC,
         );
         if (opened_root < 0) {
-            log.err(@src(), "reopen session root after mkdir failed; path={s}, errno={}", .{ path, posixErrno(-1) });
+            log.err(@src(), "reopen session root after mkdir failed; path={s}, errno={}", .{ path, @intFromEnum(std.posix.errno(opened_root)) });
             return error.Io;
         }
         errdefer _ = c.close(opened_root);
@@ -102,26 +105,27 @@ pub const Session = struct {
         try ensureDir(opened_root, "data", create);
         try ensureDir(opened_root, "ranges", create);
         try ensureDir(opened_root, "paths", create);
-        if (create and c.fsync(opened_root) != 0) {
-            log.err(@src(), "fsync session root failed; path={s}, errno={}", .{ path, posixErrno(-1) });
+        const root_sync_rc = if (create) c.fsync(opened_root) else 0;
+        if (root_sync_rc != 0) {
+            log.err(@src(), "fsync session root failed; path={s}, errno={}", .{ path, @intFromEnum(std.posix.errno(root_sync_rc)) });
             return error.Io;
         }
 
         const data_fd = c.openat(opened_root, "data", c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
         if (data_fd < 0) {
-            log.err(@src(), "open data dir failed; root={s}, errno={}", .{ path, posixErrno(-1) });
+            log.err(@src(), "open data dir failed; root={s}, errno={}", .{ path, @intFromEnum(std.posix.errno(data_fd)) });
             return error.Io;
         }
         errdefer _ = c.close(data_fd);
         const paths_fd = c.openat(opened_root, "paths", c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
         if (paths_fd < 0) {
-            log.err(@src(), "open paths dir failed; root={s}, errno={}", .{ path, posixErrno(-1) });
+            log.err(@src(), "open paths dir failed; root={s}, errno={}", .{ path, @intFromEnum(std.posix.errno(paths_fd)) });
             return error.Io;
         }
         errdefer _ = c.close(paths_fd);
         const ranges_fd = c.openat(opened_root, "ranges", c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
         if (ranges_fd < 0) {
-            log.err(@src(), "open ranges dir failed; root={s}, errno={}", .{ path, posixErrno(-1) });
+            log.err(@src(), "open ranges dir failed; root={s}, errno={}", .{ path, @intFromEnum(std.posix.errno(ranges_fd)) });
             return error.Io;
         }
         errdefer _ = c.close(ranges_fd);
@@ -145,13 +149,13 @@ pub const Session = struct {
 
     pub fn duplicateDataFd(self: *const Session) Error!c_int {
         const fd = c.fcntl(self.data_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
-        if (fd < 0) log.err(@src(), "fcntl(DUPFD_CLOEXEC) for data_fd failed; fd={}, errno={}", .{ self.data_fd, posixErrno(-1) });
+        if (fd < 0) log.err(@src(), "fcntl(DUPFD_CLOEXEC) for data_fd failed; fd={}, errno={}", .{ self.data_fd, @intFromEnum(std.posix.errno(fd)) });
         return if (fd < 0) error.Io else fd;
     }
 
     pub fn duplicatePathsFd(self: *const Session) Error!c_int {
         const fd = c.fcntl(self.paths_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
-        if (fd < 0) log.err(@src(), "fcntl(DUPFD_CLOEXEC) for paths_fd failed; fd={}, errno={}", .{ self.paths_fd, posixErrno(-1) });
+        if (fd < 0) log.err(@src(), "fcntl(DUPFD_CLOEXEC) for paths_fd failed; fd={}, errno={}", .{ self.paths_fd, @intFromEnum(std.posix.errno(fd)) });
         return if (fd < 0) error.Io else fd;
     }
 
@@ -169,7 +173,7 @@ pub const Session = struct {
         if (existing >= 0) {
             var buf: [max_path]u8 = undefined;
             const got = c.pread(existing, &buf, buf.len, 0);
-            const read_errno = if (got < 0) posixErrno(-1) else 0;
+            const read_errno: c_int = if (got < 0) @intFromEnum(std.posix.errno(got)) else 0;
             _ = c.close(existing);
             if (got < 0) {
                 log.err(@src(), "read existing path record failed; id={s}, errno={}", .{ id, read_errno });
@@ -182,8 +186,9 @@ pub const Session = struct {
             }
             return id;
         }
-        if (posixErrno(-1) != c.ENOENT) {
-            log.err(@src(), "open existing path record failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+        const existing_errno: c_int = @intFromEnum(std.posix.errno(existing));
+        if (existing_errno != c.ENOENT) {
+            log.err(@src(), "open existing path record failed; id={s}, errno={}", .{ id, existing_errno });
             return error.Io;
         }
 
@@ -202,7 +207,7 @@ pub const Session = struct {
             @as(c.mode_t, 0o600),
         );
         if (fd < 0) {
-            log.err(@src(), "open pending path record failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+            log.err(@src(), "open pending path record failed; id={s}, errno={}", .{ id, @intFromEnum(std.posix.errno(fd)) });
             return error.Io;
         }
         const written = c.pwrite(fd, path.ptr, path.len, 0);
@@ -211,46 +216,51 @@ pub const Session = struct {
                 id,
                 path.len,
                 written,
-                if (written < 0) posixErrno(-1) else 0,
+                if (written < 0) @intFromEnum(std.posix.errno(written)) else 0,
             });
             _ = c.close(fd);
             _ = c.unlinkat(self.paths_fd, pending.ptr, 0);
             return error.Io;
         }
-        if (c.fdatasync(fd) != 0) {
-            log.err(@src(), "sync pending path record failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+        const data_sync_rc = c.fdatasync(fd);
+        if (data_sync_rc != 0) {
+            log.err(@src(), "sync pending path record failed; id={s}, errno={}", .{ id, @intFromEnum(std.posix.errno(data_sync_rc)) });
             _ = c.close(fd);
             _ = c.unlinkat(self.paths_fd, pending.ptr, 0);
             return error.Io;
         }
         _ = c.close(fd);
-        if (c.linkat(self.paths_fd, pending.ptr, self.paths_fd, &id, 0) != 0) {
-            const link_errno = posixErrno(-1);
+        const link_rc = c.linkat(self.paths_fd, pending.ptr, self.paths_fd, &id, 0);
+        if (link_rc != 0) {
+            const link_errno: c_int = @intFromEnum(std.posix.errno(link_rc));
             if (link_errno != c.EEXIST) {
                 log.err(@src(), "publish path record failed; id={s}, errno={}", .{ id, link_errno });
                 _ = c.unlinkat(self.paths_fd, pending.ptr, 0);
                 return error.Io;
             }
         }
-        if (c.unlinkat(self.paths_fd, pending.ptr, 0) != 0 and posixErrno(-1) != c.ENOENT) {
-            log.warn(@src(), "remove pending path record failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+        const unlink_rc = c.unlinkat(self.paths_fd, pending.ptr, 0);
+        const unlink_errno: c_int = @intFromEnum(std.posix.errno(unlink_rc));
+        if (unlink_rc != 0 and unlink_errno != c.ENOENT) {
+            log.warn(@src(), "remove pending path record failed; id={s}, errno={}", .{ id, unlink_errno });
         }
-        if (c.fsync(self.paths_fd) != 0) {
-            log.err(@src(), "sync paths directory after publish failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+        const paths_sync_rc = c.fsync(self.paths_fd);
+        if (paths_sync_rc != 0) {
+            log.err(@src(), "sync paths directory after publish failed; id={s}, errno={}", .{ id, @intFromEnum(std.posix.errno(paths_sync_rc)) });
             return error.Io;
         }
 
         // A cross-process winner must map the hash to the same path.
         const published = c.openat(self.paths_fd, &id, c.O_RDONLY | c.O_CLOEXEC);
         if (published < 0) {
-            log.err(@src(), "verify-open published path failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+            log.err(@src(), "verify-open published path failed; id={s}, errno={}", .{ id, @intFromEnum(std.posix.errno(published)) });
             return error.Io;
         }
         defer _ = c.close(published);
         var published_buf: [max_path]u8 = undefined;
         const published_len = c.pread(published, &published_buf, published_buf.len, 0);
         if (published_len < 0) {
-            log.err(@src(), "verify-read published path failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+            log.err(@src(), "verify-read published path failed; id={s}, errno={}", .{ id, @intFromEnum(std.posix.errno(published_len)) });
             return error.Io;
         }
         if (!std.mem.eql(u8, published_buf[0..@intCast(published_len)], path)) {
@@ -273,7 +283,7 @@ pub const Session = struct {
 
         const backing_fd = c.open(backing_path.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
         if (backing_fd < 0) {
-            log.err(@src(), "open backing dir for apply failed; path={s}, errno={}", .{ backing_path, posixErrno(-1) });
+            log.err(@src(), "open backing dir for apply failed; path={s}, errno={}", .{ backing_path, @intFromEnum(std.posix.errno(backing_fd)) });
             return error.Io;
         }
         defer _ = c.close(backing_fd);
@@ -285,12 +295,13 @@ pub const Session = struct {
             @as(c.mode_t, 0o600),
         );
         if (log_fd < 0) {
-            log.err(@src(), "open/create apply checkpoint log failed; root_fd={}, errno={}", .{ self.root_fd, posixErrno(-1) });
+            log.err(@src(), "open/create apply checkpoint log failed; root_fd={}, errno={}", .{ self.root_fd, @intFromEnum(std.posix.errno(log_fd)) });
             return error.Io;
         }
         defer _ = c.close(log_fd);
-        if (c.fsync(self.root_fd) != 0) {
-            log.err(@src(), "fsync root dir before apply failed; errno={}", .{posixErrno(-1)});
+        const root_sync_rc = c.fsync(self.root_fd);
+        if (root_sync_rc != 0) {
+            log.err(@src(), "fsync root dir before apply failed; errno={}", .{@intFromEnum(std.posix.errno(root_sync_rc))});
             return error.Io;
         }
 
@@ -310,11 +321,11 @@ pub const Session = struct {
             c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC,
         );
         if (scan_fd < 0) {
-            log.err(@src(), "open paths dir for apply scan failed; errno={}", .{posixErrno(-1)});
+            log.err(@src(), "open paths dir for apply scan failed; errno={}", .{@intFromEnum(std.posix.errno(scan_fd))});
             return error.Io;
         }
         const directory = c.fdopendir(scan_fd) orelse {
-            log.err(@src(), "fdopendir for apply scan failed; errno={}", .{posixErrno(-1)});
+            log.err(@src(), "fdopendir for apply scan failed; errno={}", .{@intFromEnum(std.posix.errno(@as(c_int, -1)))});
             _ = c.close(scan_fd);
             return error.Io;
         };
@@ -360,16 +371,22 @@ pub const Session = struct {
                 // one harmless re-apply; a recreated journal can never be
                 // mistaken for the prior generation.
                 try appendCheckpoint(log_fd, name, 0);
-                if (c.unlinkat(self.data_fd, name.ptr, 0) != 0 and posixErrno(-1) != c.ENOENT) {
-                    log.err(@src(), "unlink data failed; id={s}, errno={}", .{ name, posixErrno(-1) });
+                const data_unlink_rc = c.unlinkat(self.data_fd, name.ptr, 0);
+                const data_errno: c_int = @intFromEnum(std.posix.errno(data_unlink_rc));
+                if (data_unlink_rc != 0 and data_errno != c.ENOENT) {
+                    log.err(@src(), "unlink data failed; id={s}, errno={}", .{ name, data_errno });
                     return error.Io;
                 }
-                if (c.unlinkat(self.ranges_fd, name.ptr, 0) != 0 and posixErrno(-1) != c.ENOENT) {
-                    log.err(@src(), "unlink ranges failed; id={s}, errno={}", .{ name, posixErrno(-1) });
+                const ranges_unlink_rc = c.unlinkat(self.ranges_fd, name.ptr, 0);
+                const ranges_errno: c_int = @intFromEnum(std.posix.errno(ranges_unlink_rc));
+                if (ranges_unlink_rc != 0 and ranges_errno != c.ENOENT) {
+                    log.err(@src(), "unlink ranges failed; id={s}, errno={}", .{ name, ranges_errno });
                     return error.Io;
                 }
-                if (c.unlinkat(self.paths_fd, name.ptr, 0) != 0 and posixErrno(-1) != c.ENOENT) {
-                    log.err(@src(), "unlink paths failed; id={s}, errno={}", .{ name, posixErrno(-1) });
+                const paths_unlink_rc = c.unlinkat(self.paths_fd, name.ptr, 0);
+                const paths_errno: c_int = @intFromEnum(std.posix.errno(paths_unlink_rc));
+                if (paths_unlink_rc != 0 and paths_errno != c.ENOENT) {
+                    log.err(@src(), "unlink paths failed; id={s}, errno={}", .{ name, paths_errno });
                     return error.Io;
                 }
             }
@@ -399,12 +416,13 @@ fn appendCheckpoint(fd: c_int, id: []const u8, offset: u64) Error!void {
             offset,
             checkpoint.len,
             written,
-            if (written < 0) posixErrno(-1) else 0,
+            if (written < 0) @intFromEnum(std.posix.errno(written)) else 0,
         });
         return error.Io;
     }
-    if (c.fdatasync(fd) != 0) {
-        log.err(@src(), "sync checkpoint failed; fd={}, id={s}, offset={}, errno={}", .{ fd, id, offset, posixErrno(-1) });
+    const sync_rc = c.fdatasync(fd);
+    if (sync_rc != 0) {
+        log.err(@src(), "sync checkpoint failed; fd={}, id={s}, offset={}, errno={}", .{ fd, id, offset, @intFromEnum(std.posix.errno(sync_rc)) });
         return error.Io;
     }
 }
@@ -412,8 +430,9 @@ fn appendCheckpoint(fd: c_int, id: []const u8, offset: u64) Error!void {
 fn ensureFormat(root_fd: c_int, create: bool) Error!void {
     var fd = c.openat(root_fd, "format", c.O_RDONLY | c.O_CLOEXEC);
     if (fd < 0) {
-        if (!create or posixErrno(-1) != c.ENOENT) {
-            log.err(@src(), "open format file failed; root_fd={}, create={}, errno={}", .{ root_fd, create, posixErrno(-1) });
+        const open_errno: c_int = @intFromEnum(std.posix.errno(fd));
+        if (!create or open_errno != c.ENOENT) {
+            log.err(@src(), "open format file failed; root_fd={}, create={}, errno={}", .{ root_fd, create, open_errno });
             return error.InvalidSession;
         }
         fd = c.openat(
@@ -423,7 +442,7 @@ fn ensureFormat(root_fd: c_int, create: bool) Error!void {
             @as(c.mode_t, 0o600),
         );
         if (fd < 0) {
-            log.err(@src(), "create format file failed; root_fd={}, errno={}", .{ root_fd, posixErrno(-1) });
+            log.err(@src(), "create format file failed; root_fd={}, errno={}", .{ root_fd, @intFromEnum(std.posix.errno(fd)) });
             return error.Io;
         }
         defer _ = c.close(fd);
@@ -433,16 +452,18 @@ fn ensureFormat(root_fd: c_int, create: bool) Error!void {
                 root_fd,
                 format_contents.len,
                 written,
-                if (written < 0) posixErrno(-1) else 0,
+                if (written < 0) @intFromEnum(std.posix.errno(written)) else 0,
             });
             return error.Io;
         }
-        if (c.fdatasync(fd) != 0) {
-            log.err(@src(), "sync format marker failed; root_fd={}, errno={}", .{ root_fd, posixErrno(-1) });
+        const data_sync_rc = c.fdatasync(fd);
+        if (data_sync_rc != 0) {
+            log.err(@src(), "sync format marker failed; root_fd={}, errno={}", .{ root_fd, @intFromEnum(std.posix.errno(data_sync_rc)) });
             return error.Io;
         }
-        if (c.fsync(root_fd) != 0) {
-            log.err(@src(), "sync session root after format creation failed; root_fd={}, errno={}", .{ root_fd, posixErrno(-1) });
+        const root_sync_rc = c.fsync(root_fd);
+        if (root_sync_rc != 0) {
+            log.err(@src(), "sync session root after format creation failed; root_fd={}, errno={}", .{ root_fd, @intFromEnum(std.posix.errno(root_sync_rc)) });
             return error.Io;
         }
         return;
@@ -460,15 +481,17 @@ fn ensureDir(root_fd: c_int, name: [*:0]const u8, create: bool) Error!void {
     if (!create) {
         const fd = c.openat(root_fd, name, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
         if (fd < 0) {
-            log.err(@src(), "open subdir failed; root_fd={}, name={s}, errno={}", .{ root_fd, name, posixErrno(-1) });
+            log.err(@src(), "open subdir failed; root_fd={}, name={s}, errno={}", .{ root_fd, name, @intFromEnum(std.posix.errno(fd)) });
             return error.InvalidSession;
         }
         _ = c.close(fd);
         return;
     }
-    if (c.mkdirat(root_fd, name, 0o700) == 0) return;
-    if (posixErrno(-1) == c.EEXIST) return;
-    log.err(@src(), "mkdirat subdir failed; root_fd={}, name={s}, errno={}", .{ root_fd, name, posixErrno(-1) });
+    const rc = c.mkdirat(root_fd, name, 0o700);
+    if (rc == 0) return;
+    const err: c_int = @intFromEnum(std.posix.errno(rc));
+    if (err == c.EEXIST) return;
+    log.err(@src(), "mkdirat subdir failed; root_fd={}, name={s}, errno={}", .{ root_fd, name, err });
     return error.Io;
 }
 
@@ -491,8 +514,9 @@ fn readCompleted(
     completed: *std.StringHashMapUnmanaged(u64),
 ) Error!void {
     var st: c.struct_stat = undefined;
-    if (c.fstat(fd, &st) != 0) {
-        log.err(@src(), "fstat apply.log failed; fd={}, errno={}", .{ fd, posixErrno(-1) });
+    const stat_rc = c.fstat(fd, &st);
+    if (stat_rc != 0) {
+        log.err(@src(), "fstat apply.log failed; fd={}, errno={}", .{ fd, @intFromEnum(std.posix.errno(stat_rc)) });
         return error.Io;
     }
     if (st.st_size == 0) return;
@@ -508,7 +532,7 @@ fn readCompleted(
             fd,
             contents.len,
             got,
-            if (got < 0) posixErrno(-1) else 0,
+            if (got < 0) @intFromEnum(std.posix.errno(got)) else 0,
         });
         return error.Io;
     }
@@ -518,12 +542,14 @@ fn readCompleted(
         0;
     if (parsed_len != contents.len) {
         // A checkpoint write may have been interrupted before fdatasync.
-        if (c.ftruncate(fd, @intCast(parsed_len)) != 0) {
-            log.err(@src(), "truncate torn checkpoint failed; fd={}, valid_bytes={d}, errno={}", .{ fd, parsed_len, posixErrno(-1) });
+        const truncate_rc = c.ftruncate(fd, @intCast(parsed_len));
+        if (truncate_rc != 0) {
+            log.err(@src(), "truncate torn checkpoint failed; fd={}, valid_bytes={d}, errno={}", .{ fd, parsed_len, @intFromEnum(std.posix.errno(truncate_rc)) });
             return error.Io;
         }
-        if (c.fdatasync(fd) != 0) {
-            log.err(@src(), "sync truncated checkpoint log failed; fd={}, valid_bytes={d}, errno={}", .{ fd, parsed_len, posixErrno(-1) });
+        const sync_rc = c.fdatasync(fd);
+        if (sync_rc != 0) {
+            log.err(@src(), "sync truncated checkpoint log failed; fd={}, valid_bytes={d}, errno={}", .{ fd, parsed_len, @intFromEnum(std.posix.errno(sync_rc)) });
             return error.Io;
         }
     }
@@ -554,14 +580,16 @@ fn rangeJournalEnd(session: *Session, id: []const u8) Error!u64 {
     @memcpy(id_z[0..id_len], id);
     id_z[id_len] = 0;
     const fd = c.openat(session.ranges_fd, &id_z, c.O_RDONLY | c.O_CLOEXEC);
-    if (fd < 0) return if (posixErrno(-1) == c.ENOENT) error.IncompleteEntry else blk: {
-        log.err(@src(), "open range journal failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+    const open_errno: c_int = @intFromEnum(std.posix.errno(fd));
+    if (fd < 0) return if (open_errno == c.ENOENT) error.IncompleteEntry else blk: {
+        log.err(@src(), "open range journal failed; id={s}, errno={}", .{ id, open_errno });
         break :blk error.Io;
     };
     defer _ = c.close(fd);
     var st: c.struct_stat = undefined;
-    if (c.fstat(fd, &st) != 0) {
-        log.err(@src(), "fstat range journal failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+    const stat_rc = c.fstat(fd, &st);
+    if (stat_rc != 0) {
+        log.err(@src(), "fstat range journal failed; id={s}, errno={}", .{ id, @intFromEnum(std.posix.errno(stat_rc)) });
         return error.Io;
     }
     if (st.st_size < 0) {
@@ -584,14 +612,14 @@ fn applyOne(
 
     const path_fd = c.openat(session.paths_fd, &id_z, c.O_RDONLY | c.O_CLOEXEC);
     if (path_fd < 0) {
-        log.err(@src(), "applyOne: open path record failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+        log.err(@src(), "applyOne: open path record failed; id={s}, errno={}", .{ id, @intFromEnum(std.posix.errno(path_fd)) });
         return error.Io;
     }
     defer _ = c.close(path_fd);
     var path_buf: [max_path]u8 = undefined;
     const path_len = c.pread(path_fd, &path_buf, path_buf.len, 0);
     if (path_len < 0) {
-        log.err(@src(), "apply path: read path record failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+        log.err(@src(), "apply path: read path record failed; id={s}, errno={}", .{ id, @intFromEnum(std.posix.errno(path_len)) });
         return error.Io;
     }
     if (path_len == 0) {
@@ -606,20 +634,22 @@ fn applyOne(
     path_buf[@intCast(path_len)] = 0;
 
     const overlay_fd = c.openat(session.data_fd, &id_z, c.O_RDONLY | c.O_CLOEXEC);
-    if (overlay_fd < 0) return if (posixErrno(-1) == c.ENOENT) blk: {
+    const overlay_errno: c_int = @intFromEnum(std.posix.errno(overlay_fd));
+    if (overlay_fd < 0) return if (overlay_errno == c.ENOENT) blk: {
         log.warn(@src(), "applyOne: overlay data missing; id={s}", .{id});
         break :blk error.IncompleteEntry;
     } else blk: {
-        log.err(@src(), "applyOne: open overlay data failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+        log.err(@src(), "applyOne: open overlay data failed; id={s}, errno={}", .{ id, overlay_errno });
         break :blk error.Io;
     };
     defer _ = c.close(overlay_fd);
     const ranges_fd = c.openat(session.ranges_fd, &id_z, c.O_RDONLY | c.O_CLOEXEC);
-    if (ranges_fd < 0) return if (posixErrno(-1) == c.ENOENT) blk: {
+    const ranges_errno: c_int = @intFromEnum(std.posix.errno(ranges_fd));
+    if (ranges_fd < 0) return if (ranges_errno == c.ENOENT) blk: {
         log.warn(@src(), "applyOne: range journal missing; id={s}", .{id});
         break :blk error.IncompleteEntry;
     } else blk: {
-        log.err(@src(), "applyOne: open range journal failed; id={s}, errno={}", .{ id, posixErrno(-1) });
+        log.err(@src(), "applyOne: open range journal failed; id={s}, errno={}", .{ id, ranges_errno });
         break :blk error.Io;
     };
     defer _ = c.close(ranges_fd);
@@ -627,8 +657,9 @@ fn applyOne(
     if (target_fd < 0) return error.Io;
     defer _ = c.close(target_fd);
     var target_stat: c.struct_stat = undefined;
-    if (c.fstat(target_fd, &target_stat) != 0) {
-        log.err(@src(), "applyOne: fstat target failed; id={s}, path={s}, errno={}", .{ id, path, posixErrno(-1) });
+    const target_stat_rc = c.fstat(target_fd, &target_stat);
+    if (target_stat_rc != 0) {
+        log.err(@src(), "applyOne: fstat target failed; id={s}, path={s}, errno={}", .{ id, path, @intFromEnum(std.posix.errno(target_stat_rc)) });
         return error.Io;
     }
     if (target_stat.st_mode & c.S_IFMT != c.S_IFREG) {
@@ -650,7 +681,7 @@ fn applyOne(
                 id,
                 journal_offset,
                 got_records,
-                if (got_records < 0) posixErrno(-1) else 0,
+                if (got_records < 0) @intFromEnum(std.posix.errno(got_records)) else 0,
             });
             return error.Io;
         }
@@ -675,7 +706,7 @@ fn applyOne(
                         cursor,
                         amount,
                         got,
-                        if (got < 0) posixErrno(-1) else 0,
+                        if (got < 0) @intFromEnum(std.posix.errno(got)) else 0,
                     });
                     return error.Io;
                 }
@@ -686,7 +717,7 @@ fn applyOne(
                         cursor,
                         got,
                         written,
-                        if (written < 0) posixErrno(-1) else 0,
+                        if (written < 0) @intFromEnum(std.posix.errno(written)) else 0,
                     });
                     return error.Io;
                 }
@@ -695,8 +726,9 @@ fn applyOne(
         }
         journal_offset += @intCast(got_records);
     }
-    if (c.fsync(target_fd) != 0) {
-        log.err(@src(), "applyOne: fsync target failed; id={s}, path={s}, errno={}", .{ id, path, posixErrno(-1) });
+    const sync_rc = c.fsync(target_fd);
+    if (sync_rc != 0) {
+        log.err(@src(), "applyOne: fsync target failed; id={s}, path={s}, errno={}", .{ id, path, @intFromEnum(std.posix.errno(sync_rc)) });
         return error.Io;
     }
 }
@@ -706,7 +738,7 @@ fn applyOne(
 fn openBeneath(root_fd: c_int, relative: [:0]u8) c_int {
     var directory_fd = c.fcntl(root_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
     if (directory_fd < 0) {
-        log.err(@src(), "openBeneath: DUPFD root_fd failed; root_fd={}, errno={}", .{ root_fd, posixErrno(-1) });
+        log.err(@src(), "openBeneath: DUPFD root_fd failed; root_fd={}, errno={}", .{ root_fd, @intFromEnum(std.posix.errno(directory_fd)) });
         return -1;
     }
     var start: usize = 0;
@@ -717,7 +749,7 @@ fn openBeneath(root_fd: c_int, relative: [:0]u8) c_int {
             @as([*:0]const u8, @ptrCast(relative.ptr + start)),
             c.O_PATH | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC,
         );
-        const open_errno = if (next < 0) posixErrno(-1) else 0;
+        const open_errno: c_int = if (next < 0) @intFromEnum(std.posix.errno(next)) else 0;
         relative[slash] = '/';
         _ = c.close(directory_fd);
         if (next < 0) {
@@ -737,14 +769,10 @@ fn openBeneath(root_fd: c_int, relative: [:0]u8) c_int {
         c.O_WRONLY | c.O_NONBLOCK | c.O_NOFOLLOW | c.O_CLOEXEC,
     );
     if (result < 0) {
-        log.err(@src(), "open backing target failed; target={s}, errno={}", .{ relative[start..], posixErrno(-1) });
+        log.err(@src(), "open backing target failed; target={s}, errno={}", .{ relative[start..], @intFromEnum(std.posix.errno(result)) });
     }
     _ = c.close(directory_fd);
     return result;
-}
-
-fn posixErrno(rc: anytype) c_int {
-    return @intFromEnum(std.posix.errno(rc));
 }
 
 test "overlay ids are stable and path-sensitive" {
@@ -772,7 +800,7 @@ test "path validation rejects traversal and malformed paths" {
 
 test "libc return values are decoded with posix errno" {
     const rc = c.close(-1);
-    try std.testing.expectEqual(@as(c_int, c.EBADF), posixErrno(rc));
+    try std.testing.expectEqual(@as(c_int, c.EBADF), @intFromEnum(std.posix.errno(rc)));
 }
 
 test "torn apply checkpoint tail is discarded" {

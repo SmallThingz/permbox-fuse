@@ -133,10 +133,6 @@ fn replyErr(req: c.fuse_req_t, err: c_int) void {
     _ = c.fuse_reply_err(req, err);
 }
 
-fn posixErrno(rc: anytype) c_int {
-    return @intFromEnum(std.posix.errno(rc));
-}
-
 fn childPath(parent: []const u8, name: []const u8, buf: *[max_path]u8) ?[:0]u8 {
     if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
     const separator: usize = @intFromBool(parent.len != 1);
@@ -214,7 +210,7 @@ fn openSessionFile(
     const existing_flags = flags & ~@as(c_int, c.O_CREAT | c.O_EXCL);
     var fd = c.openat(directory_fd, id, existing_flags | c.O_CLOEXEC);
     if (fd >= 0) return fd;
-    if (posixErrno(-1) != c.ENOENT) return -1;
+    if (std.posix.errno(fd) != .NOENT) return -1;
 
     fd = c.openat(
         directory_fd,
@@ -222,7 +218,7 @@ fn openSessionFile(
         flags | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC,
         @as(c.mode_t, 0o600),
     );
-    if (fd < 0 and posixErrno(-1) == c.EEXIST)
+    if (fd < 0 and std.posix.errno(fd) == .EXIST)
         return c.openat(directory_fd, id, existing_flags | c.O_CLOEXEC);
     if (fd < 0) return -1;
     if (c.fsync(directory_fd) != 0) {
@@ -377,7 +373,8 @@ fn authorize(fs: *Fs, handle: *Handle, operation: Operation) bool {
 }
 
 fn statNode(fs: *Fs, node: *Inode, st: *c.struct_stat) c_int {
-    if (c.fstat(node.fd, st) != 0) return posixErrno(-1);
+    const stat_rc = c.fstat(node.fd, st);
+    if (stat_rc != 0) return @intFromEnum(std.posix.errno(stat_rc));
     if (ruleFor(node.path)) |mode| {
         if (!visible(mode)) return c.ENOENT;
         if (mode.x != .allow) st.st_mode &= ~@as(c.mode_t, 0o111);
@@ -436,11 +433,12 @@ fn lookupCb(req: c.fuse_req_t, parent_ino: c.fuse_ino_t, name_z: [*c]const u8) c
     if (!visible(mode) or mode.k != .visible_raw) return replyErr(req, c.ENOENT);
 
     const fd = c.openat(parent.fd, name_z, c.O_PATH | c.O_NOFOLLOW | c.O_CLOEXEC);
-    if (fd < 0) return replyErr(req, posixErrno(-1));
+    if (fd < 0) return replyErr(req, @intFromEnum(std.posix.errno(fd)));
 
     var st: c.struct_stat = undefined;
-    if (c.fstat(fd, &st) != 0) {
-        const err = posixErrno(-1);
+    const stat_rc = c.fstat(fd, &st);
+    if (stat_rc != 0) {
+        const err = @intFromEnum(std.posix.errno(stat_rc));
         _ = c.close(fd);
         return replyErr(req, err);
     }
@@ -523,7 +521,7 @@ fn readlinkCb(req: c.fuse_req_t, ino: c.fuse_ino_t) callconv(.c) void {
 
     var buf: [max_path]u8 = undefined;
     const len = c.readlinkat(node.fd, "", &buf, buf.len - 1);
-    if (len < 0) return replyErr(req, posixErrno(-1));
+    if (len < 0) return replyErr(req, @intFromEnum(std.posix.errno(len)));
     buf[@intCast(len)] = 0;
     _ = c.fuse_reply_readlink(req, &buf);
 }
@@ -537,8 +535,9 @@ fn accessCb(req: c.fuse_req_t, ino: c.fuse_ino_t, mask: c_int) callconv(.c) void
     if (mask & c.W_OK != 0 and mode.w != .allow and mode.w != .overlay)
         return replyErr(req, c.EACCES);
     if (mask & c.X_OK != 0 and mode.x != .allow) return replyErr(req, c.EACCES);
-    if (c.faccessat(fs.root_fd, relativePath(node), mask, c.AT_EACCESS) != 0)
-        return replyErr(req, posixErrno(-1));
+    const access_rc = c.faccessat(fs.root_fd, relativePath(node), mask, c.AT_EACCESS);
+    if (access_rc != 0)
+        return replyErr(req, @intFromEnum(std.posix.errno(access_rc)));
     replyErr(req, 0);
 }
 
@@ -567,7 +566,7 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
     const proc_path = std.fmt.bufPrintZ(&proc_path_buf, "/proc/self/fd/{d}", .{node.fd}) catch
         return replyErr(req, c.EIO);
     const fd = c.open(proc_path.ptr, flags);
-    if (fd < 0) return replyErr(req, posixErrno(-1));
+    if (fd < 0) return replyErr(req, @intFromEnum(std.posix.errno(fd)));
 
     const handle = allocator.create(Handle) catch {
         _ = c.close(fd);
@@ -592,17 +591,15 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
     else
         -1;
     if (wants_write and mode.w == .overlay and overlay_fd < 0) {
-        const err = posixErrno(-1);
         allocator.destroy(handle);
         _ = c.close(fd);
-        return replyErr(req, err);
+        return replyErr(req, c.EIO);
     }
     if (wants_write and mode.w == .overlay and range_fd < 0) {
-        const err = posixErrno(-1);
         _ = c.close(overlay_fd);
         allocator.destroy(handle);
         _ = c.close(fd);
-        return replyErr(req, err);
+        return replyErr(req, c.EIO);
     }
     handle.* = .{
         .fd = fd,
@@ -676,7 +673,8 @@ fn readOverlay(req: c.fuse_req_t, handle: *Handle, size: usize, off: c.off_t) vo
     if (!refreshRangesLocked(handle)) return replyErr(req, c.EIO);
 
     var backing_stat: c.struct_stat = undefined;
-    if (c.fstat(handle.fd, &backing_stat) != 0) return replyErr(req, posixErrno(-1));
+    const stat_rc = c.fstat(handle.fd, &backing_stat);
+    if (stat_rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(stat_rc)));
     const overlay_fd = handle.overlay_fd.load(.acquire);
     var logical_size: u64 = @intCast(backing_stat.st_size);
     for (handle.ranges.items) |range|
@@ -696,7 +694,7 @@ fn readOverlay(req: c.fuse_req_t, handle: *Handle, size: usize, off: c.off_t) vo
     @memset(reply, 0);
 
     const backing_read = c.pread(handle.fd, reply.ptr, reply.len, off);
-    if (backing_read < 0) return replyErr(req, posixErrno(-1));
+    if (backing_read < 0) return replyErr(req, @intFromEnum(std.posix.errno(backing_read)));
 
     const request_end = offset + reply_len;
     for (handle.ranges.items) |range| {
@@ -709,7 +707,7 @@ fn readOverlay(req: c.fuse_req_t, handle: *Handle, size: usize, off: c.off_t) vo
         const destination = reply[@intCast(start - offset)..@intCast(end - offset)];
         const got = c.pread(overlay_fd, destination.ptr, destination.len, @intCast(start));
         if (got != @as(isize, @intCast(destination.len)))
-            return replyErr(req, if (got < 0) posixErrno(-1) else c.EIO);
+            return replyErr(req, if (got < 0) @intFromEnum(std.posix.errno(got)) else c.EIO);
     }
     _ = c.fuse_reply_buf(req, reply.ptr, reply.len);
 }
@@ -732,7 +730,7 @@ fn writeCb(
     if (mode.w == .overlay)
         return writeOverlay(req, fs, handle, buf, size, off);
     const written = c.pwrite(handle.fd, buf, size, off);
-    if (written < 0) return replyErr(req, posixErrno(-1));
+    if (written < 0) return replyErr(req, @intFromEnum(std.posix.errno(written)));
     _ = c.fuse_reply_write(req, @intCast(written));
 }
 
@@ -776,7 +774,7 @@ fn writeOverlay(
         return replyErr(req, c.ENOMEM);
 
     const written = c.pwrite(overlay_fd, buf, size, off);
-    if (written < 0) return replyErr(req, posixErrno(-1));
+    if (written < 0) return replyErr(req, @intFromEnum(std.posix.errno(written)));
     if (written != 0) {
         const record = overlay.Range{
             .offset = @intCast(off),
@@ -800,13 +798,17 @@ fn flushCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info) 
     const overlay_fd = handle.overlay_fd.load(.acquire);
     const target_fd = if (overlay_fd >= 0) overlay_fd else handle.fd;
     const duplicate = c.dup(target_fd);
-    if (duplicate < 0) return replyErr(req, posixErrno(-1));
-    if (c.close(duplicate) != 0) return replyErr(req, posixErrno(-1));
+    if (duplicate < 0) return replyErr(req, @intFromEnum(std.posix.errno(duplicate)));
+    const close_rc = c.close(duplicate);
+    if (close_rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(close_rc)));
     const range_fd = handle.range_fd.load(.acquire);
     if (range_fd >= 0) {
         const range_duplicate = c.dup(range_fd);
-        if (range_duplicate < 0) return replyErr(req, posixErrno(-1));
-        if (c.close(range_duplicate) != 0) return replyErr(req, posixErrno(-1));
+        if (range_duplicate < 0)
+            return replyErr(req, @intFromEnum(std.posix.errno(range_duplicate)));
+        const range_close_rc = c.close(range_duplicate);
+        if (range_close_rc != 0)
+            return replyErr(req, @intFromEnum(std.posix.errno(range_close_rc)));
     }
     replyErr(req, 0);
 }
@@ -818,11 +820,11 @@ fn fsyncCb(req: c.fuse_req_t, ino: c.fuse_ino_t, datasync: c_int, fi: ?*c.struct
     const overlay_fd = handle.overlay_fd.load(.acquire);
     const target_fd = if (overlay_fd >= 0) overlay_fd else handle.fd;
     const rc = if (datasync != 0) c.fdatasync(target_fd) else c.fsync(target_fd);
-    if (rc != 0) return replyErr(req, posixErrno(-1));
+    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
     const range_fd = handle.range_fd.load(.acquire);
     if (range_fd >= 0) {
         const range_rc = if (datasync != 0) c.fdatasync(range_fd) else c.fsync(range_fd);
-        if (range_rc != 0) return replyErr(req, posixErrno(-1));
+        if (range_rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(range_rc)));
     }
     replyErr(req, 0);
 }
@@ -834,23 +836,30 @@ fn releaseCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info
     const fs = fsFrom(req);
     const node = handle.inode;
 
-    if (c.close(handle.fd) != 0)
+    const backing_close_rc = c.close(handle.fd);
+    if (backing_close_rc != 0)
         log.warn(@src(), "failed to close backing handle for {s}: errno {d}", .{
             node.path,
-            posixErrno(-1),
+            @intFromEnum(std.posix.errno(backing_close_rc)),
         });
     const overlay_fd = handle.overlay_fd.load(.acquire);
-    if (overlay_fd >= 0 and c.close(overlay_fd) != 0)
-        log.warn(@src(), "failed to close overlay handle for {s}: errno {d}", .{
-            node.path,
-            posixErrno(-1),
-        });
+    if (overlay_fd >= 0) {
+        const close_rc = c.close(overlay_fd);
+        if (close_rc != 0)
+            log.warn(@src(), "failed to close overlay handle for {s}: errno {d}", .{
+                node.path,
+                @intFromEnum(std.posix.errno(close_rc)),
+            });
+    }
     const range_fd = handle.range_fd.load(.acquire);
-    if (range_fd >= 0 and c.close(range_fd) != 0)
-        log.warn(@src(), "failed to close overlay journal for {s}: errno {d}", .{
-            node.path,
-            posixErrno(-1),
-        });
+    if (range_fd >= 0) {
+        const close_rc = c.close(range_fd);
+        if (close_rc != 0)
+            log.warn(@src(), "failed to close overlay journal for {s}: errno {d}", .{
+                node.path,
+                @intFromEnum(std.posix.errno(close_rc)),
+            });
+    }
     handle.ranges.deinit(allocator);
     allocator.destroy(handle);
 
@@ -883,9 +892,12 @@ fn opendirCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_
     const proc_path = std.fmt.bufPrintZ(&proc_path_buf, "/proc/self/fd/{d}", .{node.fd}) catch
         return replyErr(req, c.EIO);
     const fd = c.open(proc_path.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
-    if (fd < 0) return replyErr(req, posixErrno(-1));
+    if (fd < 0) return replyErr(req, @intFromEnum(std.posix.errno(fd)));
     const stream = c.fdopendir(fd) orelse {
-        const err = posixErrno(-1);
+        // A null pointer carries no integer return code. std.posix.errno still
+        // provides the libc errno conversion when given the documented -1
+        // failure sentinel.
+        const err = @intFromEnum(std.posix.errno(@as(c_int, -1)));
         _ = c.close(fd);
         return replyErr(req, err);
     };
@@ -981,7 +993,8 @@ fn releasedirCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_i
 fn statfsCb(req: c.fuse_req_t, ino: c.fuse_ino_t) callconv(.c) void {
     _ = ino;
     var st: c.struct_statvfs = undefined;
-    if (c.fstatvfs(fsFrom(req).root_fd, &st) != 0) return replyErr(req, posixErrno(-1));
+    const rc = c.fstatvfs(fsFrom(req).root_fd, &st);
+    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
     _ = c.fuse_reply_statfs(req, &st);
 }
 
@@ -1018,7 +1031,8 @@ fn mknodCb(
     const kind = mode & c.S_IFMT;
     if (kind != 0 and kind != c.S_IFREG and kind != c.S_IFIFO)
         return replyErr(req, c.EPERM);
-    if (c.mknodat(parent.fd, name, mode, rdev) != 0) return replyErr(req, posixErrno(-1));
+    const rc = c.mknodat(parent.fd, name, mode, rdev);
+    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
     lookupCb(req, parent_ino, name);
 }
 
@@ -1027,7 +1041,8 @@ fn mkdirCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8, mode: c.
     const parent_node = inodeFrom(fs, parent);
     const policy_err = mutationPolicy(parent_node, name);
     if (policy_err != 0) return replyErr(req, policy_err);
-    if (c.mkdirat(parent_node.fd, name, mode) != 0) return replyErr(req, posixErrno(-1));
+    const rc = c.mkdirat(parent_node.fd, name, mode);
+    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
     lookupCb(req, parent, name);
 }
 fn unlinkCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
@@ -1035,7 +1050,8 @@ fn unlinkCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callcon
     const parent_node = inodeFrom(fs, parent);
     const policy_err = mutationPolicy(parent_node, name);
     if (policy_err != 0) return replyErr(req, policy_err);
-    if (c.unlinkat(parent_node.fd, name, 0) != 0) return replyErr(req, posixErrno(-1));
+    const rc = c.unlinkat(parent_node.fd, name, 0);
+    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
     replyErr(req, 0);
 }
 fn rmdirCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
@@ -1043,8 +1059,9 @@ fn rmdirCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callconv
     const parent_node = inodeFrom(fs, parent);
     const policy_err = mutationPolicy(parent_node, name);
     if (policy_err != 0) return replyErr(req, policy_err);
-    if (c.unlinkat(parent_node.fd, name, c.AT_REMOVEDIR) != 0)
-        return replyErr(req, posixErrno(-1));
+    const rc = c.unlinkat(parent_node.fd, name, c.AT_REMOVEDIR);
+    if (rc != 0)
+        return replyErr(req, @intFromEnum(std.posix.errno(rc)));
     replyErr(req, 0);
 }
 fn renameCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8, newparent: c.fuse_ino_t, newname: [*c]const u8, flags: c_uint) callconv(.c) void {
