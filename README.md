@@ -35,6 +35,29 @@ const dep = b.dependency("permbox_fuse", .{
 exe.root_module.addImport("permfuse", dep.module("permfuse"));
 ```
 
+The exported `permtrie` module can round-trip its mmap-backed binary policy to
+the permbox filesystem configuration syntax:
+
+```zig
+const text = try trie.toText(allocator);
+defer allocator.free(text);
+
+try trie.replaceFromText(allocator,
+    \\fs {
+    \\  "/": access,overlay-w,ALWAYS-allow-rx {
+    \\    "home/me": empty,allow-rw,deny-x
+    \\  }
+    \\}
+);
+```
+
+`toText` emits a canonical, bytewise-sorted `fs {}` block. It may flatten the
+input hierarchy, but preserves every explicit path and all current trie mode
+bits.
+
+See [docs/API.md](docs/API.md) for the complete public API reference for both
+`permtrie` and `permfuse`.
+
 Initialize the driver in-place and do not move it while `mount` is running,
 because libfuse retains a pointer to its callback state. Configuration paths
 are copied during initialization:
