@@ -399,48 +399,12 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
     return old_data;
 }
 
-pub fn get(self: *@This(), _path: []const u8) !?Mode {
-    var path = _path;
-    if (path.len == 0) return null;
-    if (self.pool.block().root == 0) {
-        @branchHint(.cold);
-        return null;
-    }
-
-    var node = try self.fromIdx(@intCast(self.pool.block().root));
-
-    while (true) switch (node.next(path)) {
-        .exact => {
-            if (@as(u8, @bitCast(node.data)) == 0) return null;
-            return node.data;
-        },
-        .this => |idx| {
-            if (node.bitset.isSet(idx)) {
-                const sub = try node.indexAt(idx).getNode(self);
-                if (sub.radix_len > 0) return null;
-                if (@as(u8, @bitCast(sub.data)) == 0) return null;
-                return sub.data;
-            } else {
-                const val = node.indexAt(idx).get();
-                if (val == 0) return null;
-                return inlineToMode(val);
-            }
-        },
-        .next => |idx| {
-            if (!node.bitset.isSet(idx)) return null;
-            path = path[node.radix_len + 1 ..];
-            node = try node.indexAt(idx).getNode(self);
-        },
-        .diff => return null,
-    };
-}
-
 /// Returns the exact rule or the nearest slash-delimited ancestor rule.
-pub fn getLongestPrefix(self: *@This(), path: []const u8) !?Mode {
-    if (path.len == 0 or path[0] != '/') return null;
+pub fn get(self: *@This(), path: []const u8) !?Mode {
+    std.debug.assert(path.len != 0 and path[0] == '/');
     var prefix = path;
     while (true) {
-        if (try self.get(prefix)) |mode| return mode;
+        if (try self.getExact(prefix)) |mode| return mode;
         if (prefix.len == 1) return null;
         const slash = std.mem.lastIndexOfScalar(u8, prefix, '/') orelse return null;
         prefix = if (slash == 0) "/" else prefix[0..slash];
@@ -657,6 +621,42 @@ fn ensurePoolInitialized() !@This() {
     return try init(fd);
 }
 
+fn getExact(self: *@This(), _path: []const u8) !?Mode {
+    var path = _path;
+    if (path.len == 0) return null;
+    if (self.pool.block().root == 0) {
+        @branchHint(.cold);
+        return null;
+    }
+
+    var node = try self.fromIdx(@intCast(self.pool.block().root));
+
+    while (true) switch (node.next(path)) {
+        .exact => {
+            if (@as(u8, @bitCast(node.data)) == 0) return null;
+            return node.data;
+        },
+        .this => |idx| {
+            if (node.bitset.isSet(idx)) {
+                const sub = try node.indexAt(idx).getNode(self);
+                if (sub.radix_len > 0) return null;
+                if (@as(u8, @bitCast(sub.data)) == 0) return null;
+                return sub.data;
+            } else {
+                const val = node.indexAt(idx).get();
+                if (val == 0) return null;
+                return inlineToMode(val);
+            }
+        },
+        .next => |idx| {
+            if (!node.bitset.isSet(idx)) return null;
+            path = path[node.radix_len + 1 ..];
+            node = try node.indexAt(idx).getNode(self);
+        },
+        .diff => return null,
+    };
+}
+
 fn dumpNode(self: *@This(), idx: u24, visited: *std.AutoHashMap(u24, void), depth: usize) !void {
     if (idx == 0) return;
 
@@ -757,7 +757,7 @@ test "trie exhaustive subsets (add, get, overwrite, del)" {
 
         // 3. Verify gets
         for (0..14) |i| {
-            const res = try trie.get(paths[i]);
+            const res = try trie.getExact(paths[i]);
             if ((set_mask & (@as(usize, 1) << @intCast(i))) != 0) {
                 try testing.expect(res != null);
                 try expectModeEqual(Mode.file, res.?);
@@ -776,7 +776,7 @@ test "trie exhaustive subsets (add, get, overwrite, del)" {
 
         // 5. Verify all are null after deletion
         for (0..14) |i| {
-            const res = try trie.get(paths[i]);
+            const res = try trie.getExact(paths[i]);
             try testing.expectEqual(@as(?Mode, null), res);
         }
     }
@@ -835,7 +835,7 @@ test "trie randomized fuzz test" {
         // Verify all paths against the reference map
         for (paths) |p| {
             const r = ref.get(p);
-            const t = try trie.get(p);
+            const t = try trie.getExact(p);
             if (r) |rv| {
                 try testing.expect(t != null);
                 try expectModeEqual(rv, t.?);
@@ -884,27 +884,27 @@ test "trie deep path string limit and partial shift" {
     try trie.add(p2, Mode.dir);
     try trie.add(p3, Mode.dir);
 
-    try expectModeEqual(Mode.dir, (try trie.get(p1)).?);
-    try expectModeEqual(Mode.dir, (try trie.get(p2)).?);
-    try expectModeEqual(Mode.dir, (try trie.get(p3)).?);
+    try expectModeEqual(Mode.dir, (try trie.getExact(p1)).?);
+    try expectModeEqual(Mode.dir, (try trie.getExact(p2)).?);
+    try expectModeEqual(Mode.dir, (try trie.getExact(p3)).?);
 
     // Delete p2. This will trigger the partial shift logic
     // because top_len (200) + 1 + left_len (30) = 231 > 222
     _ = try trie.del(p2);
 
-    try testing.expectEqual(@as(?Mode, null), try trie.get(p2));
-    try expectModeEqual(Mode.dir, (try trie.get(p1)).?);
-    try expectModeEqual(Mode.dir, (try trie.get(p3)).?);
+    try testing.expectEqual(@as(?Mode, null), try trie.getExact(p2));
+    try expectModeEqual(Mode.dir, (try trie.getExact(p1)).?);
+    try expectModeEqual(Mode.dir, (try trie.getExact(p3)).?);
 
     // Delete p1. This triggers the partial shift logic again
     _ = try trie.del(p1);
 
-    try testing.expectEqual(@as(?Mode, null), try trie.get(p1));
-    try expectModeEqual(Mode.dir, (try trie.get(p3)).?);
+    try testing.expectEqual(@as(?Mode, null), try trie.getExact(p1));
+    try expectModeEqual(Mode.dir, (try trie.getExact(p3)).?);
 
     // Delete p3
     _ = try trie.del(p3);
-    try testing.expectEqual(@as(?Mode, null), try trie.get(p3));
+    try testing.expectEqual(@as(?Mode, null), try trie.getExact(p3));
 }
 
 test "trie delete non-existent and empty" {
@@ -949,7 +949,7 @@ test "trie procedural forward and backward insertion/deletion" {
 
     // Verify all were inserted
     for (paths) |p| {
-        const res = try trie.get(p);
+        const res = try trie.getExact(p);
         try testing.expect(res != null);
         try expectModeEqual(Mode.dir, res.?);
     }
@@ -966,7 +966,7 @@ test "trie procedural forward and backward insertion/deletion" {
 
     // Verify deleted are gone, and others remain
     for (0..paths.len) |i| {
-        const res = try trie.get(paths[i]);
+        const res = try trie.getExact(paths[i]);
         if (i % 3 == 0) {
             try testing.expectEqual(@as(?Mode, null), res);
         } else {
@@ -985,7 +985,7 @@ test "trie procedural forward and backward insertion/deletion" {
     }
 
     for (0..paths.len) |i| {
-        const res = try trie.get(paths[i]);
+        const res = try trie.getExact(paths[i]);
         if (i % 3 == 0) {
             try testing.expect(res != null);
             try expectModeEqual(Mode.file, res.?);
@@ -1003,7 +1003,7 @@ test "trie procedural forward and backward insertion/deletion" {
     }
 
     for (paths) |p| {
-        try testing.expectEqual(@as(?Mode, null), try trie.get(p));
+        try testing.expectEqual(@as(?Mode, null), try trie.getExact(p));
     }
 
     // ==========================================
@@ -1019,7 +1019,7 @@ test "trie procedural forward and backward insertion/deletion" {
     i = paths.len;
     while (i > 0) {
         i -= 1;
-        const res = try trie.get(paths[i]);
+        const res = try trie.getExact(paths[i]);
         try testing.expect(res != null);
         try expectModeEqual(Mode.dir, res.?);
     }
@@ -1033,11 +1033,11 @@ test "trie procedural forward and backward insertion/deletion" {
         _ = try trie.del(paths[i]);
 
         // Ensure the deleted one is gone
-        try testing.expectEqual(@as(?Mode, null), try trie.get(paths[i]));
+        try testing.expectEqual(@as(?Mode, null), try trie.getExact(paths[i]));
 
         // Ensure all previous items in the array still exist
         for (0..i) |j| {
-            const res = try trie.get(paths[j]);
+            const res = try trie.getExact(paths[j]);
             try testing.expect(res != null);
             try expectModeEqual(Mode.dir, res.?);
         }
@@ -1071,7 +1071,7 @@ test "trie deep path chains (length 4)" {
 
     // Verify all exist
     for (paths) |p| {
-        const res = try trie.get(p);
+        const res = try trie.getExact(p);
         try testing.expect(res != null);
         try expectModeEqual(Mode.dir, res.?);
     }
@@ -1079,7 +1079,7 @@ test "trie deep path chains (length 4)" {
     // Delete in forward order (shortest to longest)
     for (paths) |p| {
         _ = try trie.del(p);
-        const res = try trie.get(p);
+        const res = try trie.getExact(p);
         try testing.expectEqual(@as(?Mode, null), res);
     }
 
@@ -1092,12 +1092,12 @@ test "trie deep path chains (length 4)" {
     while (i > 0) {
         i -= 1;
         _ = try trie.del(paths[i]);
-        const res = try trie.get(paths[i]);
+        const res = try trie.getExact(paths[i]);
         try testing.expectEqual(@as(?Mode, null), res);
 
         // Ensure earlier items still exist
         for (0..i) |j| {
-            const r = try trie.get(paths[j]);
+            const r = try trie.getExact(paths[j]);
             try testing.expect(r != null);
             try expectModeEqual(Mode.file, r.?);
         }
@@ -1121,13 +1121,13 @@ test "trie edge cases and merges" {
 
     // Delete from the middle
     _ = try trie.del(p3);
-    try testing.expectEqual(@as(?Mode, null), try trie.get(p3));
-    try testing.expect(try trie.get(p4) != null);
-    try testing.expect(try trie.get(p5) != null);
+    try testing.expectEqual(@as(?Mode, null), try trie.getExact(p3));
+    try testing.expect(try trie.getExact(p4) != null);
+    try testing.expect(try trie.getExact(p5) != null);
 
     // Re-add it
     try trie.add(p3, Mode.file);
-    try testing.expect(try trie.get(p3) != null);
+    try testing.expect(try trie.getExact(p3) != null);
 
     // Delete all
     _ = try trie.del(p1);
@@ -1136,11 +1136,11 @@ test "trie edge cases and merges" {
     _ = try trie.del(p4);
     _ = try trie.del(p5);
 
-    try testing.expectEqual(@as(?Mode, null), try trie.get(p1));
-    try testing.expectEqual(@as(?Mode, null), try trie.get(p2));
-    try testing.expectEqual(@as(?Mode, null), try trie.get(p3));
-    try testing.expectEqual(@as(?Mode, null), try trie.get(p4));
-    try testing.expectEqual(@as(?Mode, null), try trie.get(p5));
+    try testing.expectEqual(@as(?Mode, null), try trie.getExact(p1));
+    try testing.expectEqual(@as(?Mode, null), try trie.getExact(p2));
+    try testing.expectEqual(@as(?Mode, null), try trie.getExact(p3));
+    try testing.expectEqual(@as(?Mode, null), try trie.getExact(p4));
+    try testing.expectEqual(@as(?Mode, null), try trie.getExact(p5));
 }
 
 // --- Permutation Helper ---
@@ -1223,7 +1223,7 @@ test "1. exhaustive insertion permutations" {
         for (paths) |p| _ = trie.del(p) catch {};
 
         for (perm) |i| try trie.add(paths[i], Mode.dir);
-        for (paths) |p| try testing.expect(try trie.get(p) != null);
+        for (paths) |p| try testing.expect(try trie.getExact(p) != null);
 
         var j: usize = perm.len;
         while (j > 0) {
@@ -1231,7 +1231,7 @@ test "1. exhaustive insertion permutations" {
             _ = try trie.del(paths[perm[j]]);
         }
 
-        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try trie.get(p));
+        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try trie.getExact(p));
 
         try checkStructuralInvariants(&trie);
         try checkAllocationInvariant(&trie);
@@ -1257,7 +1257,7 @@ test "2. exhaustive delete permutations" {
             _ = try trie.del(paths[i]);
         }
 
-        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try trie.get(p));
+        for (paths) |p| try testing.expectEqual(@as(?Mode, null), try trie.getExact(p));
         try checkStructuralInvariants(&trie);
         try checkAllocationInvariant(&trie);
     }
@@ -1281,8 +1281,8 @@ test "3. exhaust every split point" {
         try trie.add(p1, Mode.dir);
         try trie.add(p2, Mode.file);
 
-        try expectModeEqual(Mode.dir, (try trie.get(p1)).?);
-        try expectModeEqual(Mode.file, (try trie.get(p2)).?);
+        try expectModeEqual(Mode.dir, (try trie.getExact(p1)).?);
+        try expectModeEqual(Mode.file, (try trie.getExact(p2)).?);
 
         _ = try trie.del(p1);
         _ = try trie.del(p2);
@@ -1362,8 +1362,8 @@ test "6. every possible common prefix" {
         try trie.add(p1, Mode.dir);
         try trie.add(p2, Mode.file);
 
-        try expectModeEqual(Mode.dir, (try trie.get(p1)).?);
-        try expectModeEqual(Mode.file, (try trie.get(p2)).?);
+        try expectModeEqual(Mode.dir, (try trie.getExact(p1)).?);
+        try expectModeEqual(Mode.file, (try trie.getExact(p2)).?);
 
         _ = try trie.del(p1);
         _ = try trie.del(p2);
@@ -1474,7 +1474,7 @@ test "11. prefix/non-prefix combinations" {
             // Re-insert if missing
             for (0..paths.len) |i| {
                 if ((subset_mask & (@as(usize, 1) << @intCast(i))) != 0) {
-                    if (try trie.get(paths[i]) == null) {
+                    if (try trie.getExact(paths[i]) == null) {
                         try trie.add(paths[i], Mode.dir);
                     }
                 }
@@ -1530,7 +1530,7 @@ test "12. random long paths" {
             try checkStructuralInvariants(&trie);
             var verify = ref.iterator();
             while (verify.next()) |entry| {
-                const actual = try trie.get(entry.key_ptr.*);
+                const actual = try trie.getExact(entry.key_ptr.*);
                 try testing.expect(actual != null);
                 try expectModeEqual(entry.value_ptr.*, actual.?);
             }
@@ -1564,5 +1564,43 @@ test "13. repeated overwrite" {
     // No new nodes should have been allocated
     try testing.expectEqual(start_free_from, blk.free_from);
     _ = try trie.del("path");
+}
+
+test "trie get returns nearest slash-delimited ancestor" {
+    var t = try ensurePoolInitialized();
+
+    // Empty trie
+    try testing.expectEqual(@as(?Mode, null), try t.get("/nonexistent"));
+
+    // Add rules at different depths
+    try t.add("/a", Mode.dir);
+    try t.add("/a/b", Mode.file);
+    try t.add("/a/b/c", Mode.dir);
+    try t.add("/x", Mode.file);
+
+    // Exact match returns the rule itself
+    try expectModeEqual(Mode.dir, (try t.get("/a")).?);
+    try expectModeEqual(Mode.file, (try t.get("/a/b")).?);
+    try expectModeEqual(Mode.dir, (try t.get("/a/b/c")).?);
+
+    // Prefix fallback: /a/b/c/d -> /a/b/c (exact)
+    try expectModeEqual(Mode.dir, (try t.get("/a/b/c/d")).?);
+    // /a/b/x -> /a/b
+    try expectModeEqual(Mode.file, (try t.get("/a/b/x")).?);
+    // /a/x -> /a
+    try expectModeEqual(Mode.dir, (try t.get("/a/x")).?);
+    // /x/y -> /x
+    try expectModeEqual(Mode.file, (try t.get("/x/y")).?);
+
+    // /a/b/c/d/e falls back to /a/b/c which is dir
+    try expectModeEqual(Mode.dir, (try t.get("/a/b/c/d/e")).?);
+
+    // No ancestor -> null
+    try testing.expectEqual(@as(?Mode, null), try t.get("/other"));
+
+    // Root-only rule
+    try t.add("/", Mode.dir);
+    try expectModeEqual(Mode.dir, (try t.get("/anything")).?);
+    try expectModeEqual(Mode.dir, (try t.get("/")).?);
 }
 
