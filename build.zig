@@ -15,15 +15,17 @@ pub fn build(b: *std.Build) void {
     else
         target;
     const optimize = b.standardOptimizeOption(.{});
-    const logging_options = b.addOptions();
-    logging_options.addOption([]const u8, "module_name", "permtrie");
+    const trie_logging_options = b.addOptions();
+    trie_logging_options.addOption([]const u8, "module_name", "permbox.trie");
+    const fuse_logging_options = b.addOptions();
+    fuse_logging_options.addOption([]const u8, "module_name", "permbox.fuse");
 
     const trie_module = b.addModule("permtrie", .{
         .root_source_file = b.path("src/trie/trie.zig"),
         .target = compile_target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "logging_options", .module = logging_options.createModule() },
+            .{ .name = "logging_options", .module = trie_logging_options.createModule() },
         },
     });
 
@@ -33,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "permtrie", .module = trie_module },
+            .{ .name = "logging_options", .module = fuse_logging_options.createModule() },
         },
     });
     permbox_module.link_libc = true;
@@ -108,6 +111,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "permtrie", .module = trie_module },
+                .{ .name = "logging_options", .module = fuse_logging_options.createModule() },
             },
         }),
         .test_runner = test_runner,
@@ -124,6 +128,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fuse/overlay.zig"),
             .target = compile_target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "logging_options", .module = fuse_logging_options.createModule() },
+            },
         }),
         .test_runner = test_runner,
     });
