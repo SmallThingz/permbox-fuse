@@ -621,7 +621,9 @@ fn ensurePoolInitialized() !@This() {
     return try init(fd);
 }
 
-fn getExact(self: *@This(), _path: []const u8) !?Mode {
+/// Exact-match lookup, no ancestor fallback. Exposed for policy code that
+/// needs to distinguish "no explicit rule" from "inherited ancestor rule".
+pub fn getExact(self: *@This(), _path: []const u8) !?Mode {
     var path = _path;
     if (path.len == 0) return null;
     if (self.pool.block().root == 0) {

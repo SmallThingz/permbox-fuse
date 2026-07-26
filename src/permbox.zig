@@ -65,11 +65,11 @@ pub const Driver = struct {
             @as(c.mode_t, 0o600),
         );
         if (policy_fd < 0) return error.OpenPolicyFailed;
-        permtrie.initIo(io, policy_fd) catch |err| {
+        policy.init(policy_fd) catch |err| {
             _ = c.close(policy_fd);
             return err;
         };
-        errdefer permtrie.deinit();
+        errdefer policy.deinit();
 
         self.io = io;
         self.backing_path = config.backing_path;
@@ -102,7 +102,7 @@ pub const Driver = struct {
         std.debug.assert(self.mounted_session.load(.acquire) == 0);
         self.fs.deinit();
         if (self.overlay_session) |*session| session.deinit();
-        permtrie.deinit();
+        policy.deinit();
         driver_active.store(false, .release);
         self.* = undefined;
     }

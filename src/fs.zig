@@ -1095,10 +1095,9 @@ test "overlay names are stable and path-sensitive" {
 }
 
 test "ask approval updates explicit policy and handle snapshot" {
-    const permtrie = @import("permtrie");
     const trie_fd = try std.posix.memfd_create("fs-ask-test", 0);
-    try permtrie.init(trie_fd);
-    defer permtrie.deinit();
+    try policy.init(trie_fd);
+    defer policy.deinit();
 
     const ask_mode = Mode{
         .k = .visible_raw,

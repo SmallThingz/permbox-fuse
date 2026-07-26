@@ -16,6 +16,17 @@ pub const K = Mode.K;
 pub const A = Mode.A;
 pub const W = Mode.W;
 
+/// Global policy trie instance. Initialised via init().
+var trie: permtrie = undefined;
+
+pub fn init(fd: std.c.fd_t) !void {
+    trie = try permtrie.init(fd);
+}
+
+pub fn deinit() void {
+    trie.deinit();
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Evaluate policy for a normalized absolute path via longest-prefix component
@@ -26,23 +37,24 @@ pub const W = Mode.W;
 /// The path is expected to be a normalised absolute FUSE path (e.g. `/a/b/c`).
 /// Must not be empty.
 pub fn evaluate(path: []const u8) !?Mode {
-    return permtrie.getLongestPrefix(path);
+    if (path.len == 0) return null;
+    return trie.get(path);
 }
 
 /// Stores an explicit rule. Callers coordinating open-handle snapshots must
 /// hold their policy write lock around this operation.
 pub fn set(path: []const u8, mode: Mode) !void {
-    try permtrie.add(path, mode);
+    try trie.add(path, mode);
 }
 
 /// Removes an explicit rule and returns it.
 pub fn remove(path: []const u8) !Mode {
-    return permtrie.del(path);
+    return trie.del(path);
 }
 
 /// Returns only an explicit rule, without ancestor inheritance.
 pub fn get(path: []const u8) !?Mode {
-    return permtrie.get(path);
+    return trie.getExact(path);
 }
 
 /// Path is visible in the namespace (raw or virtual).
@@ -104,10 +116,10 @@ var g_pool_prepared = false;
 fn preparePool() !void {
     if (!g_pool_prepared) {
         const fd = try std.posix.memfd_create("policy-test", 0);
-        try permtrie.init(fd);
+        trie = try permtrie.init(fd);
         g_pool_prepared = true;
     } else {
-        permtrie.reset();
+        trie.reset();
     }
 }
 
@@ -115,7 +127,7 @@ fn preparePool() !void {
 
 test "evaluate: exact match returns the stored Mode" {
     try preparePool();
-    try permtrie.add("/foo", Mode.dir);
+    try trie.add("/foo", Mode.dir);
     const result = try evaluate("/foo");
     try testing.expect(result != null);
     try expectModeEqual(Mode.dir, result.?);
@@ -133,7 +145,7 @@ test "evaluate: empty path returns null" {
 
 test "evaluate: root rule is found" {
     try preparePool();
-    try permtrie.add("/", Mode.dir);
+    try trie.add("/", Mode.dir);
     const result = try evaluate("/");
     try testing.expect(result != null);
     try expectModeEqual(Mode.dir, result.?);
@@ -141,7 +153,7 @@ test "evaluate: root rule is found" {
 
 test "evaluate: root rule inherited by descendants" {
     try preparePool();
-    try permtrie.add("/", Mode.dir);
+    try trie.add("/", Mode.dir);
     try expectModeEqual(Mode.dir, (try evaluate("/foo")).?);
     try expectModeEqual(Mode.dir, (try evaluate("/foo/bar")).?);
     try expectModeEqual(Mode.dir, (try evaluate("/foo/bar/baz")).?);
@@ -149,25 +161,25 @@ test "evaluate: root rule inherited by descendants" {
 
 test "evaluate: child rule overrides parent" {
     try preparePool();
-    try permtrie.add("/", Mode.dir);
-    try permtrie.add("/foo", Mode.file); // read=deny
+    try trie.add("/", Mode.dir);
+    try trie.add("/foo", Mode.file); // read=deny
     try expectModeEqual(Mode.file, (try evaluate("/foo")).?);
     try expectModeEqual(Mode.dir, (try evaluate("/bar")).?); // still inherits root
 }
 
 test "evaluate: child rule inherited by deeper paths" {
     try preparePool();
-    try permtrie.add("/", Mode.dir);
-    try permtrie.add("/foo", Mode.file);
+    try trie.add("/", Mode.dir);
+    try trie.add("/foo", Mode.file);
     try expectModeEqual(Mode.file, (try evaluate("/foo/bar")).?);
     try expectModeEqual(Mode.file, (try evaluate("/foo/bar/baz")).?);
 }
 
 test "evaluate: longest prefix wins" {
     try preparePool();
-    try permtrie.add("/", Mode.dir);
-    try permtrie.add("/a", Mode.file);
-    try permtrie.add("/a/b", Mode.dir);
+    try trie.add("/", Mode.dir);
+    try trie.add("/a", Mode.file);
+    try trie.add("/a/b", Mode.dir);
     try expectModeEqual(Mode.dir, (try evaluate("/")).?);
     try expectModeEqual(Mode.file, (try evaluate("/a")).?);
     try expectModeEqual(Mode.dir, (try evaluate("/a/b")).?);
@@ -177,8 +189,8 @@ test "evaluate: longest prefix wins" {
 
 test "evaluate: mid-level path without own rule inherits from nearest ancestor" {
     try preparePool();
-    try permtrie.add("/home", Mode.dir);
-    try permtrie.add("/home/user/docs", Mode.file);
+    try trie.add("/home", Mode.dir);
+    try trie.add("/home/user/docs", Mode.file);
     // /home/user has no rule, /home/user/docs has one → /home/user/docs
     try expectModeEqual(Mode.file, (try evaluate("/home/user/docs")).?);
     // /home/user inherits from /home
@@ -190,8 +202,8 @@ test "evaluate: mid-level path without own rule inherits from nearest ancestor" 
 test "evaluate: midway nodes are transparent" {
     try preparePool();
     // Insert a path that creates midway internal nodes (via split).
-    try permtrie.add("/abc", Mode.dir);
-    try permtrie.add("/abd", Mode.file);
+    try trie.add("/abc", Mode.dir);
+    try trie.add("/abd", Mode.file);
     // "/a" does not exist as a rule — midway nodes (data=0) should be skipped.
     try testing.expectEqual(@as(?Mode, null), try evaluate("/a"));
     // But "/abc" and "/abd" resolve correctly.
@@ -201,8 +213,8 @@ test "evaluate: midway nodes are transparent" {
 
 test "evaluate: triple-component path with mixed rules" {
     try preparePool();
-    try permtrie.add("/a/b/c", Mode.dir);
-    try permtrie.add("/a", Mode.file);
+    try trie.add("/a/b/c", Mode.dir);
+    try trie.add("/a", Mode.file);
     try expectModeEqual(Mode.file, (try evaluate("/a")).?);
     try expectModeEqual(Mode.file, (try evaluate("/a/x")).?);
     try expectModeEqual(Mode.dir, (try evaluate("/a/b/c")).?);
@@ -219,25 +231,25 @@ test "isAccessible: hidden when no rule" {
 test "isAccessible: visible_raw is accessible" {
     try preparePool();
     // Mode.dir has k=visible_raw
-    try permtrie.add("/vis", Mode.dir);
+    try trie.add("/vis", Mode.dir);
     try testing.expect(try isAccessible("/vis"));
 }
 
 test "isAccessible: visible_virtual is accessible" {
     try preparePool();
-    try permtrie.add("/virt", Mode{ .k = .visible_virtual, .r = .allow, .w = .overlay, .x = .allow });
+    try trie.add("/virt", Mode{ .k = .visible_virtual, .r = .allow, .w = .overlay, .x = .allow });
     try testing.expect(try isAccessible("/virt"));
 }
 
 test "isAccessible: invisible is not accessible" {
     try preparePool();
-    try permtrie.add("/hid", Mode{ .k = .invisible, .r = .deny, .w = .deny, .x = .deny });
+    try trie.add("/hid", Mode{ .k = .invisible, .r = .deny, .w = .deny, .x = .deny });
     try testing.expectEqual(false, try isAccessible("/hid"));
 }
 
 test "isAccessible: child of invisible is also inaccessible" {
     try preparePool();
-    try permtrie.add("/hid", Mode{ .k = .invisible, .r = .deny, .w = .deny, .x = .deny });
+    try trie.add("/hid", Mode{ .k = .invisible, .r = .deny, .w = .deny, .x = .deny });
     try testing.expectEqual(false, try isAccessible("/hid/child"));
 }
 
@@ -245,19 +257,19 @@ test "isAccessible: child of invisible is also inaccessible" {
 
 test "canRead: deny returns false" {
     try preparePool();
-    try permtrie.add("/f", Mode.file); // file has r=deny
+    try trie.add("/f", Mode.file); // file has r=deny
     try testing.expectEqual(false, try canRead("/f"));
 }
 
 test "canRead: allow returns true" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .overlay, .x = .allow });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .overlay, .x = .allow });
     try testing.expect(try canRead("/f"));
 }
 
 test "canRead: ask returns false" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .ask, .w = .overlay, .x = .allow });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .ask, .w = .overlay, .x = .allow });
     try testing.expectEqual(false, try canRead("/f"));
 }
 
@@ -270,25 +282,25 @@ test "canRead: no rule returns false" {
 
 test "canWrite: deny returns false" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .deny, .w = .deny, .x = .allow });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .deny, .w = .deny, .x = .allow });
     try testing.expectEqual(false, try canWrite("/f"));
 }
 
 test "canWrite: allow (always-allow-w) returns true" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
     try testing.expect(try canWrite("/f"));
 }
 
 test "canWrite: overlay returns true" {
     try preparePool();
-    try permtrie.add("/f", Mode.dir); // dir has w=overlay
+    try trie.add("/f", Mode.dir); // dir has w=overlay
     try testing.expect(try canWrite("/f"));
 }
 
 test "canWrite: ask returns false" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .ask, .x = .allow });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .ask, .x = .allow });
     try testing.expectEqual(false, try canWrite("/f"));
 }
 
@@ -302,19 +314,19 @@ test "canWrite: no rule returns false" {
 test "canExecute: deny returns false" {
     try preparePool();
     // file has x=allow by default, so use explicit deny
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .deny, .w = .overlay, .x = .deny });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .deny, .w = .overlay, .x = .deny });
     try testing.expectEqual(false, try canExecute("/f"));
 }
 
 test "canExecute: allow returns true" {
     try preparePool();
-    try permtrie.add("/f", Mode.dir); // dir has x=allow
+    try trie.add("/f", Mode.dir); // dir has x=allow
     try testing.expect(try canExecute("/f"));
 }
 
 test "canExecute: ask returns false" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .overlay, .x = .ask });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .overlay, .x = .ask });
     try testing.expectEqual(false, try canExecute("/f"));
 }
 
@@ -332,7 +344,7 @@ test "showMetadata: hidden path → false" {
 
 test "showMetadata: visible path → true" {
     try preparePool();
-    try permtrie.add("/vis", Mode.dir);
+    try trie.add("/vis", Mode.dir);
     try testing.expect(try showMetadata("/vis"));
 }
 
@@ -340,37 +352,37 @@ test "showMetadata: visible path → true" {
 
 test "canPassthrough: all conditions met → true" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
     try testing.expect(try canPassthrough("/f"));
 }
 
 test "canPassthrough: overlay write → false" {
     try preparePool();
-    try permtrie.add("/f", Mode.dir); // w=overlay
+    try trie.add("/f", Mode.dir); // w=overlay
     try testing.expectEqual(false, try canPassthrough("/f"));
 }
 
 test "canPassthrough: invisible → false" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .invisible, .r = .allow, .w = .allow, .x = .allow });
+    try trie.add("/f", Mode{ .k = .invisible, .r = .allow, .w = .allow, .x = .allow });
     try testing.expectEqual(false, try canPassthrough("/f"));
 }
 
 test "canPassthrough: read ask → false" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .ask, .w = .allow, .x = .allow });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .ask, .w = .allow, .x = .allow });
     try testing.expectEqual(false, try canPassthrough("/f"));
 }
 
 test "canPassthrough: write ask → false" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .ask, .x = .allow });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .ask, .x = .allow });
     try testing.expectEqual(false, try canPassthrough("/f"));
 }
 
 test "canPassthrough: execute ask → false" {
     try preparePool();
-    try permtrie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .ask });
+    try trie.add("/f", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .ask });
     try testing.expectEqual(false, try canPassthrough("/f"));
 }
 
@@ -381,15 +393,15 @@ test "canPassthrough: no rule → false" {
 
 test "canPassthrough: child inheriting passthrough root → true" {
     try preparePool();
-    try permtrie.add("/", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
+    try trie.add("/", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
     try testing.expect(try canPassthrough("/child"));
     try testing.expect(try canPassthrough("/child/grandchild"));
 }
 
 test "canPassthrough: child overrides passthrough with non-passthrough → false" {
     try preparePool();
-    try permtrie.add("/", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
-    try permtrie.add("/child", Mode.dir); // overlay write
+    try trie.add("/", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
+    try trie.add("/child", Mode.dir); // overlay write
     try testing.expectEqual(false, try canPassthrough("/child"));
     // But sibling still inherits passthrough from root
     try testing.expect(try canPassthrough("/sibling"));
@@ -411,10 +423,10 @@ test "evaluate: exhaustive prefix walks" {
     const ab_mode = Mode.dir;
     const abc_mode = Mode.file;
 
-    try permtrie.add("/", root);
-    try permtrie.add("/a", a_mode);
-    try permtrie.add("/a/b", ab_mode);
-    try permtrie.add("/a/b/c", abc_mode);
+    try trie.add("/", root);
+    try trie.add("/a", a_mode);
+    try trie.add("/a/b", ab_mode);
+    try trie.add("/a/b/c", abc_mode);
 
     // Walk exhaustive prefixes
     try expectModeEqual(root, (try evaluate("/")).?);
@@ -435,8 +447,8 @@ test "evaluate: deep path walks without allocation" {
     try preparePool();
 
     // Build a chain: /a/b/c/d/e/f/g/h/i/j/k/l/m
-    try permtrie.add("/", Mode.dir);
-    try permtrie.add("/a/b/c/d/e/f/g/h/i/j/k/l/m", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
+    try trie.add("/", Mode.dir);
+    try trie.add("/a/b/c/d/e/f/g/h/i/j/k/l/m", Mode{ .k = .visible_raw, .r = .allow, .w = .allow, .x = .allow });
 
     // The longest-prefix should find the deep rule.
     const result = try evaluate("/a/b/c/d/e/f/g/h/i/j/k/l/m");
@@ -454,9 +466,9 @@ test "evaluate: deep path walks without allocation" {
 
 test "evaluate: single component paths" {
     try preparePool();
-    try permtrie.add("/usr", Mode.dir);
-    try permtrie.add("/usr/bin", Mode.file);
-    try permtrie.add("/usr/bin/ls", Mode.dir);
+    try trie.add("/usr", Mode.dir);
+    try trie.add("/usr/bin", Mode.file);
+    try trie.add("/usr/bin/ls", Mode.dir);
 
     try expectModeEqual(Mode.dir, (try evaluate("/usr")).?);
     try expectModeEqual(Mode.file, (try evaluate("/usr/bin")).?);
@@ -467,7 +479,7 @@ test "evaluate: single component paths" {
 
 test "evaluate: only root rule set" {
     try preparePool();
-    try permtrie.add("/", Mode.dir);
+    try trie.add("/", Mode.dir);
     // All paths should inherit root
     try expectModeEqual(Mode.dir, (try evaluate("/anything")).?);
     try expectModeEqual(Mode.dir, (try evaluate("/very/deep/path")).?);
