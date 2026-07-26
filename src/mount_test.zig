@@ -1,6 +1,5 @@
 const std = @import("std");
-const permbox = @import("permbox");
-const options = @import("options.zig");
+const permfuse = @import("permfuse");
 
 pub fn getLogger(comptime module_name: []const u8) type {
     return struct {
@@ -20,23 +19,23 @@ pub fn main(init: std.process.Init) !u8 {
     defer init.gpa.free(parsed_args);
     for (raw_args, parsed_args) |arg, *parsed| parsed.* = std.mem.span(arg);
 
-    var config = options.parse(parsed_args) catch |err| {
+    var config = permfuse.options.parse(parsed_args) catch |err| {
         std.debug.print(
-            "permbox-fuse: {t}\nusage: permbox-fuse --backing=/absolute/path --policy=/absolute/trie [--state=/absolute/session] mountpoint [FUSE options]\n",
+            "permfuse-mount-test: {t}\nusage: zig build run-mount-test -- --backing=/absolute/path --policy=/absolute/trie [--state=/absolute/session] mountpoint [FUSE options]\n",
             .{err},
         );
         return 2;
     };
     defer config.deinit();
 
-    var driver: permbox.Driver = undefined;
+    var driver: permfuse.Driver = undefined;
     driver.init(init.io, .{
         .backing_path = config.backing,
         .policy_path = config.policy,
         .state_path = config.state,
         .passthrough = config.passthrough,
     }) catch |err| {
-        std.debug.print("permbox-fuse: initialization failed: {t}\n", .{err});
+        std.debug.print("permfuse-mount-test: initialization failed: {t}\n", .{err});
         return 1;
     };
     defer driver.deinit();
@@ -54,7 +53,7 @@ pub fn main(init: std.process.Init) !u8 {
         .io_uring = config.io_uring,
         .arguments = extra.items,
     }) catch |err| {
-        std.debug.print("permbox-fuse: mount failed: {t}\n", .{err});
+        std.debug.print("permfuse-mount-test: mount failed: {t}\n", .{err});
         return 1;
     };
     return 0;

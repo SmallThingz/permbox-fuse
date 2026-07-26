@@ -411,7 +411,7 @@ fn initCb(userdata: ?*anyopaque, conn_opt: ?*c.struct_fuse_conn_info) callconv(.
     const fs: *Fs = @ptrCast(@alignCast(userdata orelse return));
     const conn = conn_opt orelse return;
     if (fs.passthrough_requested and c.fuse_set_feature_flag(conn, c.FUSE_CAP_PASSTHROUGH)) {
-        conn.max_backing_stack_depth = c.FUSE_BACKING_STACKED_UNDER;
+        fuse.connSetBackingDepth(conn, c.FUSE_BACKING_STACKED_UNDER);
         fs.passthrough_capable = true;
     } else if (fs.passthrough_requested) {
         std.log.warn("kernel did not negotiate FUSE passthrough; using userspace I/O", .{});

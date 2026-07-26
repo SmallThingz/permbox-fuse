@@ -1,8 +1,9 @@
-# permbox-fuse
+# permfuse
 
-Policy-aware, low-level FUSE 3 filesystem for Linux. It maps a backing
-directory into one mount and evaluates the memory-mapped permission trie for
-every namespace and open operation.
+Embeddable, policy-aware low-level FUSE 3 library for Linux. It is the
+filesystem driver used by permbox, not a standalone daemon or application.
+It maps a backing directory into one mount and evaluates the memory-mapped
+permission trie for namespace and open operations.
 
 The daemon targets libfuse 3.18. Kernel FUSE-over-io_uring is enabled by
 default. Files whose effective rule is `visible_raw` with read, write, and
@@ -10,44 +11,20 @@ execute all set to `allow` use kernel FUSE passthrough for read, write, splice,
 and mmap. Restricted files stay in userspace and are checked against their
 longest-prefix trie rule.
 
-## Build
+## Validate
 
 ```sh
-zig build -Doptimize=ReleaseSafe
 zig build test -Doptimize=ReleaseSafe
 ```
 
-The current build requires Linux, libfuse 3.18 headers/libraries, and glibc.
+The library requires Linux, libfuse 3.18 headers/libraries, and glibc.
 Passthrough also requires kernel support, `CONFIG_FUSE_PASSTHROUGH`, and
-`CAP_SYS_ADMIN`. If passthrough negotiation fails, the daemon retains the same
+`CAP_SYS_ADMIN`. If passthrough negotiation fails, the driver retains the same
 policy behavior using userspace I/O.
-
-## Run
-
-```sh
-zig-out/bin/permbox-fuse \
-  --backing=/absolute/backing/root \
-  --policy=/absolute/policy.trie \
-  --state=/absolute/state/directory \
-  /absolute/mountpoint
-```
-
-`--state` is optional, but is required to write files governed by `overlay-w`.
-It names a durable, versioned session directory. Restarting with the same
-directory resumes the partial session. Sparse data extents override the backing
-file and holes fall through to it. `--no-io-uring` and `--no-passthrough`
-provide explicit compatibility fallbacks. Other arguments are passed to
-libfuse.
-
-Unlisted and invisible paths return as missing. `deny` and `ask` fail closed;
-the userspace confirmation control plane is not part of this daemon yet.
-Directory creation/removal and regular-file creation/removal are allowed only
-under `allow-w`; renames, links, metadata mutations, and virtual-only objects
-currently fail closed.
 
 ## Embedding
 
-The package exports both `permbox` (the driver API) and `permtrie` (the raw
+The package exports both `permfuse` (the driver API) and `permtrie` (the raw
 trie). A dependent `build.zig` can import the driver with:
 
 ```zig
@@ -55,7 +32,7 @@ const dep = b.dependency("permbox_fuse", .{
     .target = target,
     .optimize = optimize,
 });
-exe.root_module.addImport("permbox", dep.module("permbox"));
+exe.root_module.addImport("permfuse", dep.module("permfuse"));
 ```
 
 Initialize the driver in-place because its FUSE state retains pointers to the
@@ -63,13 +40,13 @@ driver's `std.Io.RwLock` and overlay session:
 
 ```zig
 const std = @import("std");
-const permbox = @import("permbox");
+const permfuse = @import("permfuse");
 
 fn ask(
     context: ?*anyopaque,
     io: std.Io,
-    request: permbox.AskRequest,
-) !permbox.AskDecision {
+    request: permfuse.AskRequest,
+) !permfuse.AskDecision {
     _ = context;
     _ = io;
     std.log.info("permission requested: {s} {t}", .{
@@ -79,7 +56,7 @@ fn ask(
     return .allow;
 }
 
-var driver: permbox.Driver = undefined;
+var driver: permfuse.Driver = undefined;
 try driver.init(io, .{
     .backing_path = "/srv/root",
     .policy_path = "/run/app/policy.trie",
@@ -88,7 +65,7 @@ try driver.init(io, .{
 });
 defer driver.deinit();
 
-try driver.setRule("/", permbox.Mode.dir);
+try driver.setRule("/", permfuse.Mode.dir);
 try driver.mount(allocator, "/run/app/mount", .{});
 ```
 
@@ -111,3 +88,19 @@ idempotent after interruption and allowing later writes to the same path.
 session and calling it again resumes at the first uncheckpointed entry.
 `OverlaySession.open` exposes the same recovery/apply machinery without
 mounting FUSE.
+
+## Manual mount harness
+
+There is no installed executable. For manual integration testing only:
+
+```sh
+zig build run-mount-test -- \
+  --backing=/absolute/backing/root \
+  --policy=/absolute/policy.trie \
+  --state=/absolute/state/directory \
+  /absolute/mountpoint
+```
+
+`--state` resumes durable overlay state. `--no-io-uring` and
+`--no-passthrough` select compatibility paths; remaining options are passed to
+libfuse.

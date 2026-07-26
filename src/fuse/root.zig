@@ -1,4 +1,4 @@
-//! Public embedding API for the permbox FUSE driver.
+//! Reusable policy-aware FUSE driver for embedding in permbox.
 const std = @import("std");
 const permtrie = @import("permtrie");
 const filesystem = @import("fs.zig");
@@ -14,6 +14,8 @@ pub const AskFn = filesystem.AskFn;
 pub const OverlaySession = overlay.Session;
 pub const ApplyOptions = overlay.ApplyOptions;
 pub const ApplyResult = overlay.ApplyResult;
+
+pub const options = @import("options.zig");
 
 var driver_active: std.atomic.Value(bool) = .init(false);
 
@@ -148,25 +150,25 @@ pub const Driver = struct {
         self: *Driver,
         allocator: std.mem.Allocator,
         mountpoint: [:0]const u8,
-        options: MountOptions,
+        mount_options: MountOptions,
     ) !void {
         if (self.mounted_session.load(.acquire) != 0) return error.AlreadyMounted;
 
         const base_count: usize = 4;
-        const argv = try allocator.alloc([*c]u8, base_count + options.arguments.len);
+        const argv = try allocator.alloc([*c]u8, base_count + mount_options.arguments.len);
         defer allocator.free(argv);
         var index: usize = 0;
-        argv[index] = @constCast("permbox-fuse");
+        argv[index] = @constCast("permfuse");
         index += 1;
         argv[index] = @constCast("-o");
-        argv[index + 1] = @constCast(if (options.io_uring)
+        argv[index + 1] = @constCast(if (mount_options.io_uring)
             "io_uring,default_permissions"
         else
             "default_permissions");
         index += 2;
         argv[index] = @constCast(mountpoint.ptr);
         index += 1;
-        for (options.arguments, argv[index..]) |arg, *out| out.* = @constCast(arg.ptr);
+        for (mount_options.arguments, argv[index..]) |arg, *out| out.* = @constCast(arg.ptr);
 
         var fuse_args: c.struct_fuse_args = .{
             .argc = @intCast(argv.len),
@@ -224,13 +226,13 @@ pub const Driver = struct {
     pub fn applyOverlay(
         self: *Driver,
         allocator: std.mem.Allocator,
-        options: ApplyOptions,
+        apply_options: ApplyOptions,
     ) !ApplyResult {
         self.mount_mutex.lockUncancelable(self.io);
         defer self.mount_mutex.unlock(self.io);
         if (self.mounted_session.load(.acquire) != 0) return error.Mounted;
         const session = if (self.overlay_session) |*value| value else return error.NoOverlaySession;
-        return session.apply(allocator, self.backing_path, options);
+        return session.apply(allocator, self.backing_path, apply_options);
     }
 };
 

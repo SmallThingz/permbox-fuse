@@ -27,8 +27,8 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const permbox_module = b.addModule("permbox", .{
-        .root_source_file = b.path("src/permbox.zig"),
+    const permbox_module = b.addModule("permfuse", .{
+        .root_source_file = b.path("src/fuse/root.zig"),
         .target = compile_target,
         .optimize = optimize,
         .imports = &.{
@@ -37,32 +37,37 @@ pub fn build(b: *std.Build) void {
     });
     permbox_module.link_libc = true;
     permbox_module.addIncludePath(b.path("src"));
+    permbox_module.addIncludePath(.{ .cwd_relative = "/usr/include/fuse3" });
     permbox_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     permbox_module.linkSystemLibrary("fuse3", .{});
-    permbox_module.addCSourceFile(.{
-        .file = b.path("src/fuse_shim.c"),
-        .flags = &.{"-std=c11"},
-    });
 
-    const exe = b.addExecutable(.{
-        .name = "permbox-fuse",
+    // This repository is consumed as a module. Keep the executable as an
+    // opt-in integration harness only; it is deliberately not installed.
+    const mount_test = b.addExecutable(.{
+        .name = "permfuse-mount-test",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/mount_test.zig"),
             .target = compile_target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "permbox", .module = permbox_module },
+                .{ .name = "permfuse", .module = permbox_module },
             },
         }),
     });
 
-    b.installArtifact(exe);
+    const mount_test_step = b.step(
+        "mount-test",
+        "Build the non-installed manual mount integration harness",
+    );
+    mount_test_step.dependOn(&mount_test.step);
 
-    const run_step = b.step("run", "Run the app");
-    const run_cmd = b.addRunArtifact(exe);
+    const run_mount_test_step = b.step(
+        "run-mount-test",
+        "Run the manual mount integration harness",
+    );
+    const run_cmd = b.addRunArtifact(mount_test);
     if (b.args) |args| run_cmd.addArgs(args);
-    run_cmd.step.dependOn(b.getInstallStep());
-    run_step.dependOn(&run_cmd.step);
+    run_mount_test_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run tests");
     const test_runner: std.Build.Step.Compile.TestRunner = .{
@@ -77,7 +82,7 @@ pub fn build(b: *std.Build) void {
 
     const policy_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/policy.zig"),
+            .root_source_file = b.path("src/fuse/policy.zig"),
             .target = compile_target,
             .optimize = optimize,
             .imports = &.{.{ .name = "permtrie", .module = trie_module }},
@@ -88,7 +93,7 @@ pub fn build(b: *std.Build) void {
 
     const options_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/options.zig"),
+            .root_source_file = b.path("src/fuse/options.zig"),
             .target = compile_target,
             .optimize = optimize,
         }),
@@ -98,26 +103,25 @@ pub fn build(b: *std.Build) void {
 
     const fs_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/fs.zig"),
+            .root_source_file = b.path("src/fuse/fs.zig"),
             .target = compile_target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "permtrie", .module = trie_module }},
+            .imports = &.{
+                .{ .name = "permtrie", .module = trie_module },
+            },
         }),
         .test_runner = test_runner,
     });
     fs_tests.root_module.link_libc = true;
     fs_tests.root_module.addIncludePath(b.path("src"));
+    fs_tests.root_module.addIncludePath(.{ .cwd_relative = "/usr/include/fuse3" });
     fs_tests.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     fs_tests.root_module.linkSystemLibrary("fuse3", .{});
-    fs_tests.root_module.addCSourceFile(.{
-        .file = b.path("src/fuse_shim.c"),
-        .flags = &.{"-std=c11"},
-    });
     test_step.dependOn(&b.addRunArtifact(fs_tests).step);
 
     const overlay_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/overlay.zig"),
+            .root_source_file = b.path("src/fuse/overlay.zig"),
             .target = compile_target,
             .optimize = optimize,
         }),

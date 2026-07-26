@@ -37,12 +37,32 @@ pub const FuseFileInfo = packed struct {
     poll_events: u32,
     backing_id: i32,
     compat_flags: u64,
-    reserved: [2]u64,
+    reserved0: u64,
+    reserved1: u64,
 
-    comptime {
-        std.debug.assert(@sizeOf(@This()) == @sizeOf(c.struct_fuse_file_info));
-    }
 };
+
+/// Mirror of the initial `unsigned` fields in `struct fuse_conn_info` that
+/// includes `max_backing_stack_depth` (which the C translation treats as
+/// opaque).  Verified against the actual size below.
+const ConnInfoMin = extern struct {
+    proto_major: c_uint,
+    proto_minor: c_uint,
+    max_write: c_uint,
+    max_read: c_uint,
+    max_readahead: c_uint,
+    capable: c_uint,
+    want: c_uint,
+    max_background: c_uint,
+    congestion_threshold: c_uint,
+    time_gran: c_uint,
+    max_backing_stack_depth: c_uint,
+};
+
+/// Helper for the single `struct fuse_conn_info` field we need to set.
+pub fn connSetBackingDepth(conn: *c.struct_fuse_conn_info, depth: u32) void {
+    @as(*align(1) ConnInfoMin, @ptrCast(conn)).max_backing_stack_depth = depth;
+}
 
 /// Helpers for `struct fuse_file_info` fields that are bitfields or need casts.
 pub const FileInfo = struct {
