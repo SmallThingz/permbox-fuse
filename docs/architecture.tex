@@ -1,0 +1,772 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=24mm]{geometry}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc,decorations.pathreplacing}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{enumitem}
+\usepackage{caption}
+
+\definecolor{ink}{HTML}{18212B}
+\definecolor{blue}{HTML}{245B8A}
+\definecolor{lightblue}{HTML}{EAF2F8}
+\definecolor{green}{HTML}{2E6B4F}
+\definecolor{lightgreen}{HTML}{EAF4EE}
+\definecolor{orange}{HTML}{9A5B13}
+\definecolor{lightorange}{HTML}{FAF0E3}
+\definecolor{graybox}{HTML}{F2F4F5}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  pdftitle={Design and Operation of permbox-fuse3},
+  pdfauthor={permbox-fuse3 project}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small permbox-fuse3}
+\rhead{\small Design and operation}
+\cfoot{\thepage}
+\setlength{\headheight}{14pt}
+
+\setlist{nosep,leftmargin=5mm}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\renewcommand{\arraystretch}{1.15}
+
+\lstdefinelanguage{Zig}{
+  morekeywords={const,var,pub,fn,struct,enum,union,error,return,try,catch,defer,errdefer,if,else,switch,while,for,null,orelse},
+  sensitive=true,
+  morecomment=[l]{//},
+  morestring=[b]"
+}
+\lstset{
+  language=Zig,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{green},
+  stringstyle=\color{orange},
+  backgroundcolor=\color{graybox},
+  frame=single,
+  rulecolor=\color{gray!35},
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  xleftmargin=2mm,
+  xrightmargin=2mm
+}
+
+\tikzset{
+  box/.style={draw=ink, rounded corners=2pt, fill=graybox, align=center,
+    minimum height=10mm, minimum width=28mm, inner sep=4pt},
+  policy/.style={box, fill=lightblue, draw=blue},
+  data/.style={box, fill=lightgreen, draw=green},
+  durable/.style={box, fill=lightorange, draw=orange},
+  flow/.style={-{Latex[length=2.5mm]}, thick, draw=ink},
+  note/.style={font=\small, align=left}
+}
+
+\title{\textbf{Design and Operation of permbox-fuse3}\\
+\large A persistent policy trie and an embeddable FUSE 3 filesystem}
+\author{permbox-fuse3 project}
+\date{26 July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+permbox-fuse3 is a Linux library that exposes a backing directory through a
+low-level FUSE 3 mount and applies path-based access rules. The project exports
+two Zig modules. \texttt{permtrie} stores rules in a memory-mapped radix trie.
+\texttt{permfuse} connects that trie to FUSE lookup, open, read, write, and
+directory operations. Fully allowed files can use kernel FUSE passthrough.
+Restricted writes can be stored in a sparse overlay session and applied to the
+backing filesystem later. This paper describes the data layout, lookup rules,
+locking, file handle state, overlay journal, recovery procedure, text format,
+and public integration points.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Scope and goals}
+
+The library is the filesystem component used by permbox. It is not an
+installed daemon. A caller creates a driver, loads or updates policy, mounts the
+filesystem, handles permission questions, and applies overlay data when the
+mount has stopped.
+
+The design has five main goals:
+
+\begin{enumerate}
+  \item Keep common read and write paths short.
+  \item Store policy in a persistent binary form that is cheap to query.
+  \item allow policy to become less restrictive while files are open.
+  \item use kernel passthrough when a handle needs no further policy checks.
+  \item keep overlay writes recoverable across process exits and partial apply
+        operations.
+\end{enumerate}
+
+The implementation targets Linux, glibc, libfuse 3.18, and Zig's
+\texttt{std.Io} synchronization primitives. FUSE over \texttt{io\_uring} is
+requested by default. The fallback path remains a normal multithreaded
+low-level FUSE loop.
+
+\section{Module and process structure}
+
+Figure~\ref{fig:overview} shows the main components. The embedding application
+owns the process and calls the public API. The kernel sends filesystem requests
+through libfuse. Policy and overlay state remain separate from the backing
+directory.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=11mm and 15mm]
+  \node[box] (app) {Embedding application\\permbox};
+  \node[policy, below=of app] (driver) {\texttt{permfuse.Driver}\\mount and policy API};
+  \node[box, left=of driver] (kernel) {Linux kernel\\VFS and FUSE};
+  \node[box, below=of kernel] (fuse) {libfuse 3.18\\low-level callbacks};
+  \node[policy, below=of driver] (trie) {\texttt{permtrie}\\mmap radix trie};
+  \node[data, right=of driver] (backing) {Backing directory};
+  \node[durable, right=of trie] (overlay) {Overlay session\\data, ranges, paths};
+
+  \draw[flow] (app) -- (driver);
+  \draw[flow] (driver) -- (app);
+  \draw[flow] (kernel) -- (fuse);
+  \draw[flow] (fuse) -- (driver);
+  \draw[flow] (driver) -- (fuse);
+  \draw[flow] (driver) -- (trie);
+  \draw[flow] (driver) -- (backing);
+  \draw[flow] (driver) -- (overlay);
+  \draw[flow, dashed] (overlay) -- node[above,font=\scriptsize]{apply later} (backing);
+\end{tikzpicture}
+\caption{Main components and data paths.}
+\label{fig:overview}
+\end{figure}
+
+\subsection{\texttt{permtrie}}
+
+\texttt{permtrie} is the public, locked wrapper around the raw trie. It owns a
+file descriptor, a shared memory mapping, and an \texttt{std.Io.RwLock}. Its
+public operations provide exact lookup, inherited lookup, mutation, grouped
+mutation, reset, and text conversion.
+
+\subsection{\texttt{permfuse}}
+
+\texttt{permfuse} owns the active policy trie, the backing directory handle,
+optional overlay session state, and the FUSE callback state. Only one driver is
+active in a process at a time. The driver is initialized in its final storage
+location. It must not be moved while mounted because libfuse stores a pointer
+to its callback state.
+
+\section{Policy representation}
+
+\subsection{One-byte modes}
+
+Each explicit rule stores a packed one-byte mode. The byte contains four
+two-bit fields:
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{@{}lllX@{}}
+\toprule
+Field & Type & Values & Meaning \\
+\midrule
+\texttt{k} & \texttt{Mode.K} &
+\texttt{midway}, \texttt{visible\_raw}, \texttt{visible\_virtual},
+\texttt{invisible} & Namespace kind and source of file contents. \\
+\texttt{r} & \texttt{Mode.A} &
+\texttt{deny}, \texttt{ask}, \texttt{allow}, reserved &
+Read and open access. \\
+\texttt{w} & \texttt{Mode.W} &
+\texttt{deny}, \texttt{ask}, \texttt{allow}, \texttt{overlay} &
+Write behavior and destination. \\
+\texttt{x} & \texttt{Mode.A} &
+\texttt{deny}, \texttt{ask}, \texttt{allow}, reserved &
+Execute access. \\
+\bottomrule
+\end{tabularx}
+\caption{Fields in a trie rule.}
+\end{table}
+
+\texttt{midway} is used by internal radix nodes that have no explicit rule.
+It is not a valid serialized policy entry. \texttt{visible\_raw} refers to the
+backing filesystem. \texttt{visible\_virtual} describes a path whose content
+must not come from the backing filesystem. \texttt{invisible} hides a path.
+
+\subsection{Exact and inherited lookup}
+
+An exact lookup returns only a rule stored at the requested path. An effective
+lookup first checks that exact path, then removes one slash-delimited component
+at a time until it reaches \texttt{/}. This makes inheritance follow filesystem
+components rather than arbitrary byte prefixes.
+
+For example, if \texttt{/home} has a rule and
+\texttt{/home/user/file} does not, the effective lookup returns the
+\texttt{/home} rule. A rule for \texttt{/hom} does not apply to
+\texttt{/home}.
+
+\section{Binary trie layout}
+
+\subsection{Memory-mapped pool}
+
+The binary file is mapped with \texttt{MAP\_SHARED}. Its allocation unit is
+1 KiB. Index zero contains the pool header. Live nodes start at index one.
+The header records:
+
+\begin{itemize}
+  \item a 14-byte magic value,
+  \item file endianness,
+  \item format version,
+  \item the next sequential free index,
+  \item the head of the free list,
+  \item the root node index.
+\end{itemize}
+
+The initial mapping is 64 KiB. When the sequential frontier reaches the end,
+the backing file grows and \texttt{mremap} may move the mapping. Code that
+allocates a node therefore stores node indices, not stable pointers. Every
+pointer that may cross a resize point is fetched again from its index.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=1.45cm,y=0.9cm]
+  \foreach \x/\label/\fill in {
+    0/{0: header}/lightorange,
+    1/{1: root}/lightblue,
+    2/{2: node}/graybox,
+    3/{3: free}/lightgreen,
+    4/{4: node}/graybox,
+    5/{5: unused}/white} {
+      \draw[fill=\fill] (\x,0) rectangle ++(1,1);
+      \node[font=\scriptsize,align=center] at (\x+0.5,0.5) {\label};
+  }
+  \draw[decorate,decoration={brace,amplitude=5pt}] (0,-0.15) -- (6,-0.15)
+    node[midway,below=5pt,font=\small]{memory-mapped file, 1 KiB per cell};
+  \draw[flow] (3.5,1.1) to[bend left=25] node[above,font=\scriptsize]{free list} (5.5,1.1);
+\end{tikzpicture}
+\caption{Pool organization. Index zero is never a live trie node.}
+\label{fig:pool}
+\end{figure}
+
+\subsection{Node structure}
+
+Each 1 KiB node contains:
+
+\begin{itemize}
+  \item a radix length and radix byte string,
+  \item one mode byte for the path represented by the node,
+  \item a 256-bit child mask,
+  \item 256 packed 24-bit slots.
+\end{itemize}
+
+The child mask changes the meaning of each 24-bit slot. If bit \(b\) is set,
+slot \(b\) is a node index. If bit \(b\) is clear, slot \(b\) is either zero or
+an inline mode value. Short leaves can therefore store a full rule without a
+second 1 KiB node.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=9mm and 12mm]
+  \node[policy] (n) {node\\radix: \texttt{/home}\\mode: explicit or midway};
+  \node[data, below left=of n] (inline) {mask bit clear\\slot contains mode};
+  \node[policy, below right=of n] (child) {mask bit set\\slot contains node index};
+  \draw[flow] (n) -- node[left,font=\scriptsize]{short leaf} (inline);
+  \draw[flow] (n) -- node[right,font=\scriptsize]{longer branch} (child);
+\end{tikzpicture}
+\caption{Dual use of a node's 24-bit slots.}
+\end{figure}
+
+\subsection{Insertion}
+
+Insertion walks the radix strings until one of four cases occurs:
+
+\begin{enumerate}
+  \item Exact match: replace the node mode.
+  \item Path ends at an inline slot: replace the inline mode.
+  \item Missing branch: create a compressed chain for the remaining bytes.
+  \item Radix difference: split the current node into a new parent and two
+        branches.
+\end{enumerate}
+
+New nodes are unpublished until every required field is ready. Error cleanup
+may release only these unpublished nodes. Once a node index is stored in the
+root or in a published parent, later cleanup must not free it. A failed
+non-critical cleanup is logged.
+
+\subsection{Deletion}
+
+Deletion clears an exact mode or inline value, then examines the path back
+toward the root. Empty nodes can be released. A node can be merged only when
+the merge preserves lookup behavior. In particular, a zero-length radix node
+is not merged, and a remaining child with its own children or inline entries
+is not folded into its parent.
+
+The free list uses two packed slots in a released node. Releasing the last
+sequential node moves the frontier backward. Releasing any other node adds it
+to the linked free list.
+
+\section{Trie concurrency and persistence}
+
+The public trie wrapper uses one read-write lock:
+
+\begin{itemize}
+  \item \texttt{get}, \texttt{getExact}, and \texttt{toText} take a shared lock.
+  \item \texttt{add}, \texttt{del}, \texttt{reset}, and text replacement take
+        an exclusive lock.
+  \item grouped updates use \texttt{lockWrite} and the \texttt{Locked}
+        operations.
+\end{itemize}
+
+The raw trie is not concurrency safe. The locked wrapper is the supported
+public interface. A group lock blocks all readers and writers, so another
+thread cannot observe half of a policy update.
+
+Mutations request an \texttt{msync} after committing. A sync failure is logged
+as a persistence error. It is not returned after the mapped data has changed.
+An error in a grouped update does not roll back earlier changes.
+
+\section{Text and binary conversion}
+
+The binary trie can be converted to and from a permbox \texttt{fs} block.
+Import accepts nested entries, flat entries, comments, semicolons, quoted path
+escapes, and combined permission forms such as \texttt{allow-rwx}. Export
+walks explicit trie entries in byte order and writes a canonical, flat
+\texttt{fs} block.
+
+\begin{lstlisting}
+fs {
+  "/": access,overlay-w,ALWAYS-allow-rx {
+    "home/user": empty,allow-rw,deny-x
+  }
+}
+\end{lstlisting}
+
+The parser builds a complete temporary rule list before taking the write lock.
+Syntax errors therefore leave the existing trie unchanged. After parsing, the
+writer lock is held while the old trie is reset and every new rule is inserted.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+Text flag & Stored value \\
+\midrule
+\texttt{access} & \texttt{k = visible\_raw} \\
+\texttt{empty} & \texttt{k = visible\_virtual} \\
+\texttt{no-access} & \texttt{k = invisible} \\
+\texttt{deny-r}, \texttt{allow-r}, \texttt{ALWAYS-allow-r}
+  & read deny, ask, allow \\
+\texttt{deny-w}, \texttt{allow-w}, \texttt{ALWAYS-allow-w}
+  & write deny, ask, allow \\
+\texttt{overlay-w} & write overlay \\
+\texttt{deny-x}, \texttt{allow-x}, \texttt{ALWAYS-allow-x}
+  & execute deny, ask, allow \\
+\bottomrule
+\end{tabular}
+\caption{Text flag mapping.}
+\end{table}
+
+\section{FUSE namespace and inode model}
+
+The driver uses the low-level FUSE API. Kernel inode numbers other than the
+root are pointer values for allocated \texttt{Inode} objects. This removes a
+global map lookup from callbacks that already have an inode number.
+
+An inode stores:
+
+\begin{itemize}
+  \item an \texttt{O\_PATH} descriptor for the backing object,
+  \item its normalized absolute policy path,
+  \item kernel lookup references,
+  \item open handle references,
+  \item an optional shared passthrough backing identifier,
+  \item a short per-inode mutex,
+  \item a separate overlay append mutex.
+\end{itemize}
+
+The global string map is used only to publish and reuse inodes by path.
+Filesystem I/O is never performed while its mutex is held. A forgotten inode
+is detached only after both its lookup count and open count reach zero.
+Directory handles increment the same open count as file handles.
+
+\subsection{Lookup}
+
+Lookup performs these steps:
+
+\begin{enumerate}
+  \item Join the parent path and child name in a fixed 4096-byte buffer.
+  \item Evaluate the effective policy.
+  \item Reject hidden or non-raw entries.
+  \item Open the child with \texttt{O\_PATH}, \texttt{O\_NOFOLLOW}, and
+        \texttt{O\_CLOEXEC}.
+  \item Read attributes.
+  \item Publish or reuse the inode under the short global mutex.
+  \item Reply to the kernel.
+\end{enumerate}
+
+The backing open and attribute read happen outside the inode-map mutex.
+
+\section{Open handles and policy snapshots}
+
+Opening a file evaluates policy once and stores the full mode byte in the
+handle. Ordinary read, write, and execute checks load this byte atomically.
+They do not take the trie lock.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=8mm and 10mm]
+  \node[box] (io) {read, write, or execute};
+  \node[policy, below=of io] (load) {atomic handle mode load};
+  \node[data, below left=of load] (allow) {allow\\continue I/O};
+  \node[box, below=of load] (deny) {deny\\return access error};
+  \node[durable, below right=of load] (ask) {ask};
+  \node[policy, below=of ask] (recheck) {re-read trie once};
+  \node[box, below left=of recheck] (resolved) {new rule resolved};
+  \node[durable, below right=of recheck] (callback) {call application};
+  \node[policy, below=of callback] (commit) {write explicit allow rule\\update handle byte};
+
+  \draw[flow] (io) -- (load);
+  \draw[flow] (load) -- node[left,font=\scriptsize]{allow} (allow);
+  \draw[flow] (load) -- node[right,font=\scriptsize]{deny} (deny);
+  \draw[flow] (load) -- node[right,font=\scriptsize]{ask} (ask);
+  \draw[flow] (ask) -- (recheck);
+  \draw[flow] (recheck) -- node[left,font=\scriptsize]{not ask} (resolved);
+  \draw[flow] (recheck) -- node[right,font=\scriptsize]{still ask} (callback);
+  \draw[flow] (callback) -- node[right,font=\scriptsize]{approved} (commit);
+\end{tikzpicture}
+\caption{Permission decision for an existing handle.}
+\label{fig:ask}
+\end{figure}
+
+If the snapshot says \texttt{ask}, the handle mutex serializes questions for
+that open. The trie is read once before the callback. This catches a rule
+change made by another handle. If the rule still asks, the application callback
+receives the path, operation, and current mode.
+
+After approval, the code takes the trie writer lock and checks again. If the
+rule still asks, it changes that operation to allow and writes an explicit
+rule. It then updates the handle mode. Existing fully allowed handles do not
+need this path. Existing denied handles remain denied until reopened unless
+their stored state is \texttt{ask}, as defined by the current API.
+
+\section{Kernel passthrough}
+
+During FUSE initialization, the driver requests
+\texttt{FUSE\_CAP\_PASSTHROUGH}. If the kernel accepts it, a fully allowed raw
+inode can register a backing descriptor with libfuse. The resulting backing
+identifier is placed in \texttt{fuse\_file\_info}.
+
+Passthrough is used only when:
+
+\begin{itemize}
+  \item the path kind is \texttt{visible\_raw},
+  \item read is \texttt{allow},
+  \item write is \texttt{allow},
+  \item execute is \texttt{allow},
+  \item the kernel negotiated the capability.
+\end{itemize}
+
+The kernel can then service read, write, splice, and mmap against the backing
+file without returning to FUSE for each operation. Policy updates do not
+retroactively change an already opened passthrough descriptor. This matches
+normal file descriptor behavior.
+
+If passthrough is unavailable, the same handle uses userspace I/O. Policy
+meaning does not change.
+
+\section{Userspace read and write paths}
+
+\subsection{Raw reads and writes}
+
+Raw reads can use \texttt{fuse\_reply\_data} with a file descriptor buffer.
+Raw writes use positional writes against the open backing descriptor. These
+operations do not hold the global inode-map mutex.
+
+\subsection{Overlay writes}
+
+An overlay handle has a sparse data descriptor, a range-journal descriptor,
+and an in-memory list of range records. A successful positional write to the
+sparse data file is followed by one fixed-size range record:
+
+\[
+R = (\textit{offset}:u64,\ \textit{length}:u64)
+\]
+
+The range file is append-only during normal operation. The per-inode overlay
+mutex prevents records from separate opens of the same inode from
+interleaving. A torn final record is truncated before further writable use.
+
+Overlay reads construct the logical file as follows:
+
+\begin{enumerate}
+  \item Determine the backing file size.
+  \item Extend the logical size to the maximum end of any overlay range.
+  \item Read backing bytes into the reply buffer.
+  \item Replace intersecting regions with bytes from the sparse overlay file.
+\end{enumerate}
+
+Later range records take effect after earlier records because they are applied
+in journal order.
+
+\section{Durable overlay session}
+
+A session directory uses this layout:
+
+\begin{lstlisting}[language={}]
+session/
+  format
+  data/<id>
+  ranges/<id>
+  paths/<id>
+  apply.log
+\end{lstlisting}
+
+The identifier is 32 hexadecimal characters made from two seeded Wyhash
+values of the normalized absolute path. The hash is only a filename. The
+\texttt{paths} record is the authoritative reverse mapping. Registration
+checks an existing record byte for byte, so a hash collision is reported
+instead of writing to the wrong path.
+
+\subsection{Publishing a path record}
+
+A path record is written to a unique pending file, synced, and linked to its
+final identifier. The directory is then synced. A process that loses the link
+race verifies that the winner stored the same path. The final name therefore
+never points to a partially written path.
+
+\subsection{Safe target resolution}
+
+Apply opens every intermediate backing directory with
+\texttt{O\_NOFOLLOW} and opens the final target with
+\texttt{O\_NOFOLLOW}. A stored session path cannot escape the configured
+backing root through a symlink. Only regular files are accepted as apply
+targets.
+
+\section{Apply protocol and recovery}
+
+The apply log stores one line per durable checkpoint:
+
+\begin{center}
+\texttt{<32-byte-id> <range-journal-offset>}
+\end{center}
+
+For each file, apply reads complete range records starting at the last
+checkpoint. It copies the described bytes from the sparse data file to the
+backing target. The order of durability operations is:
+
+\begin{enumerate}
+  \item write all pending ranges to the backing target,
+  \item \texttt{fsync} the target,
+  \item append the new range offset to \texttt{apply.log},
+  \item \texttt{fdatasync} the apply log.
+\end{enumerate}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=8mm]
+  \node[durable] (r) {read next range records};
+  \node[data, right=of r] (copy) {copy sparse bytes\\to backing target};
+  \node[durable, right=of copy] (sync) {\texttt{fsync} target};
+  \node[durable, right=of sync] (log) {append checkpoint\\sync apply log};
+  \draw[flow] (r) -- (copy);
+  \draw[flow] (copy) -- (sync);
+  \draw[flow] (sync) -- (log);
+  \node[note, below=7mm of copy] (crash) {A crash before the checkpoint may repeat a positional write.\\
+  Repeating the same bytes at the same offset is safe.};
+  \draw[dashed] (crash) -- (sync);
+\end{tikzpicture}
+\caption{Ordering for one durable apply checkpoint.}
+\end{figure}
+
+A crash before the checkpoint can cause the same positional writes to run
+again. It cannot cause the log to claim that unsynced target data is complete.
+This makes retry idempotent.
+
+A torn final line in \texttt{apply.log} is removed at startup. A partial range
+record is ignored or truncated to the last complete 16-byte boundary. Missing
+data, range, or path files are counted as incomplete entries rather than
+silently accepted.
+
+\texttt{max\_files} limits work in one call. The next call scans from the
+start and uses checkpoints to skip completed data. \texttt{remove\_applied}
+first writes a zero checkpoint, then removes session files. This allows a later
+mount to create a new journal with the same path identifier.
+
+\section{Locking and critical sections}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+Lock & Protects & Not held during \\
+\midrule
+Trie read-write lock & binary trie and policy transactions &
+ordinary I/O using a handle snapshot \\
+Filesystem inode-map mutex & path map publication and reference detach &
+backing and overlay data I/O \\
+Inode mutex & passthrough backing identifier and last-open transition &
+file reads and writes \\
+Inode overlay mutex & range append order across opens &
+raw and passthrough I/O \\
+Handle mutex & ask resolution and handle-local range refresh &
+operations on other handles \\
+Session mutex & path registration and apply session consistency &
+normal raw filesystem I/O \\
+Mount mutex & active session pointer and apply versus mount exclusion &
+the running FUSE loop \\
+\bottomrule
+\end{tabularx}
+\caption{Synchronization domains.}
+\end{table}
+
+The inode-map critical section contains no disk I/O. Policy lookup locks are
+not used on the ordinary handle fast path. Overlay serialization is limited to
+writes for the same inode. Apply holds the session mutex because it requires a
+stable view of path and range metadata.
+
+\section{Driver lifecycle}
+
+A typical embedding sequence is:
+
+\begin{lstlisting}
+var driver: permfuse.Driver = undefined;
+try driver.init(io, .{
+    .backing_path = "/srv/root",
+    .policy_path = "/run/app/policy.trie",
+    .state_path = "/run/app/session",
+    .passthrough = true,
+    .ask_fn = ask,
+});
+defer driver.deinit();
+
+try driver.replacePolicyFromText(allocator, fs_block);
+try driver.mount(allocator, "/run/app/mount", .{});
+\end{lstlisting}
+
+\texttt{mount} is blocking. Another task or thread can call
+\texttt{requestUnmount}. The driver clears the active session pointer only
+after the loop leaves. Overlay application takes the mount mutex and rejects an
+active mount, so sparse files cannot be applied while handles may still write
+them.
+
+\section{Error handling and logging}
+
+Raw Linux syscall wrappers return encoded syscall results. Those values are
+decoded with \texttt{linux.errno(rc)}. libc and \texttt{std.posix} calls use
+\texttt{std.posix.errno(rc)}. The return value is captured once before cleanup
+can replace thread-local errno.
+
+Errors that prevent a correct reply are returned to FUSE or to the public API.
+Cleanup and persistence errors that occur after a structure is published are
+logged. Published trie nodes are not freed in an error cleanup path.
+
+Logging is compiled through a small module adapter. Test and mount roots supply
+the logger. Messages include source file, line, column, and function.
+
+\section{ABI boundary}
+
+Zig's C translation treats some libfuse bitfield structures as opaque. The
+project mirrors the required \texttt{fuse\_file\_info} layout in a packed Zig
+structure and checks its 64-byte size at compile time. Accessor functions read
+and write the file handle, cache flags, and passthrough backing identifier.
+
+The code also mirrors the initial fields of \texttt{fuse\_conn\_info} to set
+the maximum backing stack depth required by passthrough. These definitions are
+tied to the selected libfuse API version, 318.
+
+\section{Testing}
+
+The build uses a custom test runner so trie and FUSE logging is available under
+test. The normal validation commands are:
+
+\begin{lstlisting}[language={}]
+zig build test
+zig build test -Doptimize=ReleaseSafe
+zig build mount-test -Doptimize=ReleaseSafe
+\end{lstlisting}
+
+Tests cover radix insertion and deletion shapes, free-list reuse, mapping
+growth, endian conversion, concurrent readers and writers, exact and inherited
+policy lookup, text round trips, malformed text, path joining, ask approval,
+inode lifetime, overlay session resume, bounded apply, and torn apply-log
+recovery.
+
+The manual mount target is an integration harness. It is not installed as a
+product binary.
+
+\section{Limits and operational requirements}
+
+\begin{itemize}
+  \item The implementation is Linux-specific and links libc because libfuse
+        requires it.
+  \item Passthrough needs kernel support, \texttt{CONFIG\_FUSE\_PASSTHROUGH},
+        and suitable privilege such as \texttt{CAP\_SYS\_ADMIN}.
+  \item A policy change does not alter permissions already stored in a
+        non-ask open handle.
+  \item A valid text import can commit some rules if a later allocation or
+        mapping growth fails. Syntax errors are detected before replacement.
+  \item The binary pool has a maximum size below 16 GiB because node indices
+        are 24 bits and each node is 1 KiB.
+  \item Overlay range records use native-endian 64-bit fields. The session
+        format marker must change if this representation changes.
+\end{itemize}
+
+\section{Public API summary}
+
+\subsection{\texttt{permtrie}}
+
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Function & Purpose \\
+\midrule
+\texttt{init}, \texttt{deinit} & own the binary file descriptor and mapping \\
+\texttt{get}, \texttt{getExact} & inherited and exact lookup \\
+\texttt{add}, \texttt{del}, \texttt{reset} & exclusive mutation \\
+\texttt{lockWrite}, \texttt{unlockWrite} & grouped policy transaction \\
+\texttt{getLocked}, \texttt{getExactLocked} & lookup inside a writer group \\
+\texttt{addLocked}, \texttt{delLocked} & mutation inside a writer group \\
+\texttt{toText}, \texttt{replaceFromText} & \texttt{fs} block conversion \\
+\bottomrule
+\end{tabularx}
+
+\subsection{\texttt{permfuse.Driver}}
+
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Function & Purpose \\
+\midrule
+\texttt{init}, \texttt{deinit} & own policy, backing descriptor, and session \\
+\texttt{getRule}, \texttt{evaluate} & exact and inherited policy lookup \\
+\texttt{setRule}, \texttt{removeRule} & one-rule mutation \\
+\texttt{updateRules} & grouped mutation under one writer lock \\
+\texttt{policyToText}, \texttt{replacePolicyFromText} & policy text conversion \\
+\texttt{mount}, \texttt{requestUnmount} & run and stop the FUSE loop \\
+\texttt{applyOverlay} & resume and apply durable sparse writes \\
+\bottomrule
+\end{tabularx}
+
+\section{Conclusion}
+
+permbox-fuse3 separates persistent policy, open-handle decisions, backing I/O,
+and recoverable overlay data. The trie makes policy lookup compact and keeps
+updates under one read-write lock. File handles carry a one-byte snapshot for
+the common path. Kernel passthrough removes FUSE callbacks for handles that
+need no policy work. Restricted writes remain in sparse files with exact range
+records and durable apply checkpoints. These parts let the embedding
+application change policy, answer permission requests, resume sessions, and
+apply selected writes without turning the library into a separate daemon.
+
+\end{document}

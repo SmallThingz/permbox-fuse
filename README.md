@@ -58,6 +58,10 @@ bits.
 See [docs/API.md](docs/API.md) for the complete public API reference for both
 `permtrie` and `permfuse`.
 
+The implementation is described in detail in
+[docs/architecture.pdf](docs/architecture.pdf). Its LaTeX source is
+[docs/architecture.tex](docs/architecture.tex).
+
 Initialize the driver in-place and do not move it while `mount` is running,
 because libfuse retains a pointer to its callback state. Configuration paths
 are copied during initialization:
