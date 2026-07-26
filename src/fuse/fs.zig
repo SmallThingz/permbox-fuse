@@ -411,7 +411,7 @@ fn initCb(userdata: ?*anyopaque, conn_opt: ?*c.struct_fuse_conn_info) callconv(.
     const fs: *Fs = @ptrCast(@alignCast(userdata orelse return));
     const conn = conn_opt orelse return;
     if (fs.passthrough_requested and c.fuse_set_feature_flag(conn, c.FUSE_CAP_PASSTHROUGH)) {
-        c.permbox_conn_set_backing_depth(conn, c.FUSE_BACKING_STACKED_UNDER);
+        conn.max_backing_stack_depth = c.FUSE_BACKING_STACKED_UNDER;
         fs.passthrough_capable = true;
     } else if (fs.passthrough_requested) {
         std.log.warn("kernel did not negotiate FUSE passthrough; using userspace I/O", .{});
@@ -551,7 +551,7 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
     const mode = mode_opt orelse return replyErr(req, c.ENOENT);
     if (!visible(mode) or mode.k != .visible_raw) return replyErr(req, c.ENOENT);
 
-    const flags_in = c.permbox_fi_flags(fi);
+    const flags_in = fuse.FileInfo.flags(fi);
     const access_mode = flags_in & c.O_ACCMODE;
     const wants_read = access_mode != c.O_WRONLY;
     const wants_write = access_mode != c.O_RDONLY;
@@ -628,13 +628,13 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
             if (node.backing_id == 0)
                 std.log.warn("passthrough registration failed for {s}", .{node.path});
         }
-        c.permbox_fi_set_backing_id(fi, node.backing_id);
+        fuse.FileInfo.setBackingId(fi, node.backing_id);
     }
     node.mutex.unlock(fs.io);
 
-    c.permbox_fi_set_fh(fi, @intFromPtr(handle));
-    c.permbox_fi_set_keep_cache(fi, @intFromBool(c.permbox_fi_backing_id(fi) == 0));
-    c.permbox_fi_set_noflush(fi, @intFromBool(!wants_write));
+    fuse.FileInfo.setFh(fi, @intFromPtr(handle));
+    fuse.FileInfo.setKeepCache(fi, @intFromBool(fuse.FileInfo.backingId(fi) == 0));
+    fuse.FileInfo.setNoflush(fi, @intFromBool(!wants_write));
     _ = c.fuse_reply_open(req, fi);
 }
 
@@ -647,7 +647,7 @@ fn readCb(
 ) callconv(.c) void {
     _ = ino;
     const info = fi orelse return replyErr(req, c.EBADF);
-    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(c.permbox_fi_fh(info))));
+    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(fuse.FileInfo.fh(info))));
     const fs = fsFrom(req);
     if (!authorize(fs, handle, .read)) return replyErr(req, c.EACCES);
     const mode = loadMode(handle);
@@ -726,7 +726,7 @@ fn writeCb(
     _ = ino;
     if (buf == null) return replyErr(req, c.EINVAL);
     const info = fi orelse return replyErr(req, c.EBADF);
-    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(c.permbox_fi_fh(info))));
+    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(fuse.FileInfo.fh(info))));
     const fs = fsFrom(req);
     if (!authorize(fs, handle, .write)) return replyErr(req, c.EACCES);
     const mode = loadMode(handle);
@@ -797,7 +797,7 @@ fn writeOverlay(
 fn flushCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info) callconv(.c) void {
     _ = ino;
     const info = fi orelse return replyErr(req, c.EBADF);
-    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(c.permbox_fi_fh(info))));
+    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(fuse.FileInfo.fh(info))));
     const overlay_fd = handle.overlay_fd.load(.acquire);
     const target_fd = if (overlay_fd >= 0) overlay_fd else handle.fd;
     const duplicate = c.dup(target_fd);
@@ -815,7 +815,7 @@ fn flushCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info) 
 fn fsyncCb(req: c.fuse_req_t, ino: c.fuse_ino_t, datasync: c_int, fi: ?*c.struct_fuse_file_info) callconv(.c) void {
     _ = ino;
     const info = fi orelse return replyErr(req, c.EBADF);
-    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(c.permbox_fi_fh(info))));
+    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(fuse.FileInfo.fh(info))));
     const overlay_fd = handle.overlay_fd.load(.acquire);
     const target_fd = if (overlay_fd >= 0) overlay_fd else handle.fd;
     const rc = if (datasync != 0) c.fdatasync(target_fd) else c.fsync(target_fd);
@@ -831,7 +831,7 @@ fn fsyncCb(req: c.fuse_req_t, ino: c.fuse_ino_t, datasync: c_int, fi: ?*c.struct
 fn releaseCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info) callconv(.c) void {
     _ = ino;
     const info = fi orelse return replyErr(req, 0);
-    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(c.permbox_fi_fh(info))));
+    const handle: *Handle = @ptrFromInt(@as(usize, @intCast(fuse.FileInfo.fh(info))));
     const fs = fsFrom(req);
     const node = handle.inode;
 
@@ -893,9 +893,9 @@ fn opendirCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_
         return replyErr(req, c.ENOMEM);
     };
     handle.* = .{ .stream = stream, .inode = node };
-    c.permbox_fi_set_fh(fi, @intFromPtr(handle));
+    fuse.FileInfo.setFh(fi, @intFromPtr(handle));
     // Policy updates must become visible without reopening the directory.
-    c.permbox_fi_set_cache_readdir(fi, 0);
+    fuse.FileInfo.setCacheReaddir(fi, 0);
     _ = c.fuse_reply_open(req, fi);
 }
 
@@ -921,7 +921,7 @@ fn readdirCb(
     _ = ino;
     const fs = fsFrom(req);
     const info = fi orelse return replyErr(req, c.EBADF);
-    const handle: *DirHandle = @ptrFromInt(@as(usize, @intCast(c.permbox_fi_fh(info))));
+    const handle: *DirHandle = @ptrFromInt(@as(usize, @intCast(fuse.FileInfo.fh(info))));
     const capacity = @min(requested_size, dir_buffer_size);
     var reply: [dir_buffer_size]u8 = undefined;
     var used: usize = 0;
@@ -961,7 +961,7 @@ fn readdirCb(
 fn releasedirCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info) callconv(.c) void {
     _ = ino;
     const info = fi orelse return replyErr(req, 0);
-    const handle: *DirHandle = @ptrFromInt(@as(usize, @intCast(c.permbox_fi_fh(info))));
+    const handle: *DirHandle = @ptrFromInt(@as(usize, @intCast(fuse.FileInfo.fh(info))));
     _ = c.closedir(handle.stream);
     allocator.destroy(handle);
     replyErr(req, 0);
