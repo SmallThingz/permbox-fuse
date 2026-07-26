@@ -46,7 +46,7 @@ pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
     var curr_idx: u24 = @intCast(self.pool.block().root);
     var parent_idx: u24 = 0;
     var parent_byte: u8 = 0;
-    var curr = try self.fromIdx(curr_idx);
+    var curr = try self.pool.activeNodeAt(curr_idx);
 
     while (true) switch (curr.next(path)) {
         .exact => {
@@ -56,15 +56,15 @@ pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
         .this => |idx| {
             if (curr.bitset.isSet(idx)) {
                 const sub_idx = curr.indexAt(idx).get();
-                var sub = try self.fromIdx(sub_idx);
+                var sub = try self.pool.activeNodeAt(sub_idx);
                 if (sub.radix_len > 0) {
                     // Split: path ends here but subnode has more radix.
                     // Create intermediate node N for this shorter path,
                     // link old subnode under N at its first radix byte.
                     const n_idx = try self.acquire();
                     errdefer self.releaseAndLog(n_idx, "unpublished prefix node");
-                    sub = self.fromIdx(sub_idx) catch unreachable;
-                    var n = try self.fromIdx(n_idx);
+                    sub = self.pool.activeNodeAt(sub_idx) catch unreachable;
+                    var n = try self.pool.activeNodeAt(n_idx);
                     n.data = data;
 
                     const first_byte = sub.radix_str[0];
@@ -76,7 +76,7 @@ pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
                         std.mem.copyForwards(u8, sub.radix_str[0..sub.radix_len], sub.radix_str[1 .. sub.radix_len + 1]);
                     }
 
-                    curr = self.fromIdx(curr_idx) catch unreachable;
+                    curr = self.pool.activeNodeAt(curr_idx) catch unreachable;
                     curr.indexAt(idx).set(n_idx);
                 } else {
                     sub.data = data;
@@ -92,7 +92,7 @@ pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
             if (!curr.bitset.isSet(idx)) {
                 const inline_val = curr.indexAt(idx).get();
                 const new_idx = try self.create(path, data, inline_val);
-                curr = try self.fromIdx(curr_idx);
+                curr = try self.pool.activeNodeAt(curr_idx);
                 curr.bitset.set(idx);
                 curr.indexAt(idx).set(new_idx);
                 return;
@@ -101,14 +101,14 @@ pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
             parent_idx = curr_idx;
             parent_byte = idx;
             curr_idx = curr.indexAt(idx).get();
-            curr = try self.fromIdx(curr_idx);
+            curr = try self.pool.activeNodeAt(curr_idx);
         },
         .diff => |idx| {
             const ogpath = path;
             const left_idx = try self.acquire();
             errdefer self.releaseAndLog(left_idx, "unpublished split child");
-            var left = try self.fromIdx(left_idx);
-            curr = try self.fromIdx(curr_idx);
+            var left = try self.pool.activeNodeAt(left_idx);
+            curr = try self.pool.activeNodeAt(curr_idx);
 
             left.radix_len = curr.radix_len - idx - 1;
             left.data = curr.data;
@@ -118,8 +118,8 @@ pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
 
             const top_idx = try self.acquire();
             errdefer self.releaseAndLog(top_idx, "unpublished split parent");
-            var top = try self.fromIdx(top_idx);
-            curr = try self.fromIdx(curr_idx);
+            var top = try self.pool.activeNodeAt(top_idx);
+            curr = try self.pool.activeNodeAt(curr_idx);
 
             top.radix_len = idx;
             top.data = .midway;
@@ -127,14 +127,14 @@ pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
             top.bitset.set(curr.radix_str[idx]);
             top.indexAt(curr.radix_str[idx]).set(left_idx);
 
-            top = try self.fromIdx(top_idx);
+            top = try self.pool.activeNodeAt(top_idx);
             if (idx == ogpath.len) {
                 top.data = data;
             } else {
                 const new_path = ogpath[idx + 1 ..];
                 if (new_path.len != 0) {
                     const right_idx = try self.create(new_path, data, 0);
-                    top = try self.fromIdx(top_idx);
+                    top = try self.pool.activeNodeAt(top_idx);
                     top.bitset.set(ogpath[idx]);
                     top.indexAt(ogpath[idx]).set(right_idx);
                 } else {
@@ -145,7 +145,7 @@ pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
             if (parent_idx == 0) {
                 self.pool.block().root = top_idx;
             } else {
-                var parent_node = try self.fromIdx(parent_idx);
+                var parent_node = try self.pool.activeNodeAt(parent_idx);
                 parent_node.indexAt(parent_byte).set(top_idx);
             }
 
@@ -161,7 +161,7 @@ pub fn create(self: *@This(), path: []const u8, data: Mode, inline_val: u24) !u2
         log.err("failed to reclaim unpublished trie chain at node {d}: {t}", .{ new_idx, err });
 
     var current_idx = new_idx;
-    var current = try self.fromIdx(current_idx);
+    var current = try self.pool.activeNodeAt(current_idx);
     current.data = if (inline_val == 0) .midway else inlineToMode(inline_val);
 
     var curr_path = path;
@@ -176,12 +176,12 @@ pub fn create(self: *@This(), path: []const u8, data: Mode, inline_val: u24) !u2
         }
 
         const new_next = try self.acquire();
-        current = try self.fromIdx(current_idx);
+        current = try self.pool.activeNodeAt(current_idx);
         current.bitset.set(next_byte);
         current.indexAt(next_byte).set(new_next);
 
         current_idx = new_next;
-        current = try self.fromIdx(current_idx);
+        current = try self.pool.activeNodeAt(current_idx);
         current.data = .midway;
     }
 
@@ -198,12 +198,12 @@ pub fn create(self: *@This(), path: []const u8, data: Mode, inline_val: u24) !u2
         }
 
         const new_next = try self.acquire();
-        current = try self.fromIdx(current_idx);
+        current = try self.pool.activeNodeAt(current_idx);
         current.bitset.set(next_byte);
         current.indexAt(next_byte).set(new_next);
 
         current_idx = new_next;
-        current = try self.fromIdx(current_idx);
+        current = try self.pool.activeNodeAt(current_idx);
         current.data = .midway;
     }
 }
@@ -220,7 +220,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
     var path = _path;
 
     var curr_idx: u24 = @intCast(self.pool.block().root);
-    var curr = try self.fromIdx(curr_idx);
+    var curr = try self.pool.activeNodeAt(curr_idx);
 
     var parent_idx: u24 = 0;
     var parent_byte: u8 = 0;
@@ -242,7 +242,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
                 .this => |idx| {
                     if (curr.bitset.isSet(idx)) {
                         const sub_idx = curr.indexAt(idx).get();
-                        const sub = try self.fromIdx(sub_idx);
+                        const sub = try self.pool.activeNodeAt(sub_idx);
                         if (sub.radix_len > 0) return error.NotFound;
                         if (@as(u8, @bitCast(sub.data)) == 0) return error.NotFound;
                         const old = sub.data;
@@ -279,7 +279,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
 
                     path = path[curr.radix_len + 1 ..];
                     curr_idx = curr.indexAt(idx).get();
-                    curr = try self.fromIdx(curr_idx);
+                    curr = try self.pool.activeNodeAt(curr_idx);
                     continue;
                 },
                 .diff => return error.NotFound,
@@ -289,7 +289,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
 
     // Refresh curr pointer in case any self.pool.release() inside the
     // del: block triggered a reset (extremely rare - requires cycle).
-    curr = try self.fromIdx(curr_idx);
+    curr = try self.pool.activeNodeAt(curr_idx);
 
     // Determine the highest non-empty node (p_idx) and its parent
     var p_idx: u24 = 0;
@@ -308,7 +308,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
     } else if (curr_idx == top_idx) {
         // top_idx itself is empty.
         if (top_parent_idx != 0) {
-            const top_parent = try self.fromIdx(top_parent_idx);
+            const top_parent = try self.pool.activeNodeAt(top_parent_idx);
             top_parent.bitset.unset(top_parent_byte);
             top_parent.indexAt(top_parent_byte).set(0);
             self.releaseAndLog(top_idx, "empty branch node");
@@ -321,7 +321,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
         return old_data; // No merge needed if the fork itself was pruned
     } else {
         // A descendant is empty. Snip the chain from top_node.
-        const top_node = try self.fromIdx(top_idx);
+        const top_node = try self.pool.activeNodeAt(top_idx);
         if (top_child_byte) |tcb| {
             const chain_head_idx = top_node.indexAt(tcb).get();
             top_node.bitset.unset(tcb);
@@ -335,18 +335,18 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
     }
 
     // If the root itself became empty (e.g., lost its last child), clear it.
-    if (p_parent_idx == 0 and isEmpty(try self.fromIdx(p_idx))) {
+    if (p_parent_idx == 0 and isEmpty(try self.pool.activeNodeAt(p_idx))) {
         self.pool.block().root = 0;
         self.releaseAndLog(p_idx, "empty root node");
         return old_data;
     }
 
-    const prune_node = try self.fromIdx(p_idx);
+    const prune_node = try self.pool.activeNodeAt(p_idx);
 
     // Rule A: Demote inline data promotion
     if (prune_node.valcntbounded(1) == 0 and @as(u8, @bitCast(prune_node.data)) != 0 and prune_node.radix_len == 0) {
         if (p_parent_idx != 0) {
-            const parent_node = try self.fromIdx(p_parent_idx);
+            const parent_node = try self.pool.activeNodeAt(p_parent_idx);
             parent_node.bitset.unset(p_parent_byte);
             parent_node.indexAt(p_parent_byte).set(modeToInline(prune_node.data));
             self.releaseAndLog(p_idx, "inline-demoted node");
@@ -360,7 +360,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
         if (child.is_node) {
             const child_byte = child.idx;
             const left_node_idx = child.val;
-            const left_node = try self.fromIdx(left_node_idx);
+            const left_node = try self.pool.activeNodeAt(left_node_idx);
 
             // A non-leaf child still relies on `.this` routing for its own
             // entries. Prepending radix bytes would turn those lookups into an
@@ -375,7 +375,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
                 // Resolve every fallible pointer before changing either node so
                 // an invalid parent cannot leave the child half-merged.
                 const parent_node = if (p_parent_idx != 0)
-                    try self.fromIdx(p_parent_idx)
+                    try self.pool.activeNodeAt(p_parent_idx)
                 else
                     null;
 
@@ -411,21 +411,42 @@ pub fn get(self: *@This(), path: []const u8) !?Mode {
     }
 }
 
-fn releaseAndLog(self: *@This(), idx: u24, comptime reason: []const u8) void {
-    self.pool.release(idx) catch |err|
-        log.err("failed to reclaim {s} {d}: {t}", .{ reason, idx, err });
-}
+/// Exact-match lookup, no ancestor fallback. Exposed for policy code that
+/// needs to distinguish "no explicit rule" from "inherited ancestor rule".
+pub fn getExact(self: *@This(), _path: []const u8) !?Mode {
+    var path = _path;
+    if (path.len == 0) return null;
+    if (self.pool.block().root == 0) {
+        @branchHint(.cold);
+        return null;
+    }
 
-/// Acquire a brand new node from the pool and init it with the required values
-pub fn acquire(self: *@This()) !u24 {
-    const node_idx = try self.pool.acquire();
-    const node = self.fromIdx(node_idx) catch unreachable;
-    node.* = .{};
-    return node_idx;
-}
+    var node = try self.pool.activeNodeAt(@intCast(self.pool.block().root));
 
-pub fn fromIdx(self: *@This(), idx: u24) Pool.OOB!*Node {
-    return self.pool.activeNodeAt(idx);
+    while (true) switch (node.next(path)) {
+        .exact => {
+            if (@as(u8, @bitCast(node.data)) == 0) return null;
+            return node.data;
+        },
+        .this => |idx| {
+            if (node.bitset.isSet(idx)) {
+                const sub = try node.indexAt(idx).getNode(self);
+                if (sub.radix_len > 0) return null;
+                if (@as(u8, @bitCast(sub.data)) == 0) return null;
+                return sub.data;
+            } else {
+                const val = node.indexAt(idx).get();
+                if (val == 0) return null;
+                return inlineToMode(val);
+            }
+        },
+        .next => |idx| {
+            if (!node.bitset.isSet(idx)) return null;
+            path = path[node.radix_len + 1 ..];
+            node = try node.indexAt(idx).getNode(self);
+        },
+        .diff => return null,
+    };
 }
 
 inline fn modeToInline(data: Mode) u24 {
@@ -440,12 +461,26 @@ inline fn isEmpty(node: *Node) bool {
     return @as(u8, @bitCast(node.data)) == 0 and node.valcntbounded(1) == 0;
 }
 
+fn releaseAndLog(self: *@This(), idx: u24, comptime reason: []const u8) void {
+    self.pool.release(idx) catch |err|
+        log.err("failed to reclaim {s} {d}: {t}", .{ reason, idx, err });
+}
+
+/// Acquire a brand new node from the pool and init it with the required values
+/// Inline to prevent copyinh where the value is overwritten anywats
+inline fn acquire(self: *@This()) !u24 {
+    const node_idx = try self.pool.acquire();
+    const node = self.pool.activeNodeAt(node_idx) catch unreachable;
+    node.* = .{};
+    return node_idx;
+}
+
 /// Releases a whole line of nodes starting from `start_idx`.
 /// Every node in the chain must have at most one subnode.
 fn releaseLine(self: *@This(), start_idx: u24) (Pool.OOB || error{CorruptedTrie})!void {
     var curr_idx = start_idx;
     while (true) {
-        const node = try self.fromIdx(curr_idx);
+        const node = try self.pool.activeNodeAt(curr_idx);
         const count = node.bitset.count();
         if (count == 0) { // Reached the end of the line
             @branchHint(.unlikely);
@@ -491,7 +526,7 @@ pub const Node = extern struct {
         }
 
         pub fn getNode(me: @This(), trie: *Trie) !*Node {
-            return trie.fromIdx(me.get());
+            return trie.pool.activeNodeAt(me.get());
         }
 
         pub fn set(me: @This(), val: u24) void {
@@ -621,51 +656,13 @@ fn ensurePoolInitialized() !@This() {
     return try init(fd);
 }
 
-/// Exact-match lookup, no ancestor fallback. Exposed for policy code that
-/// needs to distinguish "no explicit rule" from "inherited ancestor rule".
-pub fn getExact(self: *@This(), _path: []const u8) !?Mode {
-    var path = _path;
-    if (path.len == 0) return null;
-    if (self.pool.block().root == 0) {
-        @branchHint(.cold);
-        return null;
-    }
-
-    var node = try self.fromIdx(@intCast(self.pool.block().root));
-
-    while (true) switch (node.next(path)) {
-        .exact => {
-            if (@as(u8, @bitCast(node.data)) == 0) return null;
-            return node.data;
-        },
-        .this => |idx| {
-            if (node.bitset.isSet(idx)) {
-                const sub = try node.indexAt(idx).getNode(self);
-                if (sub.radix_len > 0) return null;
-                if (@as(u8, @bitCast(sub.data)) == 0) return null;
-                return sub.data;
-            } else {
-                const val = node.indexAt(idx).get();
-                if (val == 0) return null;
-                return inlineToMode(val);
-            }
-        },
-        .next => |idx| {
-            if (!node.bitset.isSet(idx)) return null;
-            path = path[node.radix_len + 1 ..];
-            node = try node.indexAt(idx).getNode(self);
-        },
-        .diff => return null,
-    };
-}
-
 fn dumpNode(self: *@This(), idx: u24, visited: *std.AutoHashMap(u24, void), depth: usize) !void {
     if (idx == 0) return;
 
     const gop = try visited.getOrPut(idx);
     if (gop.found_existing) return;
 
-    const node = try self.fromIdx(idx);
+    const node = try self.pool.activeNodeAt(idx);
 
     // Safe indenting: up to 40 levels deep (80 spaces)
     const indent_buf = " " ** 80;
