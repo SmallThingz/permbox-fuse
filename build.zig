@@ -18,13 +18,30 @@ pub fn build(b: *std.Build) void {
     const logging_options = b.addOptions();
     logging_options.addOption([]const u8, "module_name", "permtrie");
 
-    const mod = b.addModule("permtrie", .{
+    const trie_module = b.addModule("permtrie", .{
         .root_source_file = b.path("src/trie/trie.zig"),
         .target = compile_target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "logging_options", .module = logging_options.createModule() },
         },
+    });
+
+    const permbox_module = b.addModule("permbox", .{
+        .root_source_file = b.path("src/permbox.zig"),
+        .target = compile_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "permtrie", .module = trie_module },
+        },
+    });
+    permbox_module.link_libc = true;
+    permbox_module.addIncludePath(b.path("src"));
+    permbox_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+    permbox_module.linkSystemLibrary("fuse3", .{});
+    permbox_module.addCSourceFile(.{
+        .file = b.path("src/fuse_shim.c"),
+        .flags = &.{"-std=c11"},
     });
 
     const exe = b.addExecutable(.{
@@ -34,17 +51,9 @@ pub fn build(b: *std.Build) void {
             .target = compile_target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "permtrie", .module = mod },
+                .{ .name = "permbox", .module = permbox_module },
             },
         }),
-    });
-    exe.root_module.link_libc = true;
-    exe.root_module.addIncludePath(b.path("src"));
-    exe.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
-    exe.root_module.linkSystemLibrary("fuse3", .{});
-    exe.root_module.addCSourceFile(.{
-        .file = b.path("src/fuse_shim.c"),
-        .flags = &.{"-std=c11"},
     });
 
     b.installArtifact(exe);
@@ -61,7 +70,7 @@ pub fn build(b: *std.Build) void {
         .mode = .simple,
     };
     const trie_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = trie_module,
         .test_runner = test_runner,
     });
     test_step.dependOn(&b.addRunArtifact(trie_tests).step);
@@ -71,7 +80,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/policy.zig"),
             .target = compile_target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "permtrie", .module = mod }},
+            .imports = &.{.{ .name = "permtrie", .module = trie_module }},
         }),
         .test_runner = test_runner,
     });
@@ -92,7 +101,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fs.zig"),
             .target = compile_target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "permtrie", .module = mod }},
+            .imports = &.{.{ .name = "permtrie", .module = trie_module }},
         }),
         .test_runner = test_runner,
     });
@@ -105,4 +114,21 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c11"},
     });
     test_step.dependOn(&b.addRunArtifact(fs_tests).step);
+
+    const overlay_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/overlay.zig"),
+            .target = compile_target,
+            .optimize = optimize,
+        }),
+        .test_runner = test_runner,
+    });
+    overlay_tests.root_module.link_libc = true;
+    test_step.dependOn(&b.addRunArtifact(overlay_tests).step);
+
+    const api_tests = b.addTest(.{
+        .root_module = permbox_module,
+        .test_runner = test_runner,
+    });
+    test_step.dependOn(&b.addRunArtifact(api_tests).step);
 }
