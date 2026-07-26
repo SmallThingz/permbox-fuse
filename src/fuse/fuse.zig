@@ -39,8 +39,14 @@ pub const FuseFileInfo = packed struct {
     compat_flags: u64,
     reserved0: u64,
     reserved1: u64,
-
 };
+
+comptime {
+    // These accessors depend on matching libfuse's private bitfield layout.
+    // Zig translates the C bitfield struct as opaque, so enforce the ABI size
+    // specified by the libfuse 3.18 layout mirrored above.
+    std.debug.assert(@sizeOf(FuseFileInfo) == 64);
+}
 
 /// Mirror of the initial `unsigned` fields in `struct fuse_conn_info` that
 /// includes `max_backing_stack_depth` (which the C translation treats as
@@ -67,16 +73,16 @@ pub fn connSetBackingDepth(conn: *c.struct_fuse_conn_info, depth: u32) void {
 /// Helpers for `struct fuse_file_info` fields that are bitfields or need casts.
 pub const FileInfo = struct {
     pub fn flags(fi: *const c.struct_fuse_file_info) i32 {
-        return @as(*const align(1) FuseFileInfo, @ptrCast(fi)).flags;
+        return @as(*align(1) const FuseFileInfo, @ptrCast(fi)).flags;
     }
     pub fn fh(fi: *const c.struct_fuse_file_info) u64 {
-        return @as(*const align(1) FuseFileInfo, @ptrCast(fi)).fh;
+        return @as(*align(1) const FuseFileInfo, @ptrCast(fi)).fh;
     }
     pub fn setFh(fi: *c.struct_fuse_file_info, val: u64) void {
         @as(*align(1) FuseFileInfo, @ptrCast(fi)).fh = val;
     }
     pub fn backingId(fi: *const c.struct_fuse_file_info) i32 {
-        return @as(*const align(1) FuseFileInfo, @ptrCast(fi)).backing_id;
+        return @as(*align(1) const FuseFileInfo, @ptrCast(fi)).backing_id;
     }
     pub fn setBackingId(fi: *c.struct_fuse_file_info, id: i32) void {
         @as(*align(1) FuseFileInfo, @ptrCast(fi)).backing_id = id;

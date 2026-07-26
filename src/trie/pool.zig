@@ -26,8 +26,14 @@ pub fn init(fd: fd_t) InitError!@This() {
 
     if (!initialized) {
         @branchHint(.unlikely);
-        if (linux.ftruncate(fd, @intCast(len)) != 0) {
-            log.err(@src(), "file needed truncation but resize failed; fd={}, oldsize={}, newsize={}", .{ fd, _len, len });
+        const rc = linux.ftruncate(fd, @intCast(len));
+        if (rc != 0) {
+            log.err(@src(), "file needed truncation but resize failed; errno={}, fd={}, oldsize={}, newsize={}", .{
+                linux.errno(rc),
+                fd,
+                _len,
+                len,
+            });
             return TruncateError.ResizeFailed;
         }
     }
@@ -105,7 +111,7 @@ pub fn activeNodeAt(self: *@This(), idx: u24) OOB!*trie.Node {
     }
     const node = try self.nodeAt(idx);
     if (node.indexAt(0xff).get() == idx) {
-        log.err(@src(), "tried to access free'd node as active; index={}, freefrom={}, memlen={}", .{ idx, self.block().free_from, self.mem.len });
+        log.err(@src(), "tried to access a freed node as active; index={}, freefrom={}, memlen={}", .{ idx, self.block().free_from, self.mem.len });
         return OOB.OutOfBounds;
     }
     return node;
@@ -143,7 +149,7 @@ fn validate(self: *@This()) ValidateError!void {
     }
     const echar = @as(*const u8, @ptrCast(&blk.endian)).*;
     if (echar != @intFromEnum(Endian.big) and echar != @intFromEnum(Endian.little)) {
-        log.err(@src(), "file endian-ness enum has invalid valued; file={}, valid={},{}", .{ echar, @intFromEnum(Endian.big), @intFromEnum(Endian.little) });
+        log.err(@src(), "file endianness enum has an invalid value; file={}, valid={},{}", .{ echar, @intFromEnum(Endian.big), @intFromEnum(Endian.little) });
         return VE.InvalidEndian;
     }
     if (blk.endian != Endian.default) {
@@ -186,8 +192,14 @@ pub const SwitchEndianError = TruncateError || StatxError || posix.MMapError;
 pub fn switchEndian(self: *@This(), dest_fd: fd_t) SwitchEndianError!void {
     const _len = try getSize(dest_fd);
     if (_len != self.mem.len) {
-        if (linux.ftruncate(dest_fd, @intCast(self.mem.len)) != 0) {
-            log.err(@src(), "file needed truncation but resize failed; fd={}, oldsize={}, newsize={}", .{ dest_fd, _len, self.mem.len });
+        const rc = linux.ftruncate(dest_fd, @intCast(self.mem.len));
+        if (rc != 0) {
+            log.err(@src(), "file needed truncation but resize failed; errno={}, fd={}, oldsize={}, newsize={}", .{
+                linux.errno(rc),
+                dest_fd,
+                _len,
+                self.mem.len,
+            });
             return TruncateError.ResizeFailed;
         }
     }
@@ -287,8 +299,14 @@ pub fn acquire(self: *@This()) AcquireError!u24 {
 const TruncateError = error{ResizeFailed};
 const ResizeError = TruncateError || posix.MRemapError;
 fn resize(self: *@This(), new_len: usize) !void {
-    if (linux.ftruncate(self.fd, @intCast(new_len)) != 0) {
-        log.err(@src(), "failed to resize file; fd={}, oldlen={}, newlen={}", .{ self.fd, self.mem.len, new_len });
+    const rc = linux.ftruncate(self.fd, @intCast(new_len));
+    if (rc != 0) {
+        log.err(@src(), "failed to resize file; errno={}, fd={}, oldlen={}, newlen={}", .{
+            linux.errno(rc),
+            self.fd,
+            self.mem.len,
+            new_len,
+        });
         return ResizeError.ResizeFailed;
     }
     self.mem = posix.mremap(self.mem.ptr, self.mem.len, new_len, .{ .MAYMOVE = true }, null) catch |e| {
@@ -363,6 +381,10 @@ pub const Block = extern struct {
         return self.endian == Endian.default;
     }
 };
+
+comptime {
+    std.debug.assert(@sizeOf(Block) <= 1 << 10);
+}
 
 // =========================================================================
 // Pool Tests

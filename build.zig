@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     fuse_logging_options.addOption([]const u8, "module_name", "permbox.fuse");
 
     const trie_module = b.addModule("permtrie", .{
-        .root_source_file = b.path("src/trie/trie.zig"),
+        .root_source_file = b.path("src/trie/root.zig"),
         .target = compile_target,
         .optimize = optimize,
         .imports = &.{

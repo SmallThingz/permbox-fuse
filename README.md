@@ -24,8 +24,8 @@ policy behavior using userspace I/O.
 
 ## Embedding
 
-The package exports both `permfuse` (the driver API) and `permtrie` (the raw
-trie). A dependent `build.zig` can import the driver with:
+The package exports both `permfuse` (the driver API) and `permtrie` (the
+concurrency-safe trie). A dependent `build.zig` can import the driver with:
 
 ```zig
 const dep = b.dependency("permbox_fuse", .{
@@ -35,8 +35,9 @@ const dep = b.dependency("permbox_fuse", .{
 exe.root_module.addImport("permfuse", dep.module("permfuse"));
 ```
 
-Initialize the driver in-place because its FUSE state retains pointers to the
-driver's `std.Io.RwLock` and overlay session:
+Initialize the driver in-place and do not move it while `mount` is running,
+because libfuse retains a pointer to its callback state. Configuration paths
+are copied during initialization:
 
 ```zig
 const std = @import("std");

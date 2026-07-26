@@ -19,8 +19,8 @@ pub const W = Mode.W;
 /// Global policy trie instance. Initialised via init().
 var trie: permtrie = undefined;
 
-pub fn init(fd: std.c.fd_t) !void {
-    trie = try permtrie.init(fd);
+pub fn init(io: std.Io, fd: std.c.fd_t) !void {
+    trie = try permtrie.init(io, fd);
 }
 
 pub fn deinit() void {
@@ -55,6 +55,27 @@ pub fn remove(path: []const u8) !Mode {
 /// Returns only an explicit rule, without ancestor inheritance.
 pub fn get(path: []const u8) !?Mode {
     return trie.getExact(path);
+}
+
+pub fn lockUpdates() void {
+    trie.lockWrite();
+}
+
+pub fn unlockUpdates() void {
+    trie.unlockWrite();
+}
+
+pub fn evaluateLocked(path: []const u8) !?Mode {
+    if (path.len == 0) return null;
+    return trie.getLocked(path);
+}
+
+pub fn setLocked(path: []const u8, mode: Mode) !void {
+    try trie.addLocked(path, mode);
+}
+
+pub fn removeLocked(path: []const u8) !Mode {
+    return trie.delLocked(path);
 }
 
 /// Path is visible in the namespace (raw or virtual).
@@ -116,7 +137,7 @@ var g_pool_prepared = false;
 fn preparePool() !void {
     if (!g_pool_prepared) {
         const fd = try std.posix.memfd_create("policy-test", 0);
-        trie = try permtrie.init(fd);
+        trie = try permtrie.init(std.testing.io, fd);
         g_pool_prepared = true;
     } else {
         trie.reset();

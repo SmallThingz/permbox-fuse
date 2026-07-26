@@ -28,29 +28,16 @@ pub fn deinit(me: *@This()) void {
 
 /// Insert or replace `path` with `data`. Takes the write lock, then syncs.
 pub fn add(me: *@This(), path: []const u8, data: Mode) !void {
-    {
-        me.lock.lockUncancelable(me.io);
-        defer me.lock.unlock(me.io);
-        me.trie.add(path, data) catch |e| {
-            log.err(@src(), "error while adding/setting the tire node data: error={}, path={s}, data={}", .{ e, path, data });
-            return e;
-        };
-    }
-    me.syncAndLog();
+    me.lockWrite();
+    defer me.unlockWrite();
+    try me.addLocked(path, data);
 }
 
 /// Remove `path` and return its previous value. Takes the write lock, then syncs.
 pub fn del(me: *@This(), path: []const u8) !Mode {
-    const old = old: {
-        me.lock.lockUncancelable(me.io);
-        defer me.lock.unlock(me.io);
-        break :old me.trie.del(path) catch |e| {
-            log.err(@src(), "error while removing the tire node data: error={}, path={s}", .{ e, path });
-            return e;
-        };
-    };
-    me.syncAndLog();
-    return old;
+    me.lockWrite();
+    defer me.unlockWrite();
+    return me.delLocked(path);
 }
 
 /// Return the nearest slash-delimited ancestor rule for `path`. Read-only, shared lock.
@@ -60,6 +47,48 @@ pub fn get(me: *@This(), path: []const u8) !?Mode {
     return me.trie.get(path);
 }
 
+/// Return only the rule stored at `path`, without ancestor inheritance.
+pub fn getExact(me: *@This(), path: []const u8) !?Mode {
+    me.lock.lockSharedUncancelable(me.io);
+    defer me.lock.unlockShared(me.io);
+    return me.trie.getExact(path);
+}
+
+/// Begin an atomic multi-operation update. The Locked methods below may only
+/// be called while this write lock is held.
+pub fn lockWrite(me: *@This()) void {
+    me.lock.lockUncancelable(me.io);
+}
+
+pub fn unlockWrite(me: *@This()) void {
+    me.lock.unlock(me.io);
+}
+
+pub fn getLocked(me: *@This(), path: []const u8) !?Mode {
+    return me.trie.get(path);
+}
+
+pub fn getExactLocked(me: *@This(), path: []const u8) !?Mode {
+    return me.trie.getExact(path);
+}
+
+pub fn addLocked(me: *@This(), path: []const u8, data: Mode) !void {
+    me.trie.add(path, data) catch |err| {
+        log.err(@src(), "failed to set trie rule; error={t}, path={s}, mode={}", .{ err, path, data });
+        return err;
+    };
+    me.syncLocked();
+}
+
+pub fn delLocked(me: *@This(), path: []const u8) !Mode {
+    const old = me.trie.del(path) catch |err| {
+        log.err(@src(), "failed to remove trie rule; error={t}, path={s}", .{ err, path });
+        return err;
+    };
+    me.syncLocked();
+    return old;
+}
+
 /// Discard all entries and reset the trie to empty. Takes the write lock.
 pub fn reset(me: *@This()) void {
     me.lock.lockUncancelable(me.io);
@@ -67,10 +96,7 @@ pub fn reset(me: *@This()) void {
     me.trie.reset();
 }
 
-/// Flush pending writes to backing storage (read-locked, called after write ops).
-fn syncAndLog(me: *@This()) void {
-    me.lock.lockSharedUncancelable(me.io);
-    defer me.lock.unlockShared(me.io);
+fn syncLocked(me: *@This()) void {
     me.trie.sync() catch |err|
         log.err(@src(), "failed to persist committed trie update: {t}", .{err});
 }
@@ -78,7 +104,7 @@ fn syncAndLog(me: *@This()) void {
 const testing = std.testing;
 
 test "concurrent readers and writers preserve trie invariants" {
-    var root = try init(std.Io.default, try std.posix.memfd_create("permbox-root-test", 0));
+    var root = try init(std.testing.io, try std.posix.memfd_create("permbox-root-test", 0));
     defer root.deinit();
 
     var failed: std.atomic.Value(bool) = .init(false);
@@ -86,9 +112,9 @@ test "concurrent readers and writers preserve trie invariants" {
 
     const Worker = struct {
         fn run(root_ptr: *Self, first_byte: u8, fail_flag: *std.atomic.Value(bool)) void {
-            var path = [2]u8{ first_byte, 0 };
+            var path = [3]u8{ '/', first_byte, 0 };
             for (0..250) |i| {
-                path[1] = @truncate(i);
+                path[2] = @truncate(i);
                 root_ptr.add(&path, Mode.dir) catch {
                     fail_flag.store(true, .release);
                     return;
