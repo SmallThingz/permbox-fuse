@@ -8,6 +8,10 @@ const log = @import("log.zig");
 pub const Mode = Trie.Mode;
 pub const TextError = serialization.Error;
 
+pub fn parseModeText(flags: []const u8) TextError!Mode {
+    return serialization.parseMode(flags);
+}
+
 /// The unlocked trie instance.
 trie: Trie,
 /// Serialises access to the trie for concurrent I/O.

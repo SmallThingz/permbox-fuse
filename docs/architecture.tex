@@ -103,10 +103,11 @@ and public integration points.
 
 \section{Scope and goals}
 
-The library is the filesystem component used by permbox. It is not an
-installed daemon. A caller creates a driver, loads or updates policy, mounts the
-filesystem, handles permission questions, and applies overlay data when the
-mount has stopped.
+The library is the filesystem component used by permbox. An installed
+interactive command also provides direct mounts and live policy updates. An
+embedding caller can create a driver, load or update policy, mount the
+filesystem, handle permission questions, and apply overlay data when the mount
+has stopped.
 
 The design has five main goals:
 
@@ -239,6 +240,11 @@ The initial mapping is 64 KiB. When the sequential frontier reaches the end,
 the backing file grows and \texttt{mremap} may move the mapping. Code that
 allocates a node therefore stores node indices, not stable pointers. Every
 pointer that may cross a resize point is fetched again from its index.
+
+The header records file endianness. If a valid trie uses the opposite byte
+order, initialization converts it through a temporary memory file, copies the
+native-endian result back to the original mapping, and syncs it before normal
+validation continues.
 
 \begin{figure}[ht]
 \centering
@@ -704,8 +710,9 @@ policy lookup, text round trips, malformed text, path joining, ask approval,
 inode lifetime, overlay session resume, bounded apply, and torn apply-log
 recovery.
 
-The manual mount target is an integration harness. It is not installed as a
-product binary.
+The interactive \texttt{permfuse} command is installed and compiled with the
+LLVM backend. A separate manual mount target remains as a non-installed
+integration harness.
 
 \section{Limits and operational requirements}
 

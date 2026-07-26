@@ -364,8 +364,8 @@ should use `Driver` rather than manipulate session storage directly.
 It returns `permfuse.options.Config`, whose strings are owned by an internal
 arena. Call `Config.deinit()` when finished.
 
-This parser is optional convenience functionality; the core library does not
-require a standalone executable.
+This parser is also used by the installed interactive `permfuse` command. The
+core library can still be embedded without invoking that command.
 
 ### Low-level C namespace
 

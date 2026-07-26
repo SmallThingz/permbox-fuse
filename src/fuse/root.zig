@@ -15,6 +15,7 @@ pub const AskFn = filesystem.AskFn;
 pub const OverlaySession = overlay.Session;
 pub const ApplyOptions = overlay.ApplyOptions;
 pub const ApplyResult = overlay.ApplyResult;
+pub const parseModeText = permtrie.parseModeText;
 
 pub const options = @import("options.zig");
 

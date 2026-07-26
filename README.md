@@ -1,7 +1,8 @@
 # permfuse
 
-Embeddable, policy-aware low-level FUSE 3 library for Linux. It is the
-filesystem driver used by permbox, not a standalone daemon or application.
+Embeddable, policy-aware low-level FUSE 3 library for Linux, with an installed
+interactive `permfuse` command for direct mounts and live policy updates. It is
+the filesystem driver used by permbox.
 It maps a backing directory into one mount and evaluates the memory-mapped
 permission trie for namespace and open operations.
 
@@ -117,9 +118,45 @@ session and calling it again resumes at the first uncheckpointed entry.
 `OverlaySession.open` exposes the same recovery/apply machinery without
 mounting FUSE.
 
+## Interactive CLI
+
+Build and install the LLVM-backed CLI:
+
+```sh
+zig build
+```
+
+Start a mount:
+
+```sh
+zig-out/bin/permfuse \
+  --backing=/absolute/backing/root \
+  --policy=/absolute/policy.trie \
+  --state=/absolute/state/directory \
+  /absolute/mountpoint
+```
+
+The mountpoint is created when missing. While mounted, the prompt accepts:
+
+```text
+show
+get /path
+set /path access,ALWAYS-allow-r,overlay-w,allow-x
+del /path
+load policy.conf
+save policy.conf
+unmount
+apply 100 remove
+quit
+```
+
+Policy updates take effect for new opens. Handles with an `ask` snapshot
+re-read policy before issuing a permission request. The CLI automatically
+converts a valid opposite-endian trie file in place when opening it.
+
 ## Manual mount harness
 
-There is no installed executable. For manual integration testing only:
+An additional non-installed integration harness remains available:
 
 ```sh
 zig build run-mount-test -- \

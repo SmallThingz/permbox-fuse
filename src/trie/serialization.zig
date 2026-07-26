@@ -224,7 +224,7 @@ fn joinPath(allocator: std.mem.Allocator, parent: []const u8, key: []const u8) E
     return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ parent, separator, key }) catch error.OutOfMemory;
 }
 
-fn parseMode(flags: []const u8) Error!Mode {
+pub fn parseMode(flags: []const u8) Error!Mode {
     var mode = Mode.dir;
     var tokens = std.mem.splitScalar(u8, flags, ',');
     while (tokens.next()) |raw| {

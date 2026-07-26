@@ -44,8 +44,22 @@ pub fn build(b: *std.Build) void {
     permbox_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     permbox_module.linkSystemLibrary("fuse3", .{});
 
-    // This repository is consumed as a module. Keep the executable as an
-    // opt-in integration harness only; it is deliberately not installed.
+    const cli = b.addExecutable(.{
+        .name = "permfuse",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli.zig"),
+            .target = compile_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "permfuse", .module = permbox_module },
+            },
+        }),
+        .use_llvm = true,
+    });
+    b.installArtifact(cli);
+
+    // Keep the manual harness as an additional non-installed integration
+    // target.
     const mount_test = b.addExecutable(.{
         .name = "permfuse-mount-test",
         .root_module = b.createModule(.{

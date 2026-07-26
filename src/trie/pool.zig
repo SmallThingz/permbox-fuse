@@ -16,7 +16,8 @@ fd: fd_t,
 /// The mem for the blox
 mem: []align(page_size_min) u8,
 
-pub const InitError = StatxError || TruncateError || MMapError || OOB || ValidateError;
+pub const EndianFixError = SwitchEndianError || posix.MemFdCreateError || posix.MSyncError;
+pub const InitError = StatxError || TruncateError || MMapError || OOB || ValidateError || EndianFixError;
 /// This struct now owns the fd and the fd will be released when upon deinit.
 /// If this errors; the fd remains valid
 pub fn init(fd: fd_t) InitError!@This() {
@@ -49,10 +50,27 @@ pub fn init(fd: fd_t) InitError!@This() {
         const blk = self.block();
         blk.* = .{ .free_from = 1, .free_idx = 0, .root = 0 };
     } else {
-        try self.validate();
+        self.validate() catch |err| switch (err) {
+            error.EndianMismatch => {
+                log.warn(@src(), "trie endianness differs from host; converting in place; fd={}", .{fd});
+                try self.fixEndian();
+                try self.validate();
+            },
+            else => return err,
+        };
     }
 
     return self;
+}
+
+fn fixEndian(self: *@This()) EndianFixError!void {
+    const converted_fd = try posix.memfd_create("permbox-endian-conversion", 0);
+    defer _ = linux.close(converted_fd);
+    try self.switchEndian(converted_fd);
+    const converted = try mapFd(converted_fd, self.mem.len);
+    defer posix.munmap(converted);
+    @memcpy(self.mem, converted);
+    try posix.msync(self.mem, linux.MSF.SYNC);
 }
 
 pub fn reset(self: *@This()) void {
@@ -600,6 +618,22 @@ test "Pool switchEndian" {
     const dest_blk: *Block = @ptrCast(@alignCast(dest_mem.ptr));
     try testing.expect(pool.block().endian != dest_blk.endian);
     try testing.expectEqualStrings("PERMBOXRDXTRIE", &dest_blk.magic);
+}
+
+test "Pool init converts opposite-endian files in place" {
+    var source = try initTestPool();
+    const idx = try source.acquire();
+    (try source.nodeAt(idx)).radix_len = 42;
+    source.block().root = idx;
+
+    const converted_fd = try posix.memfd_create("pool-opposite-endian", 0);
+    try source.switchEndian(converted_fd);
+    source.deinit();
+
+    var reopened = try init(converted_fd);
+    defer reopened.deinit();
+    try testing.expectEqual(Endian.default, reopened.block().endian);
+    try testing.expectEqual(@as(u8, 42), (try reopened.nodeAt(idx)).radix_len);
 }
 
 test "Pool full capacity cycle" {
