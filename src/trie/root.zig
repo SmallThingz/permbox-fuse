@@ -2,9 +2,11 @@
 //! Holds the RwLock and the Io for external synchronisation.
 const std = @import("std");
 const Trie = @import("trie.zig");
+const serialization = @import("serialization.zig");
 const log = @import("log.zig");
 
 pub const Mode = Trie.Mode;
+pub const TextError = serialization.Error;
 
 /// The unlocked trie instance.
 trie: Trie,
@@ -52,6 +54,35 @@ pub fn getExact(me: *@This(), path: []const u8) !?Mode {
     me.lock.lockSharedUncancelable(me.io);
     defer me.lock.unlockShared(me.io);
     return me.trie.getExact(path);
+}
+
+/// Serialize every explicit binary-trie rule to canonical permbox `fs` text.
+pub fn toText(me: *@This(), allocator: std.mem.Allocator) ![]u8 {
+    me.lock.lockSharedUncancelable(me.io);
+    defer me.lock.unlockShared(me.io);
+    const rules = try me.trie.collectRules(allocator);
+    defer {
+        for (rules) |rule| allocator.free(rule.path);
+        allocator.free(rules);
+    }
+    return serialization.format(allocator, rules);
+}
+
+/// Replace the binary trie with rules parsed from permbox `fs` text.
+/// Parsing completes before the write lock is taken. Once mutation starts,
+/// readers remain blocked until all rules have been installed and synced.
+pub fn replaceFromText(me: *@This(), allocator: std.mem.Allocator, text: []const u8) !void {
+    const rules = try serialization.parse(allocator, text);
+    defer serialization.freeRules(allocator, rules);
+
+    me.lockWrite();
+    defer me.unlockWrite();
+    me.trie.reset();
+    for (rules) |rule| me.trie.add(rule.path, rule.mode) catch |err| {
+        log.err(@src(), "failed to import parsed trie rule; error={t}, path={s}", .{ err, rule.path });
+        return err;
+    };
+    me.syncLocked();
 }
 
 /// Begin an atomic multi-operation update. The Locked methods below may only
@@ -142,4 +173,57 @@ test "concurrent readers and writers preserve trie invariants" {
     for (threads) |thread| thread.join();
 
     try testing.expect(!failed.load(.acquire));
+}
+
+test "text serialization round trips every current mode field" {
+    var root = try init(std.testing.io, try std.posix.memfd_create("permbox-text-roundtrip", 0));
+    defer root.deinit();
+
+    const modes = [_]Mode{
+        .{ .k = .visible_raw, .r = .deny, .w = .deny, .x = .ask },
+        .{ .k = .visible_virtual, .r = .ask, .w = .allow, .x = .allow },
+        .{ .k = .invisible, .r = .allow, .w = .overlay, .x = .deny },
+    };
+    try root.add("/a", modes[0]);
+    try root.add("/a/quoted\"\\name", modes[1]);
+    try root.add("/z", modes[2]);
+
+    const text = try root.toText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    root.reset();
+    try root.replaceFromText(std.testing.allocator, text);
+
+    try std.testing.expectEqual(@as(u8, @bitCast(modes[0])), @as(u8, @bitCast((try root.getExact("/a")).?)));
+    try std.testing.expectEqual(@as(u8, @bitCast(modes[1])), @as(u8, @bitCast((try root.getExact("/a/quoted\"\\name")).?)));
+    try std.testing.expectEqual(@as(u8, @bitCast(modes[2])), @as(u8, @bitCast((try root.getExact("/z")).?)));
+}
+
+test "text import accepts nested spec syntax and combined flags" {
+    var root = try init(std.testing.io, try std.posix.memfd_create("permbox-text-nested", 0));
+    defer root.deinit();
+    try root.replaceFromText(std.testing.allocator,
+        \\fs {
+        \\  "/": access,overlay-w,ALWAYS-allow-rx {
+        \\    "home/a": empty,allow-rw,deny-x
+        \\    ".ssh": no-access,deny-rwx
+        \\  }
+        \\}
+    );
+    const child = (try root.getExact("/home/a")).?;
+    try std.testing.expectEqual(Mode.K.visible_virtual, child.k);
+    try std.testing.expectEqual(Mode.A.ask, child.r);
+    try std.testing.expectEqual(Mode.W.ask, child.w);
+    try std.testing.expectEqual(Mode.A.deny, child.x);
+    try std.testing.expectEqual(Mode.K.invisible, (try root.getExact("/.ssh")).?.k);
+}
+
+test "invalid text does not alter the binary trie" {
+    var root = try init(std.testing.io, try std.posix.memfd_create("permbox-text-invalid", 0));
+    defer root.deinit();
+    try root.add("/kept", Mode.dir);
+    try std.testing.expectError(error.InvalidFlag, root.replaceFromText(
+        std.testing.allocator,
+        "\"/bad\":access,unknown-flag",
+    ));
+    try std.testing.expect((try root.getExact("/kept")) != null);
 }

@@ -31,6 +31,66 @@ pub fn sync(self: *@This()) !void {
     try self.pool.sync();
 }
 
+pub const Rule = struct {
+    path: []u8,
+    mode: Mode,
+};
+
+/// Return every explicit rule in bytewise path order. The caller owns both
+/// the returned slice and each rule path.
+pub fn collectRules(self: *@This(), allocator: std.mem.Allocator) ![]Rule {
+    var rules: std.ArrayList(Rule) = .empty;
+    errdefer {
+        for (rules.items) |rule| allocator.free(rule.path);
+        rules.deinit(allocator);
+    }
+    if (self.pool.block().root == 0) return rules.toOwnedSlice(allocator);
+
+    var path: std.ArrayList(u8) = .empty;
+    defer path.deinit(allocator);
+    try self.collectNode(allocator, @intCast(self.pool.block().root), &path, &rules);
+    return rules.toOwnedSlice(allocator);
+}
+
+fn collectNode(
+    self: *@This(),
+    allocator: std.mem.Allocator,
+    node_idx: u24,
+    path: *std.ArrayList(u8),
+    rules: *std.ArrayList(Rule),
+) !void {
+    const original_len = path.items.len;
+    defer path.shrinkRetainingCapacity(original_len);
+    const node = try self.pool.activeNodeAt(node_idx);
+    try path.appendSlice(allocator, node.radix_str[0..node.radix_len]);
+    if (@as(u8, @bitCast(node.data)) != 0) {
+        const owned = try allocator.dupe(u8, path.items);
+        errdefer allocator.free(owned);
+        try rules.append(allocator, .{ .path = owned, .mode = node.data });
+    }
+
+    for (0..children_count) |raw_byte| {
+        const byte: u8 = @intCast(raw_byte);
+        if (node.bitset.isSet(byte)) {
+            try path.append(allocator, byte);
+            const child_idx = node.indexAt(byte).get();
+            try self.collectNode(allocator, child_idx, path, rules);
+            path.shrinkRetainingCapacity(original_len + node.radix_len);
+        } else {
+            const inline_value = node.indexAt(byte).get();
+            if (inline_value == 0) continue;
+            try path.append(allocator, byte);
+            const owned = try allocator.dupe(u8, path.items);
+            errdefer allocator.free(owned);
+            try rules.append(allocator, .{
+                .path = owned,
+                .mode = inlineToMode(inline_value),
+            });
+            path.shrinkRetainingCapacity(original_len + node.radix_len);
+        }
+    }
+}
+
 /// Insert or replace a path. No locking & the caller must sync after calling.
 pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
     std.debug.assert(_path.len != 0);

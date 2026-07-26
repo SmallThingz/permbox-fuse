@@ -57,6 +57,14 @@ pub fn get(path: []const u8) !?Mode {
     return trie.getExact(path);
 }
 
+pub fn toText(allocator: std.mem.Allocator) ![]u8 {
+    return trie.toText(allocator);
+}
+
+pub fn replaceFromText(allocator: std.mem.Allocator, text: []const u8) !void {
+    try trie.replaceFromText(allocator, text);
+}
+
 pub fn lockUpdates() void {
     trie.lockWrite();
 }

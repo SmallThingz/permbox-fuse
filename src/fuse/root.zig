@@ -154,6 +154,20 @@ pub const Driver = struct {
         return policy.remove(path);
     }
 
+    pub fn policyToText(self: *Driver, allocator: std.mem.Allocator) ![]u8 {
+        _ = self;
+        return policy.toText(allocator);
+    }
+
+    pub fn replacePolicyFromText(
+        self: *Driver,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+    ) !void {
+        _ = self;
+        try policy.replaceFromText(allocator, text);
+    }
+
     /// Applies a group under one write-side critical section. If an allocation
     /// or persistence error occurs, preceding updates remain committed.
     pub fn updateRules(self: *Driver, updates: []const RuleUpdate) !void {
