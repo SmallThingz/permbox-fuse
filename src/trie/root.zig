@@ -6,10 +6,14 @@ const log = @import("log.zig");
 
 pub const Mode = Trie.Mode;
 
+/// The unlocked trie instance.
 trie: Trie,
+/// Serialises access to the trie for concurrent I/O.
 lock: std.Io.RwLock = .init,
+/// The I/O backend used by the lock primitives.
 io: std.Io,
 
+/// Open or create a trie backed by `fd`.
 pub fn init(io: std.Io, fd: std.c.fd_t) !@This() {
     return .{
         .trie = try Trie.init(fd),
@@ -17,10 +21,12 @@ pub fn init(io: std.Io, fd: std.c.fd_t) !@This() {
     };
 }
 
+/// Release all pool resources.
 pub fn deinit(me: *@This()) void {
     me.trie.deinit();
 }
 
+/// Insert or replace `path` with `data`. Takes the write lock, then syncs.
 pub fn add(me: *@This(), path: []const u8, data: Mode) !void {
     {
         me.lock.lockUncancelable(me.io);
@@ -30,6 +36,7 @@ pub fn add(me: *@This(), path: []const u8, data: Mode) !void {
     me.syncAndLog();
 }
 
+/// Remove `path` and return its previous value. Takes the write lock, then syncs.
 pub fn del(me: *@This(), path: []const u8) !Mode {
     const old = old: {
         me.lock.lockUncancelable(me.io);
@@ -40,18 +47,21 @@ pub fn del(me: *@This(), path: []const u8) !Mode {
     return old;
 }
 
+/// Return the nearest slash-delimited ancestor rule for `path`. Read-only, shared lock.
 pub fn get(me: *@This(), path: []const u8) !?Mode {
     me.lock.lockSharedUncancelable(me.io);
     defer me.lock.unlockShared(me.io);
     return me.trie.get(path);
 }
 
+/// Discard all entries and reset the trie to empty. Takes the write lock.
 pub fn reset(me: *@This()) void {
     me.lock.lockUncancelable(me.io);
     defer me.lock.unlock(me.io);
     me.trie.reset();
 }
 
+/// Flush pending writes to backing storage (read-locked, called after write ops).
 fn syncAndLog(me: *@This()) void {
     me.lock.lockSharedUncancelable(me.io);
     defer me.lock.unlockShared(me.io);
