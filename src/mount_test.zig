@@ -4,11 +4,17 @@ const permfuse = @import("permfuse");
 pub fn getLogger(comptime module_name: []const u8) type {
     return struct {
         pub fn log(
+            comptime src: std.builtin.SourceLocation,
             comptime level: std.log.Level,
             comptime format: []const u8,
             args: anytype,
         ) void {
-            std.log.defaultLog(level, .default, "(" ++ module_name ++ ") " ++ format, args);
+            std.log.defaultLog(
+                level,
+                .default,
+                "(" ++ module_name ++ ") {s}:{d}:{d} in {s}: " ++ format,
+                .{ src.file, src.line, src.column, src.fn_name } ++ args,
+            );
         }
     };
 }

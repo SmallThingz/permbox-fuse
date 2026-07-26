@@ -11,11 +11,15 @@ pub const std_options: std.Options = .{
 pub fn getLogger(comptime module_name: []const u8) type {
     return struct {
         pub fn log(
+            comptime src: std.builtin.SourceLocation,
             comptime level: std.log.Level,
             comptime format: []const u8,
             args: anytype,
         ) void {
-            std.debug.print(level.asText() ++ "(" ++ module_name ++ "): " ++ format ++ "\n", args);
+            std.debug.print(
+                level.asText() ++ "(" ++ module_name ++ ") {s}:{d}:{d} in {s}: " ++ format ++ "\n",
+                .{ src.file, src.line, src.column, src.fn_name } ++ args,
+            );
         }
     };
 }

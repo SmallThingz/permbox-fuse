@@ -31,7 +31,10 @@ pub fn add(me: *@This(), path: []const u8, data: Mode) !void {
     {
         me.lock.lockUncancelable(me.io);
         defer me.lock.unlock(me.io);
-        try me.trie.add(path, data);
+        me.trie.add(path, data) catch |e| {
+            log.err(@src(), "error while adding/setting the tire node data: error={}, path={s}, data={}", .{e, path, data});
+            return e;
+        };
     }
     me.syncAndLog();
 }
@@ -41,7 +44,10 @@ pub fn del(me: *@This(), path: []const u8) !Mode {
     const old = old: {
         me.lock.lockUncancelable(me.io);
         defer me.lock.unlock(me.io);
-        break :old try me.trie.del(path);
+        break :old me.trie.del(path) catch |e| {
+            log.err(@src(), "error while removing the tire node data: error={}, path={s}", .{e, path});
+            return e;
+        };
     };
     me.syncAndLog();
     return old;
@@ -66,7 +72,7 @@ fn syncAndLog(me: *@This()) void {
     me.lock.lockSharedUncancelable(me.io);
     defer me.lock.unlockShared(me.io);
     me.trie.sync() catch |err|
-        log.err("failed to persist committed trie update: {t}", .{err});
+        log.err(@src(), "failed to persist committed trie update: {t}", .{err});
 }
 
 const testing = std.testing;

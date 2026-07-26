@@ -158,7 +158,7 @@ pub fn add(self: *@This(), _path: []const u8, data: Mode) !void {
 pub fn create(self: *@This(), path: []const u8, data: Mode, inline_val: u24) !u24 {
     const new_idx = try self.acquire();
     errdefer self.releaseLine(new_idx) catch |err|
-        log.err("failed to reclaim unpublished trie chain at node {d}: {t}", .{ new_idx, err });
+        log.err(@src(), "failed to reclaim unpublished trie chain at node {d}: {t}", .{ new_idx, err });
 
     var current_idx = new_idx;
     var current = try self.pool.activeNodeAt(current_idx);
@@ -327,7 +327,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
             top_node.bitset.unset(tcb);
             top_node.indexAt(tcb).set(0);
             self.releaseLine(chain_head_idx) catch |err|
-                log.err("failed to reclaim detached trie chain at node {d}: {t}", .{ chain_head_idx, err });
+                log.err(@src(), "failed to reclaim detached trie chain at node {d}: {t}", .{ chain_head_idx, err });
         }
         p_idx = top_idx;
         p_parent_idx = top_parent_idx;
@@ -463,7 +463,7 @@ inline fn isEmpty(node: *Node) bool {
 
 fn releaseAndLog(self: *@This(), idx: u24, comptime reason: []const u8) void {
     self.pool.release(idx) catch |err|
-        log.err("failed to reclaim {s} {d}: {t}", .{ reason, idx, err });
+        log.err(@src(), "failed to reclaim {s} {d}: {t}", .{ reason, idx, err });
 }
 
 /// Acquire a brand new node from the pool and init it with the required values
@@ -1602,4 +1602,3 @@ test "trie get returns nearest slash-delimited ancestor" {
     try expectModeEqual(Mode.dir, (try t.get("/anything")).?);
     try expectModeEqual(Mode.dir, (try t.get("/")).?);
 }
-
