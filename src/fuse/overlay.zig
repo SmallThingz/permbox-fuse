@@ -360,7 +360,18 @@ pub const Session = struct {
         defer _ = c.closedir(directory);
 
         var result: ApplyResult = .{ .applied = 0, .skipped = 0, .remaining = 0 };
-        while (c.readdir(directory)) |entry| {
+        while (true) {
+            // readdir returns null for both EOF and failure. errno must be
+            // cleared immediately before the call to distinguish the two.
+            std.c._errno().* = 0;
+            const entry = c.readdir(directory) orelse {
+                const read_errno: c_int = @intFromEnum(std.c.errno(@as(c_int, -1)));
+                if (read_errno != 0) {
+                    log.err(@src(), "readdir failed during apply scan; errno={}", .{read_errno});
+                    return error.Io;
+                }
+                break;
+            };
             const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
             if (name.len != id_len or name[0] == '.') continue;
             const journal_end = rangeJournalEnd(self, name) catch |err| switch (err) {
@@ -374,7 +385,7 @@ pub const Session = struct {
             // remove_applied permits a later mount to recreate the same id.
             if (journal_start > journal_end) journal_start = 0;
             if (journal_start == journal_end) {
-                if (options.remove_applied and journal_end != 0)
+                if (options.remove_applied)
                     try removeAppliedEntry(self, log_fd, name);
                 result.skipped += 1;
                 continue;
@@ -664,7 +675,35 @@ fn rangeJournalEnd(session: *Session, id: []const u8) Error!u64 {
     id_z[id_len] = 0;
     const fd = c.openat(session.ranges_fd, &id_z, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
     const open_errno: c_int = @intFromEnum(std.c.errno(fd));
-    if (fd < 0) return if (open_errno == c.ENOENT) error.IncompleteEntry else blk: {
+    if (fd < 0 and open_errno == c.ENOENT) {
+        // Publishing the path precedes creating the data and range files. A
+        // missing journal is therefore a harmless interrupted registration
+        // only when no overlay data was published.
+        const data_fd = c.openat(session.data_fd, &id_z, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
+        const data_errno: c_int = @intFromEnum(std.c.errno(data_fd));
+        if (data_fd < 0) {
+            if (data_errno == c.ENOENT) return 0;
+            log.err(@src(), "open orphan overlay data failed; id={s}, errno={}", .{ id, data_errno });
+            return error.Io;
+        }
+        defer _ = c.close(data_fd);
+        var data_stat: c.struct_stat = undefined;
+        const data_stat_rc = c.fstat(data_fd, &data_stat);
+        if (data_stat_rc != 0) {
+            log.err(@src(), "fstat orphan overlay data failed; id={s}, errno={}", .{
+                id,
+                @intFromEnum(std.c.errno(data_stat_rc)),
+            });
+            return error.Io;
+        }
+        if (data_stat.st_size == 0) return 0;
+        log.err(@src(), "range journal missing for non-empty overlay data; id={s}, size={d}", .{
+            id,
+            data_stat.st_size,
+        });
+        return error.InvalidSession;
+    }
+    if (fd < 0) return blk: {
         log.err(@src(), "open range journal failed; id={s}, errno={}", .{ id, open_errno });
         break :blk error.Io;
     };
@@ -1117,6 +1156,36 @@ test "session resumes and bounded apply is idempotent" {
     const missing_ranges_errno = std.c.errno(missing_ranges);
     try std.testing.expectEqual(@as(c_int, -1), missing_ranges);
     try std.testing.expectEqual(std.c.E.NOENT, missing_ranges_errno);
+
+    // A crash after publishing the path record but before creating its range
+    // journal leaves no data that can be applied. It must not keep the session
+    // permanently incomplete.
+    _ = try session.register("/file");
+    const corrupt_data = c.openat(
+        session.data_fd,
+        &id,
+        c.O_WRONLY | c.O_CREAT | c.O_CLOEXEC,
+        @as(c.mode_t, 0o600),
+    );
+    try std.testing.expect(corrupt_data >= 0);
+    try std.testing.expectEqual(@as(isize, 1), c.write(corrupt_data, "x", 1));
+    _ = c.close(corrupt_data);
+    try std.testing.expectError(
+        error.InvalidSession,
+        session.apply(std.testing.allocator, backing_path, .{}),
+    );
+    try std.testing.expectEqual(@as(c_int, 0), c.unlinkat(session.data_fd, &id, 0));
+
+    const orphaned = try session.apply(std.testing.allocator, backing_path, .{
+        .remove_applied = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), orphaned.skipped);
+    try std.testing.expect(orphaned.complete());
+    const missing_path = c.openat(session.paths_fd, &id, c.O_RDONLY | c.O_CLOEXEC);
+    const missing_path_errno = std.c.errno(missing_path);
+    try std.testing.expectEqual(@as(c_int, -1), missing_path);
+    try std.testing.expectEqual(std.c.E.NOENT, missing_path_errno);
+
     _ = try session.register("/file");
 
     const truncated_data = c.openat(

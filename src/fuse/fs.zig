@@ -397,7 +397,13 @@ fn authorize(fs: *Fs, handle: *Handle, operation: Operation) bool {
     var updated = policy.evaluateLocked(handle.inode.path) catch |err| {
         log.err(@src(), "policy recheck failed for {s}: {t}", .{ handle.inode.path, err });
         return false;
-    } orelse mode;
+    } orelse {
+        // The rule (including any inherited rule) was removed while the
+        // permission request was pending. Do not resurrect stale policy.
+        denyOperation(&mode, operation);
+        handle.mode.store(@bitCast(mode), .release);
+        return false;
+    };
     if (operationState(updated, operation) == .ask) {
         allowOperation(&updated, operation);
         policy.setLocked(handle.inode.path, updated) catch |err| {
@@ -979,8 +985,11 @@ fn releaseCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info
     const previous = node.open_count.fetchSub(1, .acq_rel);
     std.debug.assert(previous != 0);
     const detached = detachIfUnusedLocked(fs, node);
-    fs.mutex.unlock(fs.io);
+    // Keep the inode-map lock held until this callback no longer touches the
+    // inode. FORGET only takes fs.mutex and may destroy a detached inode as
+    // soon as that lock is released.
     node.mutex.unlock(fs.io);
+    fs.mutex.unlock(fs.io);
 
     if (detached) destroyDetached(node);
     replyErr(req, 0);
@@ -1334,6 +1343,37 @@ test "ask denial is cached in the handle snapshot" {
     try std.testing.expect(!authorize(&fs, &handle, .read));
     try std.testing.expect(!authorize(&fs, &handle, .read));
     try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(Mode.A.deny, loadMode(&handle).r);
+}
+
+test "ask approval does not resurrect a rule removed while pending" {
+    const trie_fd = try std.posix.memfd_create("fs-ask-removal-test", 0);
+    try policy.init(std.testing.io, trie_fd);
+    defer policy.deinit();
+    const ask_mode = Mode{
+        .k = .visible_raw,
+        .r = .ask,
+        .w = .deny,
+        .x = .allow,
+    };
+    try policy.set("/file", ask_mode);
+    const Callback = struct {
+        fn ask(_: ?*anyopaque, _: std.Io, request: AskRequest) !AskDecision {
+            try std.testing.expectEqualStrings("/file", request.path);
+            try policy.remove("/file");
+            return .allow;
+        }
+    };
+    var fs = Fs.init(std.testing.io, -1, null, false, null, Callback.ask);
+    var inode = Inode{ .fd = -1, .path = "/file" };
+    var handle = Handle{
+        .fd = -1,
+        .inode = &inode,
+        .mode = .init(@bitCast(ask_mode)),
+    };
+
+    try std.testing.expect(!authorize(&fs, &handle, .read));
+    try std.testing.expectEqual(@as(?Mode, null), try policy.get("/file"));
     try std.testing.expectEqual(Mode.A.deny, loadMode(&handle).r);
 }
 
