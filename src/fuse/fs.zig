@@ -274,10 +274,8 @@ fn appendTruncateRecord(fs: *Fs, handle: *Handle) c_int {
     const record: overlay.Range = .{ .offset = 0, .length = 0 };
     const disk = overlay.encodeRange(record, handle.ranges_little_endian);
     const range_fd = handle.range_fd.load(.acquire);
-    if (c.write(range_fd, &disk, @sizeOf(overlay.Range)) != @sizeOf(overlay.Range)) {
-        _ = c.ftruncate(range_fd, @intCast(handle.range_bytes));
+    if (c.write(range_fd, &disk, @sizeOf(overlay.Range)) != @sizeOf(overlay.Range))
         return c.EIO;
-    }
     handle.ranges.appendAssumeCapacity(record);
     handle.range_bytes += @sizeOf(overlay.Range);
     return 0;
@@ -608,18 +606,30 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
     const fs = fsFrom(req);
     const node = inodeFrom(fs, ino);
     const mode_opt = ruleFor(node.path);
-    const mode = mode_opt orelse return replyErr(req, c.ENOENT);
+    var mode = mode_opt orelse return replyErr(req, c.ENOENT);
     if (!visible(mode) or mode.k != .visible_raw) return replyErr(req, c.ENOENT);
 
     const flags_in = fuse.FileInfo.flags(fi);
     const access_mode = flags_in & c.O_ACCMODE;
     const wants_read = access_mode != c.O_WRONLY;
     const wants_write = access_mode != c.O_RDONLY;
+    const wants_truncate = flags_in & c.O_TRUNC != 0;
+    const mutates_file = wants_write or wants_truncate;
     if (wants_read and mode.r == .deny) return replyErr(req, c.EACCES);
-    if (wants_write and mode.w == .deny)
+    if (mutates_file and mode.w == .deny)
         return replyErr(req, c.EACCES);
-    if (wants_write and mode.w == .overlay and fs.session == null)
+    if (mutates_file and mode.w == .overlay and fs.session == null)
         return replyErr(req, c.EROFS);
+    if (wants_truncate and mode.w == .ask) {
+        var permission_handle = Handle{
+            .fd = -1,
+            .inode = node,
+            .mode = .init(@bitCast(mode)),
+        };
+        if (!authorize(fs, &permission_handle, .write))
+            return replyErr(req, c.EACCES);
+        mode = loadMode(&permission_handle);
+    }
 
     var flags = (flags_in & ~@as(c_int, c.O_CREAT | c.O_EXCL | c.O_NOCTTY)) | c.O_CLOEXEC;
     if (mode.w == .overlay)
@@ -638,8 +648,8 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
         openOverlay(
             fs,
             node.path,
-            if (wants_write) c.O_RDWR | c.O_CREAT else c.O_RDONLY,
-            wants_write,
+            if (mutates_file) c.O_RDWR | c.O_CREAT else c.O_RDONLY,
+            mutates_file,
         )
     else
         -1;
@@ -647,17 +657,18 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
         openRanges(
             fs,
             node.path,
-            if (wants_write) c.O_RDWR | c.O_CREAT | c.O_APPEND else c.O_RDONLY,
-            wants_write,
+            if (mutates_file) c.O_RDWR | c.O_CREAT | c.O_APPEND else c.O_RDONLY,
+            mutates_file,
         )
     else
         -1;
-    if (wants_write and mode.w == .overlay and overlay_fd < 0) {
+    if (mutates_file and mode.w == .overlay and overlay_fd < 0) {
+        if (range_fd >= 0) _ = c.close(range_fd);
         allocator.destroy(handle);
         _ = c.close(fd);
         return replyErr(req, c.EIO);
     }
-    if (wants_write and mode.w == .overlay and range_fd < 0) {
+    if (mutates_file and mode.w == .overlay and range_fd < 0) {
         _ = c.close(overlay_fd);
         allocator.destroy(handle);
         _ = c.close(fd);
@@ -682,7 +693,7 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
         _ = c.close(fd);
         return replyErr(req, c.EIO);
     }
-    if (mode.w == .overlay and wants_write and flags_in & c.O_TRUNC != 0) {
+    if (mode.w == .overlay and wants_truncate) {
         const truncate_err = appendTruncateRecord(fs, handle);
         if (truncate_err != 0) {
             if (range_fd >= 0) _ = c.close(range_fd);
@@ -703,14 +714,14 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
         }
         fuse.FileInfo.setBackingId(fi, node.backing_id);
     }
-    node.mutex.unlock(fs.io);
     fs.mutex.lockUncancelable(fs.io);
     _ = node.open_count.fetchAdd(1, .release);
     fs.mutex.unlock(fs.io);
+    node.mutex.unlock(fs.io);
 
     fuse.FileInfo.setFh(fi, @intFromPtr(handle));
     fuse.FileInfo.setKeepCache(fi, @intFromBool(fuse.FileInfo.backingId(fi) == 0));
-    fuse.FileInfo.setNoflush(fi, @intFromBool(!wants_write));
+    fuse.FileInfo.setNoflush(fi, @intFromBool(!mutates_file));
     _ = c.fuse_reply_open(req, fi);
 }
 
@@ -875,8 +886,6 @@ fn writeOverlay(
         };
         const disk = overlay.encodeRange(record, handle.ranges_little_endian);
         if (c.write(range_fd, &disk, @sizeOf(overlay.Range)) != @sizeOf(overlay.Range)) {
-            // Discard a possible torn record before another open appends.
-            _ = c.ftruncate(range_fd, @intCast(handle.range_bytes));
             return replyErr(req, c.EIO);
         }
         handle.ranges.appendAssumeCapacity(record);
@@ -958,16 +967,19 @@ fn releaseCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info
     allocator.destroy(handle);
 
     node.mutex.lockUncancelable(fs.io);
+    // Keep the open reference published while closing the shared passthrough
+    // registration. FORGET only takes fs.mutex, so decrementing first would
+    // let it free `node` while this callback still accesses backing_id.
+    if (node.open_count.load(.acquire) == 1 and node.backing_id != 0) {
+        if (c.fuse_passthrough_close(req, node.backing_id) < 0)
+            log.warn(@src(), "failed to close passthrough id {d} for {s}", .{ node.backing_id, node.path });
+        node.backing_id = 0;
+    }
     fs.mutex.lockUncancelable(fs.io);
     const previous = node.open_count.fetchSub(1, .acq_rel);
     std.debug.assert(previous != 0);
     const detached = detachIfUnusedLocked(fs, node);
     fs.mutex.unlock(fs.io);
-    if (previous == 1 and node.backing_id != 0) {
-        if (c.fuse_passthrough_close(req, node.backing_id) < 0)
-            log.warn(@src(), "failed to close passthrough id {d} for {s}", .{ node.backing_id, node.path });
-        node.backing_id = 0;
-    }
     node.mutex.unlock(fs.io);
 
     if (detached) destroyDetached(node);
