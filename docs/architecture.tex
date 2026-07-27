@@ -671,9 +671,9 @@ them.
 \section{Error handling and logging}
 
 Raw Linux syscall wrappers return encoded syscall results. Those values are
-decoded with \texttt{linux.errno(rc)}. libc and \texttt{std.posix} calls use
-\texttt{std.posix.errno(rc)}. The return value is captured once before cleanup
-can replace thread-local errno.
+decoded with \texttt{linux.errno(rc)}. libc calls return \(-1\) and set
+thread-local errno, so they use \texttt{std.c.errno(rc)}. The return value and
+errno are captured before cleanup can replace thread-local errno.
 
 Errors that prevent a correct reply are returned to FUSE or to the public API.
 Cleanup and persistence errors that occur after a structure is published are
@@ -727,8 +727,9 @@ integration harness.
         mapping growth fails. Syntax errors are detected before replacement.
   \item The binary pool has a maximum size below 16 GiB because node indices
         are 24 bits and each node is 1 KiB.
-  \item Overlay range records use native-endian 64-bit fields. The session
-        format marker must change if this representation changes.
+  \item Version 2 overlay range records use explicit little-endian 64-bit
+        fields. Version 1 sessions remain readable with their native-endian
+        representation.
 \end{itemize}
 
 \section{Public API summary}

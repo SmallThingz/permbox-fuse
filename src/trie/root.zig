@@ -230,4 +230,9 @@ test "invalid text does not alter the binary trie" {
         "\"/bad\":access,unknown-flag",
     ));
     try std.testing.expect((try root.getExact("/kept")) != null);
+    try std.testing.expectError(error.InvalidPath, root.replaceFromText(
+        std.testing.allocator,
+        "\"/allowed/../denied\":access,ALWAYS-allow-rwx",
+    ));
+    try std.testing.expect((try root.getExact("/kept")) != null);
 }

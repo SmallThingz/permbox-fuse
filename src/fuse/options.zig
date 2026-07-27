@@ -46,6 +46,7 @@ pub const ParseError = error{
     StateNotAbsolute,
     MountpointNotAbsolute,
     BackingAliasesMountpoint,
+    MountpointInsideBacking,
 };
 
 /// Parse command-line arguments into a `Config`.
@@ -133,7 +134,14 @@ pub fn parse(argv: []const [:0]const u8) ParseError!Config {
     if (!std.fs.path.isAbsolute(p)) return error.PolicyNotAbsolute;
     if (state) |path| if (!std.fs.path.isAbsolute(path)) return error.StateNotAbsolute;
     if (!std.fs.path.isAbsolute(m)) return error.MountpointNotAbsolute;
-    if (std.mem.eql(u8, b, m)) return error.BackingAliasesMountpoint;
+    const normalized_backing = std.fs.path.resolve(allocator, &.{b}) catch
+        return error.OutOfMemory;
+    const normalized_mountpoint = std.fs.path.resolve(allocator, &.{m}) catch
+        return error.OutOfMemory;
+    if (std.mem.eql(u8, normalized_backing, normalized_mountpoint))
+        return error.BackingAliasesMountpoint;
+    if (pathDescendsFrom(normalized_mountpoint, normalized_backing))
+        return error.MountpointInsideBacking;
 
     // ---- build default -o string ----
     var o_buf = std.ArrayList(u8).empty;
@@ -153,14 +161,21 @@ pub fn parse(argv: []const [:0]const u8) ParseError!Config {
 
     return Config{
         .arena = arena,
-        .backing = try allocator.dupeZ(u8, b),
+        .backing = try allocator.dupeZ(u8, normalized_backing),
         .policy = try allocator.dupeZ(u8, p),
         .state = if (state) |path| try allocator.dupeZ(u8, path) else null,
-        .mountpoint = try allocator.dupeZ(u8, m),
+        .mountpoint = try allocator.dupeZ(u8, normalized_mountpoint),
         .fuse_args = try fuse_list.toOwnedSlice(allocator),
         .io_uring = io_uring,
         .passthrough = passthrough,
     };
+}
+
+fn pathDescendsFrom(path: []const u8, parent: []const u8) bool {
+    if (parent.len == 1 and parent[0] == '/') return path.len > 1;
+    return path.len > parent.len and
+        std.mem.startsWith(u8, path, parent) and
+        path[parent.len] == '/';
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────
@@ -327,6 +342,24 @@ test "backing aliases mountpoint" {
         "/same/path",
     };
     try testing.expectError(error.BackingAliasesMountpoint, parse(&args));
+}
+
+test "mountpoint inside backing is rejected after lexical normalization" {
+    const nested = [_][:0]const u8{
+        "prog",
+        "--backing=/srv/data",
+        "--policy=/policy",
+        "/srv/data/mount",
+    };
+    try testing.expectError(error.MountpointInsideBacking, parse(&nested));
+
+    const normalized = [_][:0]const u8{
+        "prog",
+        "--backing=/srv/data/../data",
+        "--policy=/policy",
+        "/srv/data/child/../mount",
+    };
+    try testing.expectError(error.MountpointInsideBacking, parse(&normalized));
 }
 
 test "fuse args pass through" {

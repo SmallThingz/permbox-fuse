@@ -1,5 +1,6 @@
 const std = @import("std");
 const permfuse = @import("permfuse");
+const permtrie = @import("permtrie");
 const terminal = @import("terminal.zig");
 
 const c = @cImport({
@@ -47,6 +48,9 @@ pub fn main(init: std.process.Init) !u8 {
     const args = try init.gpa.alloc([:0]const u8, raw_args.len);
     defer init.gpa.free(args);
     for (raw_args, args) |arg, *parsed| parsed.* = std.mem.span(arg);
+
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "trie"))
+        return runTrieCommand(init, args[2..]);
 
     var config = permfuse.options.parse(args) catch |err| {
         printUsage(err);
@@ -130,6 +134,138 @@ pub fn main(init: std.process.Init) !u8 {
         joined = true;
     }
     return if (mount_context.failed.load(.acquire)) 1 else 0;
+}
+
+fn runTrieCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
+    if (args.len == 0 or std.mem.eql(u8, args[0], "help")) {
+        printTrieUsage(null);
+        return 0;
+    }
+    if (std.mem.eql(u8, args[0], "to-text")) {
+        if (args.len < 2 or args.len > 3) {
+            printTrieUsage(error.InvalidArguments);
+            return 2;
+        }
+        const fd = std.c.open(args[1].ptr, .{
+            .ACCMODE = .RDWR,
+            .CLOEXEC = true,
+        });
+        if (fd < 0) {
+            printConversionError("cannot open binary trie", args[1], std.c.errno(fd));
+            return 1;
+        }
+        var trie = permtrie.init(init.io, fd) catch |err| {
+            _ = std.c.close(fd);
+            printConversionError("cannot read binary trie", args[1], err);
+            return 1;
+        };
+        defer trie.deinit();
+        const text = trie.toText(init.gpa) catch |err| {
+            printConversionError("cannot serialize binary trie", args[1], err);
+            return 1;
+        };
+        defer init.gpa.free(text);
+        if (args.len == 2 or std.mem.eql(u8, args[2], "-")) {
+            if (c.fwrite(text.ptr, 1, text.len, c.stdout) != text.len or c.fflush(c.stdout) != 0) {
+                printConversionError("cannot write text trie", "-", std.c.errno(-1));
+                return 1;
+            }
+        } else {
+            std.Io.Dir.cwd().writeFile(init.io, .{
+                .sub_path = args[2],
+                .data = text,
+            }) catch |err| {
+                printConversionError("cannot write text trie", args[2], err);
+                return 1;
+            };
+            terminal.label(terminal.bright_green, "converted  ");
+            std.debug.print("{s} -> {s}\n", .{ args[1], args[2] });
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[0], "from-text")) {
+        if (args.len != 3) {
+            printTrieUsage(error.InvalidArguments);
+            return 2;
+        }
+        const text = std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            args[1],
+            init.gpa,
+            .limited(16 * 1024 * 1024),
+        ) catch |err| {
+            printConversionError("cannot read text trie", args[1], err);
+            return 1;
+        };
+        defer init.gpa.free(text);
+        const fd = std.c.open(
+            args[2].ptr,
+            .{
+                .ACCMODE = .RDWR,
+                .CREAT = true,
+                .TRUNC = true,
+                .CLOEXEC = true,
+            },
+            @as(std.c.mode_t, 0o600),
+        );
+        if (fd < 0) {
+            printConversionError("cannot create binary trie", args[2], std.c.errno(fd));
+            return 1;
+        }
+        const reserve_rc = std.os.linux.fallocate(
+            fd,
+            std.os.linux.FALLOC.FL_KEEP_SIZE,
+            0,
+            1 << 16,
+        );
+        if (reserve_rc != 0) {
+            const reserve_errno = std.os.linux.errno(reserve_rc);
+            switch (reserve_errno) {
+                .NOSPC, .DQUOT => {
+                    _ = std.c.close(fd);
+                    printConversionError("cannot allocate binary trie", args[2], reserve_errno);
+                    return 1;
+                },
+                else => {},
+            }
+        }
+        var trie = permtrie.init(init.io, fd) catch |err| {
+            _ = std.c.close(fd);
+            printConversionError("cannot initialize binary trie", args[2], err);
+            return 1;
+        };
+        defer trie.deinit();
+        trie.replaceFromText(init.gpa, text) catch |err| {
+            printConversionError("cannot parse text trie", args[1], err);
+            return 1;
+        };
+        terminal.label(terminal.bright_green, "converted  ");
+        std.debug.print("{s} -> {s}\n", .{ args[1], args[2] });
+        return 0;
+    }
+    printTrieUsage(error.UnknownCommand);
+    return 2;
+}
+
+fn printConversionError(comptime message: []const u8, path: []const u8, err: anytype) void {
+    terminal.label(terminal.bright_red, "error: ");
+    std.debug.print(message ++ " {s}: {any}\n", .{ path, err });
+}
+
+fn printTrieUsage(err: ?anyerror) void {
+    if (err) |value| {
+        terminal.label(terminal.bright_red, "error: ");
+        std.debug.print("{t}\n", .{value});
+    }
+    terminal.label(terminal.bright_blue, "trie conversion\n");
+    std.debug.print(
+        "  permfuse trie to-text BINARY [TEXT|-]\n" ++
+            "  permfuse trie from-text TEXT BINARY\n" ++
+            "\n" ++
+            "  to-text writes the fs block to stdout when TEXT is omitted or '-'.\n" ++
+            "  from-text creates or replaces BINARY from the test fs representation.\n",
+        .{},
+    );
 }
 
 fn executeCommand(
@@ -267,7 +403,8 @@ fn printUsage(err: anyerror) void {
     std.debug.print(
         "permfuse --backing=/absolute/root --policy=/absolute/trie " ++
             "[--state=/absolute/session] [--no-io-uring] [--no-passthrough] " ++
-            "/absolute/mountpoint [FUSE options]\n",
+            "/absolute/mountpoint [FUSE options]\n" ++
+            "  permfuse trie help\n",
         .{},
     );
 }

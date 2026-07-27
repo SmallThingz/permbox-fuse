@@ -56,6 +56,17 @@ try trie.replaceFromText(allocator,
 input hierarchy, but preserves every explicit path and all current trie mode
 bits.
 
+The CLI can perform the same conversion without mounting a filesystem:
+
+```sh
+permfuse trie to-text policy.trie policy.fs
+permfuse trie from-text policy.fs policy.trie
+permfuse trie to-text policy.trie
+```
+
+The last form writes the `fs {}` representation to standard output. Opening a
+binary trie also repairs opposite-endian data in place before exporting it.
+
 See [docs/API.md](docs/API.md) for the complete public API reference for both
 `permtrie` and `permfuse`.
 

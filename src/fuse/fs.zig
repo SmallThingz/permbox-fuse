@@ -19,6 +19,8 @@ const dir_buffer_size = 16 * 1024;
 const Inode = struct {
     fd: c_int,
     path: [:0]const u8,
+    device: u64 = 0,
+    inode_number: u64 = 0,
     lookup_count: u64 = 1,
     open_count: std.atomic.Value(u32) = .init(0),
     backing_id: i32 = 0,
@@ -32,6 +34,7 @@ const Handle = struct {
     range_fd: std.atomic.Value(c_int) = .init(-1),
     ranges: std.ArrayListUnmanaged(overlay.Range) = .empty,
     range_bytes: u64 = 0,
+    ranges_little_endian: bool = true,
     inode: *Inode,
     mode: std.atomic.Value(u8),
     mutex: std.Io.Mutex = .init,
@@ -205,21 +208,21 @@ fn openSessionFile(
     durable_create: bool,
 ) c_int {
     if (!durable_create or flags & c.O_CREAT == 0)
-        return c.openat(directory_fd, id, flags | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+        return c.openat(directory_fd, id, flags | c.O_NOFOLLOW | c.O_CLOEXEC, @as(c.mode_t, 0o600));
 
     const existing_flags = flags & ~@as(c_int, c.O_CREAT | c.O_EXCL);
-    var fd = c.openat(directory_fd, id, existing_flags | c.O_CLOEXEC);
+    var fd = c.openat(directory_fd, id, existing_flags | c.O_NOFOLLOW | c.O_CLOEXEC);
     if (fd >= 0) return fd;
-    if (std.posix.errno(fd) != .NOENT) return -1;
+    if (std.c.errno(fd) != .NOENT) return -1;
 
     fd = c.openat(
         directory_fd,
         id,
-        flags | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC,
+        flags | c.O_CREAT | c.O_EXCL | c.O_NOFOLLOW | c.O_CLOEXEC,
         @as(c.mode_t, 0o600),
     );
-    if (fd < 0 and std.posix.errno(fd) == .EXIST)
-        return c.openat(directory_fd, id, existing_flags | c.O_CLOEXEC);
+    if (fd < 0 and std.c.errno(fd) == .EXIST)
+        return c.openat(directory_fd, id, existing_flags | c.O_NOFOLLOW | c.O_CLOEXEC);
     if (fd < 0) return -1;
     if (c.fsync(directory_fd) != 0) {
         _ = c.close(fd);
@@ -255,11 +258,32 @@ fn refreshRangesLocked(handle: *Handle) bool {
         handle.ranges.items.len = old_len;
         return false;
     }
+    for (handle.ranges.items[old_len..]) |*range| {
+        const disk: overlay.RangeDisk = @as(*const overlay.RangeDisk, @ptrCast(range)).*;
+        range.* = overlay.decodeRange(&disk, handle.ranges_little_endian);
+    }
     handle.range_bytes = valid_bytes;
     return true;
 }
 
-fn maxRangeEnd(range_fd: c_int) ?u64 {
+fn appendTruncateRecord(fs: *Fs, handle: *Handle) c_int {
+    handle.inode.overlay_mutex.lockUncancelable(fs.io);
+    defer handle.inode.overlay_mutex.unlock(fs.io);
+    if (!refreshRangesLocked(handle)) return c.EIO;
+    handle.ranges.ensureUnusedCapacity(allocator, 1) catch return c.ENOMEM;
+    const record: overlay.Range = .{ .offset = 0, .length = 0 };
+    const disk = overlay.encodeRange(record, handle.ranges_little_endian);
+    const range_fd = handle.range_fd.load(.acquire);
+    if (c.write(range_fd, &disk, @sizeOf(overlay.Range)) != @sizeOf(overlay.Range)) {
+        _ = c.ftruncate(range_fd, @intCast(handle.range_bytes));
+        return c.EIO;
+    }
+    handle.ranges.appendAssumeCapacity(record);
+    handle.range_bytes += @sizeOf(overlay.Range);
+    return 0;
+}
+
+fn logicalRangeEnd(range_fd: c_int, backing_size: u64, little_endian: bool) ?u64 {
     var st: c.struct_stat = undefined;
     if (c.fstat(range_fd, &st) != 0 or st.st_size < 0) return null;
     const valid_bytes: u64 = @divFloor(
@@ -267,8 +291,8 @@ fn maxRangeEnd(range_fd: c_int) ?u64 {
         @sizeOf(overlay.Range),
     ) * @sizeOf(overlay.Range);
     var offset: u64 = 0;
-    var records: [128]overlay.Range = undefined;
-    var maximum: u64 = 0;
+    var records: [128]overlay.RangeDisk = undefined;
+    var maximum = backing_size;
     while (offset < valid_bytes) {
         const bytes: usize = @intCast(@min(
             @as(u64, @sizeOf(@TypeOf(records))),
@@ -276,7 +300,13 @@ fn maxRangeEnd(range_fd: c_int) ?u64 {
         ));
         const got = c.pread(range_fd, &records, bytes, @intCast(offset));
         if (got <= 0 or @rem(got, @sizeOf(overlay.Range)) != 0) return null;
-        for (records[0..@intCast(@divExact(got, @sizeOf(overlay.Range)))]) |range| {
+        for (records[0..@intCast(@divExact(got, @sizeOf(overlay.Range)))]) |*disk| {
+            const range = overlay.decodeRange(disk, little_endian);
+            if (range.length == 0) {
+                if (range.offset > std.math.maxInt(c.off_t)) return null;
+                maximum = range.offset;
+                continue;
+            }
             const end = std.math.add(u64, range.offset, range.length) catch return null;
             if (end > std.math.maxInt(c.off_t)) return null;
             maximum = @max(maximum, end);
@@ -311,6 +341,14 @@ fn allowOperation(mode: *Mode, operation: Operation) void {
         .read => mode.r = .allow,
         .write => mode.w = .allow,
         .execute => mode.x = .allow,
+    }
+}
+
+fn denyOperation(mode: *Mode, operation: Operation) void {
+    switch (operation) {
+        .read => mode.r = .deny,
+        .write => mode.w = .deny,
+        .execute => mode.x = .deny,
     }
 }
 
@@ -349,7 +387,11 @@ fn authorize(fs: *Fs, handle: *Handle, operation: Operation) bool {
         log.warn(@src(), "permission request failed for {s}: {t}", .{ handle.inode.path, err });
         return false;
     };
-    if (decision != .allow) return false;
+    if (decision != .allow) {
+        denyOperation(&mode, operation);
+        handle.mode.store(@bitCast(mode), .release);
+        return false;
+    }
 
     policy.lockUpdates();
     defer policy.unlockUpdates();
@@ -374,21 +416,33 @@ fn authorize(fs: *Fs, handle: *Handle, operation: Operation) bool {
 
 fn statNode(fs: *Fs, node: *Inode, st: *c.struct_stat) c_int {
     const stat_rc = c.fstat(node.fd, st);
-    if (stat_rc != 0) return @intFromEnum(std.posix.errno(stat_rc));
+    if (stat_rc != 0) return @intFromEnum(std.c.errno(stat_rc));
     if (ruleFor(node.path)) |mode| {
         if (!visible(mode)) return c.ENOENT;
-        if (mode.x != .allow) st.st_mode &= ~@as(c.mode_t, 0o111);
-        if (mode.w == .overlay and fs.session != null) {
-            const range_fd = openRanges(fs, node.path, c.O_RDONLY, false);
-            if (range_fd >= 0) {
-                if (maxRangeEnd(range_fd)) |end|
-                    st.st_size = @max(st.st_size, @as(c.off_t, @intCast(end)));
-                _ = c.close(range_fd);
-            }
-        }
+        applyPolicyStat(fs, node.path, mode, st);
         return 0;
     }
     return c.ENOENT;
+}
+
+fn applyPolicyStat(fs: *Fs, path: []const u8, mode: Mode, st: *c.struct_stat) void {
+    if (mode.r == .deny) st.st_mode &= ~@as(c.mode_t, 0o444);
+    if (mode.w == .deny) st.st_mode &= ~@as(c.mode_t, 0o222);
+    if (mode.w == .overlay and fs.session != null)
+        st.st_mode |= @as(c.mode_t, 0o222);
+    if (mode.x == .deny) st.st_mode &= ~@as(c.mode_t, 0o111);
+    if (mode.w == .overlay and fs.session != null) {
+        const range_fd = openRanges(fs, path, c.O_RDONLY, false);
+        if (range_fd >= 0) {
+            if (logicalRangeEnd(
+                range_fd,
+                @intCast(st.st_size),
+                fs.session.?.rangesAreLittleEndian(),
+            )) |end|
+                st.st_size = @as(c.off_t, @intCast(end));
+            _ = c.close(range_fd);
+        }
+    }
 }
 
 fn destroyDetached(node: *Inode) void {
@@ -400,8 +454,12 @@ fn destroyDetached(node: *Inode) void {
 fn detachIfUnusedLocked(fs: *Fs, node: *Inode) bool {
     if (node == &fs.root or node.lookup_count != 0 or node.open_count.load(.acquire) != 0) return false;
     if (fs.inodes.get(node.path)) |published| {
-        if (published == node) _ = fs.inodes.remove(node.path);
+        if (published == node) {
+            _ = fs.inodes.remove(node.path);
+        }
     }
+    // A replaced inode is no longer in the path map, but remains alive until
+    // its kernel lookup and open references both reach zero.
     return true;
 }
 
@@ -433,16 +491,16 @@ fn lookupCb(req: c.fuse_req_t, parent_ino: c.fuse_ino_t, name_z: [*c]const u8) c
     if (!visible(mode) or mode.k != .visible_raw) return replyErr(req, c.ENOENT);
 
     const fd = c.openat(parent.fd, name_z, c.O_PATH | c.O_NOFOLLOW | c.O_CLOEXEC);
-    if (fd < 0) return replyErr(req, @intFromEnum(std.posix.errno(fd)));
+    if (fd < 0) return replyErr(req, @intFromEnum(std.c.errno(fd)));
 
     var st: c.struct_stat = undefined;
     const stat_rc = c.fstat(fd, &st);
     if (stat_rc != 0) {
-        const err = @intFromEnum(std.posix.errno(stat_rc));
+        const err = @intFromEnum(std.c.errno(stat_rc));
         _ = c.close(fd);
         return replyErr(req, err);
     }
-    if (mode.x != .allow) st.st_mode &= ~@as(c.mode_t, 0o111);
+    applyPolicyStat(fs, path, mode, &st);
 
     const owned_path = allocator.dupeZ(u8, path) catch {
         _ = c.close(fd);
@@ -453,23 +511,26 @@ fn lookupCb(req: c.fuse_req_t, parent_ino: c.fuse_ino_t, name_z: [*c]const u8) c
         _ = c.close(fd);
         return replyErr(req, c.ENOMEM);
     };
-    candidate.* = .{ .fd = fd, .path = owned_path };
+    candidate.* = .{
+        .fd = fd,
+        .path = owned_path,
+        .device = @intCast(st.st_dev),
+        .inode_number = @intCast(st.st_ino),
+    };
 
     fs.mutex.lockUncancelable(fs.io);
     const node = if (fs.inodes.get(path)) |existing| current: {
-        var existing_stat: c.struct_stat = undefined;
-        if (c.fstat(existing.fd, &existing_stat) == 0 and
-            existing_stat.st_dev == st.st_dev and existing_stat.st_ino == st.st_ino)
+        if (existing.device == @as(u64, @intCast(st.st_dev)) and
+            existing.inode_number == @as(u64, @intCast(st.st_ino)))
         {
             existing.lookup_count += 1;
             break :current existing;
         }
+        // Replacement does not increase the map's entry count. Remove and
+        // republish without allocation so the map key belongs to `candidate`;
+        // retaining the old key would leave it dangling when `existing` dies.
         _ = fs.inodes.remove(existing.path);
-        fs.inodes.put(allocator, candidate.path, candidate) catch {
-            fs.mutex.unlock(fs.io);
-            destroyDetached(candidate);
-            return replyErr(req, c.ENOMEM);
-        };
+        fs.inodes.putAssumeCapacity(candidate.path, candidate);
         break :current candidate;
     } else published: {
         fs.inodes.put(allocator, candidate.path, candidate) catch {
@@ -521,7 +582,7 @@ fn readlinkCb(req: c.fuse_req_t, ino: c.fuse_ino_t) callconv(.c) void {
 
     var buf: [max_path]u8 = undefined;
     const len = c.readlinkat(node.fd, "", &buf, buf.len - 1);
-    if (len < 0) return replyErr(req, @intFromEnum(std.posix.errno(len)));
+    if (len < 0) return replyErr(req, @intFromEnum(std.c.errno(len)));
     buf[@intCast(len)] = 0;
     _ = c.fuse_reply_readlink(req, &buf);
 }
@@ -535,9 +596,10 @@ fn accessCb(req: c.fuse_req_t, ino: c.fuse_ino_t, mask: c_int) callconv(.c) void
     if (mask & c.W_OK != 0 and mode.w != .allow and mode.w != .overlay)
         return replyErr(req, c.EACCES);
     if (mask & c.X_OK != 0 and mode.x != .allow) return replyErr(req, c.EACCES);
-    const access_rc = c.faccessat(fs.root_fd, relativePath(node), mask, c.AT_EACCESS);
+    const backing_mask = if (mode.w == .overlay) mask & ~@as(c_int, c.W_OK) else mask;
+    const access_rc = c.faccessat(fs.root_fd, relativePath(node), backing_mask, c.AT_EACCESS);
     if (access_rc != 0)
-        return replyErr(req, @intFromEnum(std.posix.errno(access_rc)));
+        return replyErr(req, @intFromEnum(std.c.errno(access_rc)));
     replyErr(req, 0);
 }
 
@@ -566,7 +628,7 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
     const proc_path = std.fmt.bufPrintZ(&proc_path_buf, "/proc/self/fd/{d}", .{node.fd}) catch
         return replyErr(req, c.EIO);
     const fd = c.open(proc_path.ptr, flags);
-    if (fd < 0) return replyErr(req, @intFromEnum(std.posix.errno(fd)));
+    if (fd < 0) return replyErr(req, @intFromEnum(std.c.errno(fd)));
 
     const handle = allocator.create(Handle) catch {
         _ = c.close(fd);
@@ -607,17 +669,32 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
         .range_fd = .init(range_fd),
         .inode = node,
         .mode = .init(@bitCast(mode)),
+        .ranges_little_endian = if (fs.session) |session|
+            session.rangesAreLittleEndian()
+        else
+            true,
     };
     if (!refreshRangesLocked(handle)) {
         if (range_fd >= 0) _ = c.close(range_fd);
         if (overlay_fd >= 0) _ = c.close(overlay_fd);
+        handle.ranges.deinit(allocator);
         allocator.destroy(handle);
         _ = c.close(fd);
         return replyErr(req, c.EIO);
     }
+    if (mode.w == .overlay and wants_write and flags_in & c.O_TRUNC != 0) {
+        const truncate_err = appendTruncateRecord(fs, handle);
+        if (truncate_err != 0) {
+            if (range_fd >= 0) _ = c.close(range_fd);
+            if (overlay_fd >= 0) _ = c.close(overlay_fd);
+            handle.ranges.deinit(allocator);
+            allocator.destroy(handle);
+            _ = c.close(fd);
+            return replyErr(req, truncate_err);
+        }
+    }
 
     node.mutex.lockUncancelable(fs.io);
-    _ = node.open_count.fetchAdd(1, .release);
     if (fs.passthrough_capable and policy.canPassthroughMode(mode)) {
         if (node.backing_id == 0) {
             node.backing_id = c.fuse_passthrough_open(req, fd);
@@ -627,6 +704,9 @@ fn openCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_inf
         fuse.FileInfo.setBackingId(fi, node.backing_id);
     }
     node.mutex.unlock(fs.io);
+    fs.mutex.lockUncancelable(fs.io);
+    _ = node.open_count.fetchAdd(1, .release);
+    fs.mutex.unlock(fs.io);
 
     fuse.FileInfo.setFh(fi, @intFromPtr(handle));
     fuse.FileInfo.setKeepCache(fi, @intFromBool(fuse.FileInfo.backingId(fi) == 0));
@@ -674,15 +754,24 @@ fn readOverlay(req: c.fuse_req_t, handle: *Handle, size: usize, off: c.off_t) vo
 
     var backing_stat: c.struct_stat = undefined;
     const stat_rc = c.fstat(handle.fd, &backing_stat);
-    if (stat_rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(stat_rc)));
+    if (stat_rc != 0) return replyErr(req, @intFromEnum(std.c.errno(stat_rc)));
     const overlay_fd = handle.overlay_fd.load(.acquire);
     var logical_size: u64 = @intCast(backing_stat.st_size);
-    for (handle.ranges.items) |range|
-        logical_size = @max(
-            logical_size,
-            std.math.add(u64, range.offset, range.length) catch
-                return replyErr(req, c.EIO),
-        );
+    var backing_limit = logical_size;
+    var active_range_start: usize = 0;
+    for (handle.ranges.items, 0..) |range, index| {
+        if (range.length == 0) {
+            if (range.offset > std.math.maxInt(c.off_t)) return replyErr(req, c.EIO);
+            logical_size = range.offset;
+            backing_limit = @min(backing_limit, range.offset);
+            active_range_start = index + 1;
+            continue;
+        }
+        const end = std.math.add(u64, range.offset, range.length) catch
+            return replyErr(req, c.EIO);
+        if (end > std.math.maxInt(c.off_t)) return replyErr(req, c.EIO);
+        logical_size = @max(logical_size, end);
+    }
     const offset: u64 = @intCast(off);
     if (offset >= logical_size) {
         _ = c.fuse_reply_buf(req, null, 0);
@@ -693,21 +782,25 @@ fn readOverlay(req: c.fuse_req_t, handle: *Handle, size: usize, off: c.off_t) vo
     defer allocator.free(reply);
     @memset(reply, 0);
 
-    const backing_read = c.pread(handle.fd, reply.ptr, reply.len, off);
-    if (backing_read < 0) return replyErr(req, @intFromEnum(std.posix.errno(backing_read)));
+    const backing_len: usize = @intCast(@min(@as(u64, reply.len), backing_limit -| offset));
+    if (backing_len != 0) {
+        const backing_read = c.pread(handle.fd, reply.ptr, backing_len, off);
+        if (backing_read < 0) return replyErr(req, @intFromEnum(std.c.errno(backing_read)));
+    }
 
     const request_end = offset + reply_len;
-    for (handle.ranges.items) |range| {
+    for (handle.ranges.items[active_range_start..]) |range| {
         if (range.length == 0 or range.offset >= request_end) continue;
         const range_end = std.math.add(u64, range.offset, range.length) catch
             return replyErr(req, c.EIO);
         if (range_end <= offset) continue;
         const start = @max(range.offset, offset);
         const end = @min(range_end, request_end);
+        if (start > std.math.maxInt(c.off_t)) return replyErr(req, c.EIO);
         const destination = reply[@intCast(start - offset)..@intCast(end - offset)];
         const got = c.pread(overlay_fd, destination.ptr, destination.len, @intCast(start));
         if (got != @as(isize, @intCast(destination.len)))
-            return replyErr(req, if (got < 0) @intFromEnum(std.posix.errno(got)) else c.EIO);
+            return replyErr(req, if (got < 0) @intFromEnum(std.c.errno(got)) else c.EIO);
     }
     _ = c.fuse_reply_buf(req, reply.ptr, reply.len);
 }
@@ -730,7 +823,7 @@ fn writeCb(
     if (mode.w == .overlay)
         return writeOverlay(req, fs, handle, buf, size, off);
     const written = c.pwrite(handle.fd, buf, size, off);
-    if (written < 0) return replyErr(req, @intFromEnum(std.posix.errno(written)));
+    if (written < 0) return replyErr(req, @intFromEnum(std.c.errno(written)));
     _ = c.fuse_reply_write(req, @intCast(written));
 }
 
@@ -774,13 +867,14 @@ fn writeOverlay(
         return replyErr(req, c.ENOMEM);
 
     const written = c.pwrite(overlay_fd, buf, size, off);
-    if (written < 0) return replyErr(req, @intFromEnum(std.posix.errno(written)));
+    if (written < 0) return replyErr(req, @intFromEnum(std.c.errno(written)));
     if (written != 0) {
         const record = overlay.Range{
             .offset = @intCast(off),
             .length = @intCast(written),
         };
-        if (c.write(range_fd, &record, @sizeOf(overlay.Range)) != @sizeOf(overlay.Range)) {
+        const disk = overlay.encodeRange(record, handle.ranges_little_endian);
+        if (c.write(range_fd, &disk, @sizeOf(overlay.Range)) != @sizeOf(overlay.Range)) {
             // Discard a possible torn record before another open appends.
             _ = c.ftruncate(range_fd, @intCast(handle.range_bytes));
             return replyErr(req, c.EIO);
@@ -798,17 +892,17 @@ fn flushCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info) 
     const overlay_fd = handle.overlay_fd.load(.acquire);
     const target_fd = if (overlay_fd >= 0) overlay_fd else handle.fd;
     const duplicate = c.dup(target_fd);
-    if (duplicate < 0) return replyErr(req, @intFromEnum(std.posix.errno(duplicate)));
+    if (duplicate < 0) return replyErr(req, @intFromEnum(std.c.errno(duplicate)));
     const close_rc = c.close(duplicate);
-    if (close_rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(close_rc)));
+    if (close_rc != 0) return replyErr(req, @intFromEnum(std.c.errno(close_rc)));
     const range_fd = handle.range_fd.load(.acquire);
     if (range_fd >= 0) {
         const range_duplicate = c.dup(range_fd);
         if (range_duplicate < 0)
-            return replyErr(req, @intFromEnum(std.posix.errno(range_duplicate)));
+            return replyErr(req, @intFromEnum(std.c.errno(range_duplicate)));
         const range_close_rc = c.close(range_duplicate);
         if (range_close_rc != 0)
-            return replyErr(req, @intFromEnum(std.posix.errno(range_close_rc)));
+            return replyErr(req, @intFromEnum(std.c.errno(range_close_rc)));
     }
     replyErr(req, 0);
 }
@@ -820,11 +914,11 @@ fn fsyncCb(req: c.fuse_req_t, ino: c.fuse_ino_t, datasync: c_int, fi: ?*c.struct
     const overlay_fd = handle.overlay_fd.load(.acquire);
     const target_fd = if (overlay_fd >= 0) overlay_fd else handle.fd;
     const rc = if (datasync != 0) c.fdatasync(target_fd) else c.fsync(target_fd);
-    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
+    if (rc != 0) return replyErr(req, @intFromEnum(std.c.errno(rc)));
     const range_fd = handle.range_fd.load(.acquire);
     if (range_fd >= 0) {
         const range_rc = if (datasync != 0) c.fdatasync(range_fd) else c.fsync(range_fd);
-        if (range_rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(range_rc)));
+        if (range_rc != 0) return replyErr(req, @intFromEnum(std.c.errno(range_rc)));
     }
     replyErr(req, 0);
 }
@@ -840,7 +934,7 @@ fn releaseCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info
     if (backing_close_rc != 0)
         log.warn(@src(), "failed to close backing handle for {s}: errno {d}", .{
             node.path,
-            @intFromEnum(std.posix.errno(backing_close_rc)),
+            @intFromEnum(std.c.errno(backing_close_rc)),
         });
     const overlay_fd = handle.overlay_fd.load(.acquire);
     if (overlay_fd >= 0) {
@@ -848,7 +942,7 @@ fn releaseCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info
         if (close_rc != 0)
             log.warn(@src(), "failed to close overlay handle for {s}: errno {d}", .{
                 node.path,
-                @intFromEnum(std.posix.errno(close_rc)),
+                @intFromEnum(std.c.errno(close_rc)),
             });
     }
     const range_fd = handle.range_fd.load(.acquire);
@@ -857,26 +951,25 @@ fn releaseCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info
         if (close_rc != 0)
             log.warn(@src(), "failed to close overlay journal for {s}: errno {d}", .{
                 node.path,
-                @intFromEnum(std.posix.errno(close_rc)),
+                @intFromEnum(std.c.errno(close_rc)),
             });
     }
     handle.ranges.deinit(allocator);
     allocator.destroy(handle);
 
     node.mutex.lockUncancelable(fs.io);
+    fs.mutex.lockUncancelable(fs.io);
     const previous = node.open_count.fetchSub(1, .acq_rel);
     std.debug.assert(previous != 0);
-    const last_open = previous == 1;
-    if (last_open and node.backing_id != 0) {
+    const detached = detachIfUnusedLocked(fs, node);
+    fs.mutex.unlock(fs.io);
+    if (previous == 1 and node.backing_id != 0) {
         if (c.fuse_passthrough_close(req, node.backing_id) < 0)
             log.warn(@src(), "failed to close passthrough id {d} for {s}", .{ node.backing_id, node.path });
         node.backing_id = 0;
     }
     node.mutex.unlock(fs.io);
 
-    fs.mutex.lockUncancelable(fs.io);
-    const detached = detachIfUnusedLocked(fs, node);
-    fs.mutex.unlock(fs.io);
     if (detached) destroyDetached(node);
     replyErr(req, 0);
 }
@@ -892,12 +985,12 @@ fn opendirCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_
     const proc_path = std.fmt.bufPrintZ(&proc_path_buf, "/proc/self/fd/{d}", .{node.fd}) catch
         return replyErr(req, c.EIO);
     const fd = c.open(proc_path.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
-    if (fd < 0) return replyErr(req, @intFromEnum(std.posix.errno(fd)));
+    if (fd < 0) return replyErr(req, @intFromEnum(std.c.errno(fd)));
     const stream = c.fdopendir(fd) orelse {
-        // A null pointer carries no integer return code. std.posix.errno still
+        // A null pointer carries no integer return code. std.c.errno still
         // provides the libc errno conversion when given the documented -1
         // failure sentinel.
-        const err = @intFromEnum(std.posix.errno(@as(c_int, -1)));
+        const err = @intFromEnum(std.c.errno(@as(c_int, -1)));
         _ = c.close(fd);
         return replyErr(req, err);
     };
@@ -906,7 +999,9 @@ fn opendirCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi_opt: ?*c.struct_fuse_file_
         return replyErr(req, c.ENOMEM);
     };
     handle.* = .{ .stream = stream, .inode = node };
+    fs.mutex.lockUncancelable(fs.io);
     _ = node.open_count.fetchAdd(1, .release);
+    fs.mutex.unlock(fs.io);
     fuse.FileInfo.setFh(fi, @intFromPtr(handle));
     // Policy updates must become visible without reopening the directory.
     fuse.FileInfo.setCacheReaddir(fi, 0);
@@ -981,9 +1076,9 @@ fn releasedirCb(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_i
     _ = c.closedir(handle.stream);
     allocator.destroy(handle);
 
+    fs.mutex.lockUncancelable(fs.io);
     const previous = node.open_count.fetchSub(1, .acq_rel);
     std.debug.assert(previous != 0);
-    fs.mutex.lockUncancelable(fs.io);
     const detached = detachIfUnusedLocked(fs, node);
     fs.mutex.unlock(fs.io);
     if (detached) destroyDetached(node);
@@ -994,7 +1089,7 @@ fn statfsCb(req: c.fuse_req_t, ino: c.fuse_ino_t) callconv(.c) void {
     _ = ino;
     var st: c.struct_statvfs = undefined;
     const rc = c.fstatvfs(fsFrom(req).root_fd, &st);
-    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
+    if (rc != 0) return replyErr(req, @intFromEnum(std.c.errno(rc)));
     _ = c.fuse_reply_statfs(req, &st);
 }
 
@@ -1032,7 +1127,7 @@ fn mknodCb(
     if (kind != 0 and kind != c.S_IFREG and kind != c.S_IFIFO)
         return replyErr(req, c.EPERM);
     const rc = c.mknodat(parent.fd, name, mode, rdev);
-    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
+    if (rc != 0) return replyErr(req, @intFromEnum(std.c.errno(rc)));
     lookupCb(req, parent_ino, name);
 }
 
@@ -1042,7 +1137,7 @@ fn mkdirCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8, mode: c.
     const policy_err = mutationPolicy(parent_node, name);
     if (policy_err != 0) return replyErr(req, policy_err);
     const rc = c.mkdirat(parent_node.fd, name, mode);
-    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
+    if (rc != 0) return replyErr(req, @intFromEnum(std.c.errno(rc)));
     lookupCb(req, parent, name);
 }
 fn unlinkCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
@@ -1051,7 +1146,7 @@ fn unlinkCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callcon
     const policy_err = mutationPolicy(parent_node, name);
     if (policy_err != 0) return replyErr(req, policy_err);
     const rc = c.unlinkat(parent_node.fd, name, 0);
-    if (rc != 0) return replyErr(req, @intFromEnum(std.posix.errno(rc)));
+    if (rc != 0) return replyErr(req, @intFromEnum(std.c.errno(rc)));
     replyErr(req, 0);
 }
 fn rmdirCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
@@ -1061,7 +1156,7 @@ fn rmdirCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callconv
     if (policy_err != 0) return replyErr(req, policy_err);
     const rc = c.unlinkat(parent_node.fd, name, c.AT_REMOVEDIR);
     if (rc != 0)
-        return replyErr(req, @intFromEnum(std.posix.errno(rc)));
+        return replyErr(req, @intFromEnum(std.c.errno(rc)));
     replyErr(req, 0);
 }
 fn renameCb(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8, newparent: c.fuse_ino_t, newname: [*c]const u8, flags: c_uint) callconv(.c) void {
@@ -1122,6 +1217,35 @@ test "overlay names are stable and path-sensitive" {
     try std.testing.expect(!std.mem.eql(u8, overlayName("/a", &a), overlayName("/b", &b)));
 }
 
+test "overlay logical size honors truncation and rejects overflowing ranges" {
+    const fd = try std.posix.memfd_create("fs-logical-range-test", 0);
+    defer _ = c.close(fd);
+    const ranges = [_]overlay.Range{
+        .{ .offset = 10, .length = 5 },
+        .{ .offset = 3, .length = 0 },
+        .{ .offset = 5, .length = 2 },
+    };
+    for (ranges) |range| {
+        const disk = overlay.encodeRange(range, true);
+        try std.testing.expectEqual(
+            @as(isize, @sizeOf(overlay.Range)),
+            c.write(fd, &disk, disk.len),
+        );
+    }
+    try std.testing.expectEqual(@as(?u64, 7), logicalRangeEnd(fd, 100, true));
+
+    try std.testing.expectEqual(@as(c_int, 0), c.ftruncate(fd, 0));
+    const invalid = overlay.encodeRange(.{
+        .offset = std.math.maxInt(u64),
+        .length = 1,
+    }, true);
+    try std.testing.expectEqual(
+        @as(isize, @sizeOf(overlay.Range)),
+        c.write(fd, &invalid, invalid.len),
+    );
+    try std.testing.expectEqual(@as(?u64, null), logicalRangeEnd(fd, 0, true));
+}
+
 test "ask approval updates explicit policy and handle snapshot" {
     const trie_fd = try std.posix.memfd_create("fs-ask-test", 0);
     try policy.init(std.testing.io, trie_fd);
@@ -1169,6 +1293,38 @@ test "ask approval updates explicit policy and handle snapshot" {
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
+test "ask denial is cached in the handle snapshot" {
+    const trie_fd = try std.posix.memfd_create("fs-ask-denial-test", 0);
+    try policy.init(std.testing.io, trie_fd);
+    defer policy.deinit();
+    const ask_mode = Mode{
+        .k = .visible_raw,
+        .r = .ask,
+        .w = .deny,
+        .x = .allow,
+    };
+    try policy.set("/file", ask_mode);
+    const Callback = struct {
+        fn ask(context: ?*anyopaque, _: std.Io, _: AskRequest) !AskDecision {
+            const count: *usize = @ptrCast(@alignCast(context.?));
+            count.* += 1;
+            return .deny;
+        }
+    };
+    var count: usize = 0;
+    var fs = Fs.init(std.testing.io, -1, null, false, &count, Callback.ask);
+    var inode = Inode{ .fd = -1, .path = "/file" };
+    var handle = Handle{
+        .fd = -1,
+        .inode = &inode,
+        .mode = .init(@bitCast(ask_mode)),
+    };
+    try std.testing.expect(!authorize(&fs, &handle, .read));
+    try std.testing.expect(!authorize(&fs, &handle, .read));
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(Mode.A.deny, loadMode(&handle).r);
+}
+
 test "an open directory reference keeps a forgotten inode alive" {
     var fs = Fs.init(std.testing.io, -1, null, false, null, null);
     defer fs.inodes.deinit(allocator);
@@ -1190,11 +1346,41 @@ test "an open directory reference keeps a forgotten inode alive" {
     try std.testing.expect(!detachIfUnusedLocked(&fs, node));
     fs.mutex.unlock(fs.io);
 
+    fs.mutex.lockUncancelable(fs.io);
     const previous = node.open_count.fetchSub(1, .acq_rel);
     try std.testing.expectEqual(@as(u32, 1), previous);
-    fs.mutex.lockUncancelable(fs.io);
     const detached = detachIfUnusedLocked(&fs, node);
     fs.mutex.unlock(fs.io);
     try std.testing.expect(detached);
     destroyDetached(node);
+}
+
+test "a replaced inode is reclaimed only after all references drain" {
+    var fs = Fs.init(std.testing.io, -1, null, false, null, null);
+    defer fs.inodes.deinit(allocator);
+    const old = try allocator.create(Inode);
+    const old_path = try allocator.dupeZ(u8, "/file");
+    old.* = .{
+        .fd = -1,
+        .path = old_path,
+        .lookup_count = 0,
+        .open_count = .init(1),
+    };
+    const replacement = try allocator.create(Inode);
+    const replacement_path = try allocator.dupeZ(u8, "/file");
+    replacement.* = .{ .fd = -1, .path = replacement_path };
+    try fs.inodes.put(allocator, replacement.path, replacement);
+
+    fs.mutex.lockUncancelable(fs.io);
+    try std.testing.expect(!detachIfUnusedLocked(&fs, old));
+    _ = old.open_count.fetchSub(1, .acq_rel);
+    try std.testing.expect(detachIfUnusedLocked(&fs, old));
+    fs.mutex.unlock(fs.io);
+    destroyDetached(old);
+
+    fs.mutex.lockUncancelable(fs.io);
+    replacement.lookup_count = 0;
+    try std.testing.expect(detachIfUnusedLocked(&fs, replacement));
+    fs.mutex.unlock(fs.io);
+    destroyDetached(replacement);
 }

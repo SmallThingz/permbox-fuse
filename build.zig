@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "permfuse", .module = permbox_module },
+                .{ .name = "permtrie", .module = trie_module },
             },
         }),
         .use_llvm = true,

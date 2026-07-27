@@ -44,8 +44,7 @@ pub fn format(allocator: std.mem.Allocator, rules: []const Trie.Rule) Error![]u8
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "fs {\n");
     for (rules) |rule| {
-        if (rule.path.len == 0 or rule.path[0] != '/' or
-            std.mem.indexOfScalar(u8, rule.path, 0) != null)
+        if (!validPath(rule.path))
             return error.InvalidPath;
         try out.appendSlice(allocator, "  \"");
         for (rule.path) |byte| switch (byte) {
@@ -216,12 +215,36 @@ const Parser = struct {
 
 fn joinPath(allocator: std.mem.Allocator, parent: []const u8, key: []const u8) Error![]u8 {
     if (parent.len == 0) {
-        if (key.len == 0 or key[0] != '/') return error.InvalidPath;
+        if (!validPath(key)) return error.InvalidPath;
         return allocator.dupe(u8, key) catch error.OutOfMemory;
     }
     if (key.len == 0 or key[0] == '/') return error.InvalidPath;
     const separator = if (parent.len == 1) "" else "/";
-    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ parent, separator, key }) catch error.OutOfMemory;
+    const path = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+        parent,
+        separator,
+        key,
+    }) catch return error.OutOfMemory;
+    if (!validPath(path)) {
+        allocator.free(path);
+        return error.InvalidPath;
+    }
+    return path;
+}
+
+fn validPath(path: []const u8) bool {
+    if (path.len == 0 or path[0] != '/' or
+        std.mem.indexOfScalar(u8, path, 0) != null)
+        return false;
+    if (path.len == 1) return true;
+    if (path[path.len - 1] == '/') return false;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+            return false;
+    }
+    return true;
 }
 
 pub fn parseMode(flags: []const u8) Error!Mode {
@@ -230,11 +253,7 @@ pub fn parseMode(flags: []const u8) Error!Mode {
     while (tokens.next()) |raw| {
         const token = std.mem.trim(u8, raw, " \t\r\n");
         if (token.len == 0) continue;
-        if (std.mem.eql(u8, token, "access")) mode.k = .visible_raw else
-        if (std.mem.eql(u8, token, "empty")) mode.k = .visible_virtual else
-        if (std.mem.eql(u8, token, "no-access")) mode.k = .invisible else
-        if (std.mem.eql(u8, token, "overlay-w")) mode.w = .overlay else
-        if (std.mem.startsWith(u8, token, "deny-"))
+        if (std.mem.eql(u8, token, "access")) mode.k = .visible_raw else if (std.mem.eql(u8, token, "empty")) mode.k = .visible_virtual else if (std.mem.eql(u8, token, "no-access")) mode.k = .invisible else if (std.mem.eql(u8, token, "overlay-w")) mode.w = .overlay else if (std.mem.startsWith(u8, token, "deny-"))
             try setPermissions(&mode, token[5..], .deny)
         else if (std.mem.startsWith(u8, token, "allow-"))
             try setPermissions(&mode, token[6..], .ask)

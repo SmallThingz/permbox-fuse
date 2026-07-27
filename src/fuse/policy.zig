@@ -15,6 +15,7 @@ pub const Mode = permtrie.Mode;
 pub const K = Mode.K;
 pub const A = Mode.A;
 pub const W = Mode.W;
+pub const PathError = error{InvalidPath};
 
 /// Global policy trie instance. Initialised via init().
 var trie: permtrie = undefined;
@@ -37,23 +38,26 @@ pub fn deinit() void {
 /// The path is expected to be a normalised absolute FUSE path (e.g. `/a/b/c`).
 /// Must not be empty.
 pub fn evaluate(path: []const u8) !?Mode {
-    if (path.len == 0) return null;
+    try validatePath(path);
     return trie.get(path);
 }
 
 /// Stores an explicit rule. Callers coordinating open-handle snapshots must
 /// hold their policy write lock around this operation.
 pub fn set(path: []const u8, mode: Mode) !void {
+    try validatePath(path);
     try trie.add(path, mode);
 }
 
 /// Removes an explicit rule and returns it.
 pub fn remove(path: []const u8) !Mode {
+    try validatePath(path);
     return trie.del(path);
 }
 
 /// Returns only an explicit rule, without ancestor inheritance.
 pub fn get(path: []const u8) !?Mode {
+    try validatePath(path);
     return trie.getExact(path);
 }
 
@@ -74,16 +78,34 @@ pub fn unlockUpdates() void {
 }
 
 pub fn evaluateLocked(path: []const u8) !?Mode {
-    if (path.len == 0) return null;
+    try validatePath(path);
     return trie.getLocked(path);
 }
 
 pub fn setLocked(path: []const u8, mode: Mode) !void {
+    try validatePath(path);
     try trie.addLocked(path, mode);
 }
 
 pub fn removeLocked(path: []const u8) !Mode {
+    try validatePath(path);
     return trie.delLocked(path);
+}
+
+/// Accept only canonical absolute paths. FUSE supplies paths in this form, and
+/// rejecting traversal components keeps direct library callers from creating
+/// a trie decision for a different path than the backing filesystem resolves.
+pub fn validatePath(path: []const u8) PathError!void {
+    if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null)
+        return error.InvalidPath;
+    if (path.len == 1) return;
+    if (path[path.len - 1] == '/') return error.InvalidPath;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+            return error.InvalidPath;
+    }
 }
 
 /// Path is visible in the namespace (raw or virtual).
@@ -167,9 +189,27 @@ test "evaluate: nonexistent path returns null" {
     try testing.expectEqual(@as(?Mode, null), try evaluate("/nope"));
 }
 
-test "evaluate: empty path returns null" {
+test "evaluate: empty path is rejected" {
     try preparePool();
-    try testing.expectEqual(@as(?Mode, null), try evaluate(""));
+    try testing.expectError(error.InvalidPath, evaluate(""));
+}
+
+test "policy paths must be canonical and absolute" {
+    try preparePool();
+    const invalid = [_][]const u8{
+        "relative",
+        "/allowed/../denied",
+        "/a/./b",
+        "/a//b",
+        "/trailing/",
+        "/nul\x00suffix",
+    };
+    for (invalid) |path| {
+        try testing.expectError(error.InvalidPath, evaluate(path));
+        try testing.expectError(error.InvalidPath, set(path, Mode.dir));
+        try testing.expectError(error.InvalidPath, get(path));
+        try testing.expectError(error.InvalidPath, remove(path));
+    }
 }
 
 test "evaluate: root rule is found" {

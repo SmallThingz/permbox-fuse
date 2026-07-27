@@ -69,7 +69,7 @@ pub const Driver = struct {
         if (policy_fd < 0) {
             log.err(@src(), "open policy path failed; path={s}, errno={}", .{
                 config.policy_path,
-                @intFromEnum(std.posix.errno(policy_fd)),
+                @intFromEnum(std.c.errno(policy_fd)),
             });
             return error.OpenPolicyFailed;
         }
@@ -108,7 +108,7 @@ pub const Driver = struct {
         if (root_fd < 0) {
             log.err(@src(), "open backing path failed; path={s}, errno={}", .{
                 config.backing_path,
-                @intFromEnum(std.posix.errno(root_fd)),
+                @intFromEnum(std.c.errno(root_fd)),
             });
             return error.OpenBackingFailed;
         }
