@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var config = permfuse.options.parse(parsed_args) catch |err| {
         std.debug.print(
-            "permfuse-mount-test: {t}\nusage: zig build run-mount-test -- --backing=/absolute/path --policy=/absolute/trie [--state=/absolute/session] mountpoint [FUSE options]\n",
+            "permfuse-mount-test: {t}\nusage: zig build run-mount-test -- --lower=/absolute/path --policy=/absolute/trie --session=/absolute/session mountpoint [FUSE options]\n",
             .{err},
         );
         return 2;
@@ -32,9 +32,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     var driver: permfuse.Driver = undefined;
     driver.init(init.io, .{
-        .backing_path = config.backing,
+        .lower_path = config.lower,
         .policy_path = config.policy,
-        .state_path = config.state,
+        .session_path = config.session,
         .passthrough = config.passthrough,
     }) catch |err| {
         std.debug.print("permfuse-mount-test: initialization failed: {t}\n", .{err});

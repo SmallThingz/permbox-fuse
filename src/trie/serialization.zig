@@ -5,7 +5,6 @@ pub const Mode = Trie.Mode;
 pub const Error = error{
     InvalidSyntax,
     InvalidPath,
-    InvalidFlag,
     InvalidMode,
     OutOfMemory,
 };
@@ -20,9 +19,14 @@ pub fn freeRules(allocator: std.mem.Allocator, rules: []ParsedRule) void {
     allocator.free(rules);
 }
 
-/// Parse the permbox `fs` rule syntax. Both flat canonical entries and nested
-/// entries are accepted. Later entries for the same path are left for the trie
-/// insertion layer to replace.
+pub fn parseMode(text: []const u8) Error!Mode {
+    const value = std.mem.trim(u8, text, " \t\r\n,");
+    inline for (.{ Mode.whiteout, Mode.r, Mode.rw, Mode.ask }) |mode| {
+        if (std.mem.eql(u8, value, @tagName(mode))) return mode;
+    }
+    return error.InvalidMode;
+}
+
 pub fn parse(allocator: std.mem.Allocator, text: []const u8) Error![]ParsedRule {
     var parser = Parser{ .allocator = allocator, .text = text };
     errdefer parser.deinit();
@@ -44,7 +48,7 @@ pub fn format(allocator: std.mem.Allocator, rules: []const Trie.Rule) Error![]u8
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "fs {\n");
     for (rules) |rule| {
-        if (!validPath(rule.path))
+        if (!validPath(rule.path) or rule.mode == .midway)
             return error.InvalidPath;
         try out.appendSlice(allocator, "  \"");
         for (rule.path) |byte| switch (byte) {
@@ -55,45 +59,15 @@ pub fn format(allocator: std.mem.Allocator, rules: []const Trie.Rule) Error![]u8
             '\t' => try out.appendSlice(allocator, "\\t"),
             else => if (std.ascii.isControl(byte)) {
                 var buf: [4]u8 = undefined;
-                const escaped = std.fmt.bufPrint(&buf, "\\x{x:0>2}", .{byte}) catch unreachable;
-                try out.appendSlice(allocator, escaped);
+                try out.appendSlice(allocator, std.fmt.bufPrint(&buf, "\\x{x:0>2}", .{byte}) catch unreachable);
             } else try out.append(allocator, byte),
         };
         try out.appendSlice(allocator, "\":");
-        try appendMode(allocator, &out, rule.mode);
-        try out.appendSlice(allocator, "\n");
+        try out.appendSlice(allocator, @tagName(rule.mode));
+        try out.append(allocator, '\n');
     }
     try out.appendSlice(allocator, "}\n");
     return out.toOwnedSlice(allocator) catch error.OutOfMemory;
-}
-
-fn appendMode(allocator: std.mem.Allocator, out: *std.ArrayList(u8), mode: Mode) Error!void {
-    try out.appendSlice(allocator, switch (mode.k) {
-        .visible_raw => "access",
-        .visible_virtual => "empty",
-        .invisible => "no-access",
-        .midway => return error.InvalidMode,
-    });
-    try appendAccess(allocator, out, mode.r, "r");
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, switch (mode.w) {
-        .deny => "deny-w",
-        .ask => "allow-w",
-        .allow => "ALWAYS-allow-w",
-        .overlay => "overlay-w",
-    });
-    try appendAccess(allocator, out, mode.x, "x");
-}
-
-fn appendAccess(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: Mode.A, suffix: []const u8) Error!void {
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, switch (value) {
-        .deny => "deny-",
-        .ask => "allow-",
-        .allow => "ALWAYS-allow-",
-        ._reserved => return error.InvalidMode,
-    });
-    try out.appendSlice(allocator, suffix);
 }
 
 const Parser = struct {
@@ -109,26 +83,26 @@ const Parser = struct {
 
     fn parseEntries(self: *Parser, parent: []const u8, end: ?u8) Error!void {
         while (true) {
-            self.skipSpaceAndSeparators();
+            self.skipSeparators();
             if (self.index == self.text.len)
                 return if (end == null) {} else error.InvalidSyntax;
             if (end) |closing| if (self.text[self.index] == closing) {
                 self.index += 1;
                 return;
             };
+
             const key = try self.parseQuoted();
             defer self.allocator.free(key);
             self.skipSpace();
             if (self.consume(':')) self.skipSpace();
-            const flags_start = self.index;
+            const start = self.index;
             while (self.index < self.text.len) : (self.index += 1) switch (self.text[self.index]) {
-                '{', '}', ';', '"', '#', '\n' => break,
+                '{', '}', ';', '#', '\n' => break,
                 else => {},
             };
-            const flags = std.mem.trim(u8, self.text[flags_start..self.index], " \t\r,");
+            const mode = try parseMode(self.text[start..self.index]);
             const path = try joinPath(self.allocator, parent, key);
             errdefer self.allocator.free(path);
-            const mode = try parseMode(flags);
             try self.rules.append(self.allocator, .{ .path = path, .mode = mode });
             self.skipSpace();
             if (self.consume('{')) try self.parseEntries(path, '}');
@@ -159,10 +133,12 @@ const Parser = struct {
                 't' => try out.append(self.allocator, '\t'),
                 'x' => {
                     if (self.index + 2 > self.text.len) return error.InvalidSyntax;
-                    const value = std.fmt.parseInt(u8, self.text[self.index .. self.index + 2], 16) catch
-                        return error.InvalidSyntax;
+                    try out.append(self.allocator, std.fmt.parseInt(
+                        u8,
+                        self.text[self.index..][0..2],
+                        16,
+                    ) catch return error.InvalidSyntax);
                     self.index += 2;
-                    try out.append(self.allocator, value);
                 },
                 else => return error.InvalidSyntax,
             }
@@ -174,15 +150,14 @@ const Parser = struct {
         while (self.index < self.text.len) {
             if (std.ascii.isWhitespace(self.text[self.index])) {
                 self.index += 1;
-                continue;
-            }
-            if (self.text[self.index] != '#') return;
-            while (self.index < self.text.len and self.text[self.index] != '\n')
-                self.index += 1;
+            } else if (self.text[self.index] == '#') {
+                while (self.index < self.text.len and self.text[self.index] != '\n')
+                    self.index += 1;
+            } else return;
         }
     }
 
-    fn skipSpaceAndSeparators(self: *Parser) void {
+    fn skipSeparators(self: *Parser) void {
         while (self.index < self.text.len) switch (self.text[self.index]) {
             ' ', '\t', '\r', '\n', ';' => self.index += 1,
             '#' => {
@@ -194,7 +169,7 @@ const Parser = struct {
     }
 
     fn consume(self: *Parser, byte: u8) bool {
-        if (self.index >= self.text.len or self.text[self.index] != byte) return false;
+        if (self.index == self.text.len or self.text[self.index] != byte) return false;
         self.index += 1;
         return true;
     }
@@ -219,12 +194,11 @@ fn joinPath(allocator: std.mem.Allocator, parent: []const u8, key: []const u8) E
         return allocator.dupe(u8, key) catch error.OutOfMemory;
     }
     if (key.len == 0 or key[0] == '/') return error.InvalidPath;
-    const separator = if (parent.len == 1) "" else "/";
-    const path = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-        parent,
-        separator,
-        key,
-    }) catch return error.OutOfMemory;
+    const path = std.fmt.allocPrint(
+        allocator,
+        "{s}{s}{s}",
+        .{ parent, if (parent.len == 1) "" else "/", key },
+    ) catch return error.OutOfMemory;
     if (!validPath(path)) {
         allocator.free(path);
         return error.InvalidPath;
@@ -233,8 +207,7 @@ fn joinPath(allocator: std.mem.Allocator, parent: []const u8, key: []const u8) E
 }
 
 fn validPath(path: []const u8) bool {
-    if (path.len == 0 or path[0] != '/' or
-        std.mem.indexOfScalar(u8, path, 0) != null)
+    if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null)
         return false;
     if (path.len == 1) return true;
     if (path[path.len - 1] == '/') return false;
@@ -247,37 +220,20 @@ fn validPath(path: []const u8) bool {
     return true;
 }
 
-pub fn parseMode(flags: []const u8) Error!Mode {
-    var mode = Mode.dir;
-    var tokens = std.mem.splitScalar(u8, flags, ',');
-    while (tokens.next()) |raw| {
-        const token = std.mem.trim(u8, raw, " \t\r\n");
-        if (token.len == 0) continue;
-        if (std.mem.eql(u8, token, "access")) mode.k = .visible_raw else if (std.mem.eql(u8, token, "empty")) mode.k = .visible_virtual else if (std.mem.eql(u8, token, "no-access")) mode.k = .invisible else if (std.mem.eql(u8, token, "overlay-w")) mode.w = .overlay else if (std.mem.startsWith(u8, token, "deny-"))
-            try setPermissions(&mode, token[5..], .deny)
-        else if (std.mem.startsWith(u8, token, "allow-"))
-            try setPermissions(&mode, token[6..], .ask)
-        else if (std.mem.startsWith(u8, token, "ALWAYS-allow-") or
-            std.mem.startsWith(u8, token, "always-allow-"))
-        {
-            const prefix_len: usize = if (token[0] == 'A') 13 else 13;
-            try setPermissions(&mode, token[prefix_len..], .allow);
-        } else return error.InvalidFlag;
-    }
-    return mode;
-}
-
-fn setPermissions(mode: *Mode, bits: []const u8, access: Mode.A) Error!void {
-    if (bits.len == 0) return error.InvalidFlag;
-    for (bits) |bit| switch (bit) {
-        'r' => mode.r = access,
-        'x' => mode.x = access,
-        'w' => mode.w = switch (access) {
-            .deny => .deny,
-            .ask => .ask,
-            .allow => .allow,
-            ._reserved => unreachable,
-        },
-        else => return error.InvalidFlag,
+test "four policy states round trip" {
+    const rules = [_]Trie.Rule{
+        .{ .path = @constCast("/"), .mode = .rw },
+        .{ .path = @constCast("/secret"), .mode = .whiteout },
+        .{ .path = @constCast("/read"), .mode = .r },
+        .{ .path = @constCast("/prompt"), .mode = .ask },
     };
+    const text = try format(std.testing.allocator, &rules);
+    defer std.testing.allocator.free(text);
+    const parsed = try parse(std.testing.allocator, text);
+    defer freeRules(std.testing.allocator, parsed);
+    try std.testing.expectEqual(rules.len, parsed.len);
+    for (rules, parsed) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.path, actual.path);
+        try std.testing.expectEqual(expected.mode, actual.mode);
+    }
 }

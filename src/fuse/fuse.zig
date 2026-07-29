@@ -12,6 +12,7 @@ pub const c = @cImport({
     @cInclude("dirent.h");
     @cInclude("errno.h");
     @cInclude("fcntl.h");
+    @cInclude("sys/xattr.h");
     @cInclude("poll.h");
     @cInclude("unistd.h");
 });

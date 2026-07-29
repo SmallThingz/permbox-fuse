@@ -66,9 +66,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     var driver: permfuse.Driver = undefined;
     driver.init(init.io, .{
-        .backing_path = config.backing,
+        .lower_path = config.lower,
         .policy_path = config.policy,
-        .state_path = config.state,
+        .session_path = config.session,
         .passthrough = config.passthrough,
     }) catch |err| {
         terminal.label(terminal.bright_red, "initialization failed: ");
@@ -98,7 +98,11 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     terminal.label(terminal.bright_green, "mounted configuration\n");
-    std.debug.print("  backing    {s}\n  mountpoint {s}\n", .{ config.backing, config.mountpoint });
+    std.debug.print("  lower      {s}\n  session    {s}\n  mountpoint {s}\n", .{
+        config.lower,
+        config.session,
+        config.mountpoint,
+    });
     terminal.label(terminal.dim, "  type 'help' for live policy commands\n");
 
     var line_ptr: [*c]u8 = null;
@@ -116,7 +120,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (length < 0) break;
         const line = std.mem.trim(u8, line_ptr[0..@intCast(length)], " \t\r\n");
         if (line.len == 0) continue;
-        const keep_running = executeCommand(init, &driver, line, joined) catch |err| {
+        const keep_running = executeCommand(init, &driver, line) catch |err| {
             terminal.label(terminal.bright_red, "error: ");
             std.debug.print("{t}\n", .{err});
             continue;
@@ -272,7 +276,6 @@ fn executeCommand(
     init: std.process.Init,
     driver: *permfuse.Driver,
     line: []const u8,
-    unmounted: bool,
 ) !bool {
     var words = std.mem.tokenizeAny(u8, line, " \t");
     const command = words.next().?;
@@ -294,8 +297,8 @@ fn executeCommand(
     } else if (std.mem.eql(u8, command, "set")) {
         const path = words.next() orelse return error.MissingPath;
         const flags_start = skipWords(line, 2) orelse return error.MissingFlags;
-        const mode = try permfuse.parseModeText(flags_start);
-        try driver.setRule(path, mode);
+        const access = try permfuse.parseAccessText(flags_start);
+        try driver.setRule(path, access);
         terminal.label(terminal.bright_green, "updated  ");
         std.debug.print("{s}\n", .{path});
     } else if (std.mem.eql(u8, command, "del")) {
@@ -320,24 +323,21 @@ fn executeCommand(
     } else if (std.mem.eql(u8, command, "unmount")) {
         driver.requestUnmount();
     } else if (std.mem.eql(u8, command, "apply")) {
-        if (!unmounted) return error.StillMounted;
         const limit = if (words.next()) |value|
             try std.fmt.parseInt(usize, value, 10)
         else
             null;
-        const remove = if (words.next()) |value| std.mem.eql(u8, value, "remove") else false;
-        const result = try driver.applyOverlay(init.gpa, .{
-            .max_files = limit,
-            .remove_applied = remove,
-        });
-        terminal.label(terminal.bright_green, "overlay  ");
-        std.debug.print("applied={}, skipped={}, remaining={}\n", .{
-            result.applied,
-            result.skipped,
-            result.remaining,
-        });
+        const result = try driver.apply(.{ .max_entries = limit });
+        terminal.label(terminal.bright_green, "applied  ");
+        std.debug.print("{} entries, {} remaining\n", .{ result.applied, result.remaining });
+    } else if (std.mem.eql(u8, command, "discard")) {
+        const path = words.next() orelse return error.MissingPath;
+        const relative = std.mem.trimStart(u8, path, "/");
+        try driver.discard(relative);
+        terminal.label(terminal.yellow, "discarded ");
+        std.debug.print("{s}\n", .{path});
     } else if (std.mem.eql(u8, command, "quit") or std.mem.eql(u8, command, "exit")) {
-        if (!unmounted) driver.requestUnmount();
+        driver.requestUnmount();
         return false;
     } else {
         return error.UnknownCommand;
@@ -360,14 +360,9 @@ fn skipWords(line: []const u8, count: usize) ?[]const u8 {
     return if (index == line.len) null else line[index..];
 }
 
-fn printMode(mode: ?permfuse.Mode) void {
+fn printMode(mode: ?permfuse.Access) void {
     if (mode) |value| {
-        std.debug.print("kind={t}, read={t}, write={t}, execute={t}\n", .{
-            value.k,
-            value.r,
-            value.w,
-            value.x,
-        });
+        std.debug.print("{t}\n", .{value});
     } else {
         std.debug.print("<none>\n", .{});
     }
@@ -378,7 +373,7 @@ fn printHelp() void {
     std.debug.print(
         "  show                         print the complete fs block\n" ++
             "  get PATH                     show exact and effective rules\n" ++
-            "  set PATH FLAGS               insert or replace a live rule\n" ++
+            "  set PATH whiteout|r|rw|ask   insert or replace a live rule\n" ++
             "  del PATH                     remove an explicit rule\n" ++
             "  load FILE                    replace policy from an fs block\n" ++
             "  save FILE                    save policy as an fs block\n",
@@ -387,7 +382,8 @@ fn printHelp() void {
     terminal.label(terminal.bright_blue, "Mount and overlay\n");
     std.debug.print(
         "  unmount                      stop the active mount\n" ++
-            "  apply [MAX_FILES] [remove]   apply overlay data after unmount\n" ++
+            "  apply [MAX_ENTRIES]          apply and remove upper entries\n" ++
+            "  discard PATH                 discard one upper subtree\n" ++
             "  quit                         unmount and exit\n",
         .{},
     );
@@ -401,8 +397,8 @@ fn printUsage(err: anyerror) void {
     );
     terminal.label(terminal.bright_blue, "usage\n  ");
     std.debug.print(
-        "permfuse --backing=/absolute/root --policy=/absolute/trie " ++
-            "[--state=/absolute/session] [--no-io-uring] [--no-passthrough] " ++
+        "permfuse --lower=/absolute/root --policy=/absolute/trie " ++
+            "--session=/absolute/session [--no-io-uring] [--no-passthrough] " ++
             "/absolute/mountpoint [FUSE options]\n" ++
             "  permfuse trie help\n",
         .{},

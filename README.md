@@ -1,82 +1,62 @@
 # permfuse
 
-Embeddable, policy-aware low-level FUSE 3 library for Linux, with an installed
-interactive `permfuse` command for direct mounts and live policy updates. It is
-the filesystem driver used by permbox.
-It maps a backing directory into one mount and evaluates the memory-mapped
-permission trie for namespace and open operations.
+`permfuse` is an embeddable Linux filesystem policy driver used by Permbox.
+It mounts a private kernel OverlayFS and exposes that merged tree through a
+small low-level FUSE filesystem.
 
-The daemon targets libfuse 3.18. Kernel FUSE-over-io_uring is enabled by
-default. Files whose effective rule is `visible_raw` with read, write, and
-execute all set to `allow` use kernel FUSE passthrough for read, write, splice,
-and mmap. Restricted files stay in userspace and are checked against their
-longest-prefix trie rule.
+OverlayFS handles copy-up, whiteouts, opaque directories, sparse files, mmap,
+links, rename, and ordinary filesystem behavior. The FUSE layer decides
+whether each path is hidden, read-only, writable, or requires a synchronous
+decision.
 
-## Validate
+## Policy
+
+Every explicit trie rule is one of:
+
+| Rule | Meaning |
+| --- | --- |
+| `whiteout` | The path appears not to exist |
+| `r` | Metadata and read-only access |
+| `rw` | Reads and mutations, subject to Unix permissions |
+| `ask` | Resolve to one of the other three before the operation |
+
+Rules use longest-component-prefix inheritance. There is no separate execute
+rule. Owner, group, mode, POSIX ACL, sticky-directory, and execute checks are
+normal kernel permission checks.
+
+The text form is:
+
+```text
+fs {
+  "/":rw {
+    "usr":r
+    "home/me":rw
+    "home/me/.ssh":ask
+    "secret":whiteout
+  }
+}
+```
+
+## Build and test
+
+The installed CLI uses LLVM by default:
 
 ```sh
+zig build
+```
+
+Run both required test configurations:
+
+```sh
+zig build test
 zig build test -Doptimize=ReleaseSafe
 ```
 
-The library requires Linux, libfuse 3.18 headers/libraries, and glibc.
-Passthrough also requires kernel support, `CONFIG_FUSE_PASSTHROUGH`, and
-`CAP_SYS_ADMIN`. If passthrough negotiation fails, the driver retains the same
-policy behavior using userspace I/O.
+Linux, glibc, and libfuse 3.18 are required. Kernel OverlayFS mounting and
+FUSE passthrough require the corresponding kernel features and privileges.
+When passthrough is unavailable, file I/O uses the normal FUSE path.
 
-## Embedding
-
-The package exports both `permfuse` (the driver API) and `permtrie` (the
-concurrency-safe trie). A dependent `build.zig` can import the driver with:
-
-```zig
-const dep = b.dependency("permbox_fuse", .{
-    .target = target,
-    .optimize = optimize,
-});
-exe.root_module.addImport("permfuse", dep.module("permfuse"));
-```
-
-The exported `permtrie` module can round-trip its mmap-backed binary policy to
-the permbox filesystem configuration syntax:
-
-```zig
-const text = try trie.toText(allocator);
-defer allocator.free(text);
-
-try trie.replaceFromText(allocator,
-    \\fs {
-    \\  "/": access,overlay-w,ALWAYS-allow-rx {
-    \\    "home/me": empty,allow-rw,deny-x
-    \\  }
-    \\}
-);
-```
-
-`toText` emits a canonical, bytewise-sorted `fs {}` block. It may flatten the
-input hierarchy, but preserves every explicit path and all current trie mode
-bits.
-
-The CLI can perform the same conversion without mounting a filesystem:
-
-```sh
-permfuse trie to-text policy.trie policy.fs
-permfuse trie from-text policy.fs policy.trie
-permfuse trie to-text policy.trie
-```
-
-The last form writes the `fs {}` representation to standard output. Opening a
-binary trie also repairs opposite-endian data in place before exporting it.
-
-See [docs/API.md](docs/API.md) for the complete public API reference for both
-`permtrie` and `permfuse`.
-
-The implementation is described in detail in
-[docs/architecture.pdf](docs/architecture.pdf). Its LaTeX source is
-[docs/architecture.tex](docs/architecture.tex).
-
-Initialize the driver in-place and do not move it while `mount` is running,
-because libfuse retains a pointer to its callback state. Configuration paths
-are copied during initialization:
+## Library use
 
 ```zig
 const std = @import("std");
@@ -86,97 +66,81 @@ fn ask(
     context: ?*anyopaque,
     io: std.Io,
     request: permfuse.AskRequest,
-) !permfuse.AskDecision {
+) !permfuse.Access {
     _ = context;
     _ = io;
-    std.log.info("permission requested: {s} {t}", .{
+    std.log.info("policy request: {s} {t}", .{
         request.path,
         request.operation,
     });
-    return .allow;
+    return .r;
 }
 
 var driver: permfuse.Driver = undefined;
 try driver.init(io, .{
-    .backing_path = "/srv/root",
-    .policy_path = "/run/app/policy.trie",
-    .state_path = "/run/app/session",
+    .lower_path = "/srv/root",
+    .policy_path = "/run/permbox/policy.trie",
+    .session_path = "/run/permbox/session",
     .ask_fn = ask,
 });
 defer driver.deinit();
 
-try driver.setRule("/", permfuse.Mode.dir);
-try driver.mount(allocator, "/run/app/mount", .{});
+try driver.setRule("/", .rw);
+try driver.setRule("/etc", .r);
+try driver.mount(allocator, "/run/permbox/mount", .{});
 ```
 
-`mount` is blocking and `requestUnmount` is thread-safe; applications can run
-the mount with `std.Io.concurrent` when they need other work on the calling
-task. One driver may be active in a process because the mmap trie currently has
-one process-global pool.
+`mount` blocks until unmounted. Run it with `std.Io.concurrent` or another
+thread when the caller needs to continue. `requestUnmount` is thread-safe.
+The driver must remain at a stable address while mounted.
 
-An open snapshots its effective rule. Allowed operations stay on an atomic
-one-byte fast path and fully allowed files remain eligible for kernel
-passthrough. For an `ask` snapshot, the operation re-checks the trie once before
-calling `ask_fn`. Approval stores an explicit allow rule and updates that open
-handle. This avoids duplicate prompts when another open resolved the rule.
+The private OverlayFS is mounted only for the duration of `Driver.mount`.
+After it returns, changes can be applied or discarded:
 
-`applyOverlay` copies exact journaled write ranges back to the backing
-filesystem only while the driver is unmounted. Each target is synced before
-its range-journal offset is checkpointed in `apply.log`, making retries
-idempotent after interruption and allowing later writes to the same path.
-`ApplyOptions.max_files` permits bounded/partial application; reopening the
-session and calling it again resumes at the first uncheckpointed entry.
-`OverlaySession.open` exposes the same recovery/apply machinery without
-mounting FUSE.
+```zig
+const result = try driver.apply(.{ .max_entries = 100 });
+if (!result.complete()) {
+    // A later call resumes from the remaining upper entries.
+}
 
-## Interactive CLI
-
-Build and install the LLVM-backed CLI:
-
-```sh
-zig build
+try driver.discard("tmp/generated");
 ```
 
-Start a mount:
+Apply publishes through destination-side temporary names, syncs the result and
+destination directory, then removes the corresponding upper entry. The upper
+tree is therefore the restart checkpoint.
+
+## CLI
 
 ```sh
 zig-out/bin/permfuse \
-  --backing=/absolute/backing/root \
+  --lower=/absolute/lower \
   --policy=/absolute/policy.trie \
-  --state=/absolute/state/directory \
+  --session=/absolute/session \
   /absolute/mountpoint
 ```
 
-The mountpoint is created when missing. While mounted, the prompt accepts:
+Interactive commands:
 
 ```text
 show
 get /path
-set /path access,ALWAYS-allow-r,overlay-w,allow-x
+set /path whiteout|r|rw|ask
 del /path
-load policy.conf
-save policy.conf
+load policy.fs
+save policy.fs
 unmount
-apply 100 remove
+apply 100
+discard /path
 quit
 ```
 
-Policy updates take effect for new opens. Handles with an `ask` snapshot
-re-read policy before issuing a permission request. The CLI automatically
-converts a valid opposite-endian trie file in place when opening it.
-
-## Manual mount harness
-
-An additional non-installed integration harness remains available:
+Trie conversion does not mount a filesystem:
 
 ```sh
-zig build run-mount-test -- \
-  --backing=/absolute/backing/root \
-  --policy=/absolute/policy.trie \
-  --state=/absolute/state/directory \
-  /absolute/mountpoint
+permfuse trie to-text policy.trie policy.fs
+permfuse trie from-text policy.fs policy.trie
 ```
 
-`--state` resumes durable overlay state. `--no-io-uring` and
-`--no-passthrough` select compatibility paths; remaining options are passed to
-libfuse.
+See [docs/API.md](docs/API.md) for the exported API and [PLAN.md](PLAN.md) for
+the implementation design and remaining acceptance work.

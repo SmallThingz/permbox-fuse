@@ -175,11 +175,8 @@ fn validate(self: *@This()) ValidateError!void {
         return VE.EndianMismatch;
     }
 
-    if (blk.version < VERSION) {
-        // This will start erroring if the VERSION is incremented
-        @compileError("TODO: implement older version handling");
-    } else if (blk.version > VERSION) {
-        log.err(@src(), "file's version value is higher than version of the program; file={}, program={}", .{ blk.version, VERSION });
+    if (blk.version != VERSION) {
+        log.err(@src(), "file version is unsupported; file={}, program={}", .{ blk.version, VERSION });
         return VE.UnsupportedVersion;
     }
 

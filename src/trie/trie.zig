@@ -63,7 +63,7 @@ fn collectNode(
     defer path.shrinkRetainingCapacity(original_len);
     const node = try self.pool.activeNodeAt(node_idx);
     try path.appendSlice(allocator, node.radix_str[0..node.radix_len]);
-    if (@as(u8, @bitCast(node.data)) != 0) {
+    if (@intFromEnum(node.data) != 0) {
         const owned = try allocator.dupe(u8, path.items);
         errdefer allocator.free(owned);
         try rules.append(allocator, .{ .path = owned, .mode = node.data });
@@ -294,7 +294,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
         while (true) {
             switch (curr.next(path)) {
                 .exact => {
-                    if (@as(u8, @bitCast(curr.data)) == 0) return error.NotFound;
+                    if (@intFromEnum(curr.data) == 0) return error.NotFound;
                     const old = curr.data;
                     curr.data = .midway;
                     break :del old;
@@ -304,7 +304,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
                         const sub_idx = curr.indexAt(idx).get();
                         const sub = try self.pool.activeNodeAt(sub_idx);
                         if (sub.radix_len > 0) return error.NotFound;
-                        if (@as(u8, @bitCast(sub.data)) == 0) return error.NotFound;
+                        if (@intFromEnum(sub.data) == 0) return error.NotFound;
                         const old = sub.data;
                         sub.data = .midway;
 
@@ -325,7 +325,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
                     if (!curr.bitset.isSet(idx)) return error.NotFound;
 
                     const valcnt = curr.valcntbounded(2);
-                    if (valcnt > 1 or (valcnt == 1 and @as(u8, @bitCast(curr.data)) != 0)) {
+                    if (valcnt > 1 or (valcnt == 1 and @intFromEnum(curr.data) != 0)) {
                         top_parent_idx = parent_idx;
                         top_parent_byte = parent_byte;
                         top_idx = curr_idx;
@@ -404,7 +404,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
     const prune_node = try self.pool.activeNodeAt(p_idx);
 
     // Rule A: Demote inline data promotion
-    if (prune_node.valcntbounded(1) == 0 and @as(u8, @bitCast(prune_node.data)) != 0 and prune_node.radix_len == 0) {
+    if (prune_node.valcntbounded(1) == 0 and @intFromEnum(prune_node.data) != 0 and prune_node.radix_len == 0) {
         if (p_parent_idx != 0) {
             const parent_node = try self.pool.activeNodeAt(p_parent_idx);
             parent_node.bitset.unset(p_parent_byte);
@@ -415,7 +415,7 @@ pub fn del(self: *@This(), _path: []const u8) !Mode {
     }
 
     // Rule B: Standard string merge
-    if (prune_node.valcntbounded(2) == 1 and @as(u8, @bitCast(prune_node.data)) == 0) {
+    if (prune_node.valcntbounded(2) == 1 and @intFromEnum(prune_node.data) == 0) {
         const child = prune_node.findFirstChild() orelse unreachable;
         if (child.is_node) {
             const child_byte = child.idx;
@@ -485,14 +485,14 @@ pub fn getExact(self: *@This(), _path: []const u8) !?Mode {
 
     while (true) switch (node.next(path)) {
         .exact => {
-            if (@as(u8, @bitCast(node.data)) == 0) return null;
+            if (@intFromEnum(node.data) == 0) return null;
             return node.data;
         },
         .this => |idx| {
             if (node.bitset.isSet(idx)) {
                 const sub = try node.indexAt(idx).getNode(self);
                 if (sub.radix_len > 0) return null;
-                if (@as(u8, @bitCast(sub.data)) == 0) return null;
+                if (@intFromEnum(sub.data) == 0) return null;
                 return sub.data;
             } else {
                 const val = node.indexAt(idx).get();
@@ -510,15 +510,15 @@ pub fn getExact(self: *@This(), _path: []const u8) !?Mode {
 }
 
 inline fn modeToInline(data: Mode) u24 {
-    return @as(u24, @as(u8, @bitCast(data)));
+    return @intFromEnum(data);
 }
 
 inline fn inlineToMode(val: u24) Mode {
-    return @bitCast(@as(u8, @truncate(val)));
+    return @enumFromInt(@as(u8, @truncate(val)));
 }
 
 inline fn isEmpty(node: *Node) bool {
-    return @as(u8, @bitCast(node.data)) == 0 and node.valcntbounded(1) == 0;
+    return node.data == .midway and node.valcntbounded(1) == 0;
 }
 
 fn releaseAndLog(self: *@This(), idx: u24, comptime reason: []const u8) void {
@@ -664,51 +664,26 @@ pub const BlkIdx = packed struct(u32) {
     }
 };
 
-pub const Mode = packed struct(u8) {
-    /// Dicatates the kind of node
-    k: K,
-    /// Controls weather one can read the contents of the current dir or not.
-    /// Default value depends on weather this is a dir or a file.
-    r: A,
-    /// Controls the write permission to the given file or dir.
-    /// Allowing writes for dirs means renaming files; defaults to tracking file moves
-    w: W,
-    /// Controls weather exec is allowed. Disallowing this for a dir means the process can't read subdiles/subdirs
-    x: A,
+/// A single policy decision. Zero is reserved for trie nodes which do not
+/// contain an explicit rule, so durable rules start at one.
+pub const Mode = enum(u8) {
+    midway = 0,
+    whiteout = 1,
+    r = 2,
+    rw = 3,
+    ask = 4,
 
-    pub const midway: @This() = @bitCast(@as(u8, 0));
-    pub const dir: @This() = .{ .k = .visible_raw, .r = .allow, .w = .overlay, .x = .allow };
-    pub const file: @This() = .{ .k = .visible_raw, .r = .deny, .w = .overlay, .x = .allow };
-
-    pub const K = enum(u2) {
-        /// This is a mid-way node and does not have it's own data; may or may not have children
-        midway = 0,
-        /// The file/dir is visible and present in the original fs
-        visible_raw = 1,
-        /// The file/dir is purely virtual; you should not do actual fs lookup in any case
-        visible_virtual = 2,
-        /// The node is not visible, may be created virtually in which case it will ve virtual
-        invisible = 3,
-    };
-    pub const A = enum(u2) {
-        deny = 0,
-        ask = 1,
-        allow = 2,
-        _reserved,
-    };
-    pub const W = enum(u2) {
-        deny = 0,
-        ask = 1,
-        allow = 2,
-        overlay = 3,
-    };
+    // Test values used by the trie structure tests below. These are private;
+    // the exported policy API exposes only the enum cases.
+    const dir: @This() = .rw;
+    const file: @This() = .r;
 };
 
 const testing = std.testing;
 
 // Helper to compare packed structs safely
 fn expectModeEqual(expected: Mode, actual: Mode) !void {
-    try testing.expectEqual(@as(u8, @bitCast(expected)), @as(u8, @bitCast(actual)));
+    try testing.expectEqual(expected, actual);
 }
 
 fn ensurePoolInitialized() !@This() {
@@ -729,7 +704,7 @@ fn dumpNode(self: *@This(), idx: u24, visited: *std.AutoHashMap(u24, void), dept
     const indent = indent_buf[0..@min(depth * 2, indent_buf.len)];
 
     std.debug.print("{s}node[{d}]: radix_len={d} data={x:0>2} radix_str='", .{
-        indent, idx, node.radix_len, @as(u8, @bitCast(node.data)),
+        indent, idx, node.radix_len, @intFromEnum(node.data),
     });
 
     const rlen = @min(node.radix_len, 40);

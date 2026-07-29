@@ -5,11 +5,16 @@ const Trie = @import("trie.zig");
 const serialization = @import("serialization.zig");
 const log = @import("log.zig");
 
-pub const Mode = Trie.Mode;
+pub const Access = enum(u2) {
+    whiteout,
+    r,
+    rw,
+    ask,
+};
 pub const TextError = serialization.Error;
 
-pub fn parseModeText(flags: []const u8) TextError!Mode {
-    return serialization.parseMode(flags);
+pub fn parseAccessText(flags: []const u8) TextError!Access {
+    return decode(serialization.parseMode(flags) catch |err| return err);
 }
 
 /// The unlocked trie instance.
@@ -33,31 +38,31 @@ pub fn deinit(me: *@This()) void {
 }
 
 /// Insert or replace `path` with `data`. Takes the write lock, then syncs.
-pub fn add(me: *@This(), path: []const u8, data: Mode) !void {
+pub fn add(me: *@This(), path: []const u8, data: Access) !void {
     me.lockWrite();
     defer me.unlockWrite();
     try me.addLocked(path, data);
 }
 
 /// Remove `path` and return its previous value. Takes the write lock, then syncs.
-pub fn del(me: *@This(), path: []const u8) !Mode {
+pub fn del(me: *@This(), path: []const u8) !Access {
     me.lockWrite();
     defer me.unlockWrite();
     return me.delLocked(path);
 }
 
 /// Return the nearest slash-delimited ancestor rule for `path`. Read-only, shared lock.
-pub fn get(me: *@This(), path: []const u8) !?Mode {
+pub fn get(me: *@This(), path: []const u8) !?Access {
     me.lock.lockSharedUncancelable(me.io);
     defer me.lock.unlockShared(me.io);
-    return me.trie.get(path);
+    return if (try me.trie.get(path)) |mode| decode(mode) else null;
 }
 
 /// Return only the rule stored at `path`, without ancestor inheritance.
-pub fn getExact(me: *@This(), path: []const u8) !?Mode {
+pub fn getExact(me: *@This(), path: []const u8) !?Access {
     me.lock.lockSharedUncancelable(me.io);
     defer me.lock.unlockShared(me.io);
-    return me.trie.getExact(path);
+    return if (try me.trie.getExact(path)) |mode| decode(mode) else null;
 }
 
 /// Serialize every explicit binary-trie rule to canonical permbox `fs` text.
@@ -99,29 +104,29 @@ pub fn unlockWrite(me: *@This()) void {
     me.lock.unlock(me.io);
 }
 
-pub fn getLocked(me: *@This(), path: []const u8) !?Mode {
-    return me.trie.get(path);
+pub fn getLocked(me: *@This(), path: []const u8) !?Access {
+    return if (try me.trie.get(path)) |mode| decode(mode) else null;
 }
 
-pub fn getExactLocked(me: *@This(), path: []const u8) !?Mode {
-    return me.trie.getExact(path);
+pub fn getExactLocked(me: *@This(), path: []const u8) !?Access {
+    return if (try me.trie.getExact(path)) |mode| decode(mode) else null;
 }
 
-pub fn addLocked(me: *@This(), path: []const u8, data: Mode) !void {
-    me.trie.add(path, data) catch |err| {
+pub fn addLocked(me: *@This(), path: []const u8, data: Access) !void {
+    me.trie.add(path, encode(data)) catch |err| {
         log.err(@src(), "failed to set trie rule; error={t}, path={s}, mode={}", .{ err, path, data });
         return err;
     };
     me.syncLocked();
 }
 
-pub fn delLocked(me: *@This(), path: []const u8) !Mode {
+pub fn delLocked(me: *@This(), path: []const u8) !Access {
     const old = me.trie.del(path) catch |err| {
         log.err(@src(), "failed to remove trie rule; error={t}, path={s}", .{ err, path });
         return err;
     };
     me.syncLocked();
-    return old;
+    return decode(old);
 }
 
 /// Discard all entries and reset the trie to empty. Takes the write lock.
@@ -134,6 +139,25 @@ pub fn reset(me: *@This()) void {
 fn syncLocked(me: *@This()) void {
     me.trie.sync() catch |err|
         log.err(@src(), "failed to persist committed trie update: {t}", .{err});
+}
+
+fn encode(access: Access) Trie.Mode {
+    return switch (access) {
+        .whiteout => .whiteout,
+        .r => .r,
+        .rw => .rw,
+        .ask => .ask,
+    };
+}
+
+fn decode(mode: Trie.Mode) Access {
+    return switch (mode) {
+        .whiteout => .whiteout,
+        .r => .r,
+        .rw => .rw,
+        .ask => .ask,
+        .midway => unreachable,
+    };
 }
 
 const testing = std.testing;
@@ -150,7 +174,7 @@ test "concurrent readers and writers preserve trie invariants" {
             var path = [3]u8{ '/', first_byte, 0 };
             for (0..250) |i| {
                 path[2] = @truncate(i);
-                root_ptr.add(&path, Mode.dir) catch {
+                root_ptr.add(&path, .rw) catch {
                     fail_flag.store(true, .release);
                     return;
                 };
@@ -179,15 +203,11 @@ test "concurrent readers and writers preserve trie invariants" {
     try testing.expect(!failed.load(.acquire));
 }
 
-test "text serialization round trips every current mode field" {
+test "text serialization round trips all policy states" {
     var root = try init(std.testing.io, try std.posix.memfd_create("permbox-text-roundtrip", 0));
     defer root.deinit();
 
-    const modes = [_]Mode{
-        .{ .k = .visible_raw, .r = .deny, .w = .deny, .x = .ask },
-        .{ .k = .visible_virtual, .r = .ask, .w = .allow, .x = .allow },
-        .{ .k = .invisible, .r = .allow, .w = .overlay, .x = .deny },
-    };
+    const modes = [_]Access{ .whiteout, .r, .ask };
     try root.add("/a", modes[0]);
     try root.add("/a/quoted\"\\name", modes[1]);
     try root.add("/z", modes[2]);
@@ -197,42 +217,38 @@ test "text serialization round trips every current mode field" {
     root.reset();
     try root.replaceFromText(std.testing.allocator, text);
 
-    try std.testing.expectEqual(@as(u8, @bitCast(modes[0])), @as(u8, @bitCast((try root.getExact("/a")).?)));
-    try std.testing.expectEqual(@as(u8, @bitCast(modes[1])), @as(u8, @bitCast((try root.getExact("/a/quoted\"\\name")).?)));
-    try std.testing.expectEqual(@as(u8, @bitCast(modes[2])), @as(u8, @bitCast((try root.getExact("/z")).?)));
+    try std.testing.expectEqual(modes[0], (try root.getExact("/a")).?);
+    try std.testing.expectEqual(modes[1], (try root.getExact("/a/quoted\"\\name")).?);
+    try std.testing.expectEqual(modes[2], (try root.getExact("/z")).?);
 }
 
-test "text import accepts nested spec syntax and combined flags" {
+test "text import accepts nested fs syntax" {
     var root = try init(std.testing.io, try std.posix.memfd_create("permbox-text-nested", 0));
     defer root.deinit();
     try root.replaceFromText(std.testing.allocator,
         \\fs {
-        \\  "/": access,overlay-w,ALWAYS-allow-rx {
-        \\    "home/a": empty,allow-rw,deny-x
-        \\    ".ssh": no-access,deny-rwx
+        \\  "/":rw {
+        \\    "home/a":r
+        \\    ".ssh":whiteout
         \\  }
         \\}
     );
-    const child = (try root.getExact("/home/a")).?;
-    try std.testing.expectEqual(Mode.K.visible_virtual, child.k);
-    try std.testing.expectEqual(Mode.A.ask, child.r);
-    try std.testing.expectEqual(Mode.W.ask, child.w);
-    try std.testing.expectEqual(Mode.A.deny, child.x);
-    try std.testing.expectEqual(Mode.K.invisible, (try root.getExact("/.ssh")).?.k);
+    try std.testing.expectEqual(Access.r, (try root.getExact("/home/a")).?);
+    try std.testing.expectEqual(Access.whiteout, (try root.getExact("/.ssh")).?);
 }
 
 test "invalid text does not alter the binary trie" {
     var root = try init(std.testing.io, try std.posix.memfd_create("permbox-text-invalid", 0));
     defer root.deinit();
-    try root.add("/kept", Mode.dir);
-    try std.testing.expectError(error.InvalidFlag, root.replaceFromText(
+    try root.add("/kept", .rw);
+    try std.testing.expectError(error.InvalidMode, root.replaceFromText(
         std.testing.allocator,
-        "\"/bad\":access,unknown-flag",
+        "\"/bad\":invalid",
     ));
     try std.testing.expect((try root.getExact("/kept")) != null);
     try std.testing.expectError(error.InvalidPath, root.replaceFromText(
         std.testing.allocator,
-        "\"/allowed/../denied\":access,ALWAYS-allow-rwx",
+        "\"/allowed/../denied\":rw",
     ));
     try std.testing.expect((try root.getExact("/kept")) != null);
 }

@@ -1,83 +1,37 @@
-//! Durable sparse-overlay sessions and restart-safe application.
-//!
-//! A session directory contains:
-//!   format       - format marker
-//!   data/<id>    - sparse data extents
-//!   ranges/<id>  - exact little-endian { offset, length } write records
-//!   paths/<id>   - the normalized absolute backing path
-//!   apply.log    - durable per-id range-journal offsets
-//!
-//! Applying a file is idempotent. The target is synced before its journal
-//! offset is appended and synced in apply.log, so a crash can at worst replay
-//! the uncheckpointed ranges.
+//! Private kernel OverlayFS session lifecycle.
 const std = @import("std");
 const log = @import("log.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
     @cDefine("_FORTIFY_SOURCE", "0");
-    @cInclude("dirent.h");
     @cInclude("errno.h");
+    @cInclude("dirent.h");
     @cInclude("fcntl.h");
+    @cInclude("stdio.h");
+    @cInclude("sys/file.h");
+    @cInclude("sys/mount.h");
     @cInclude("sys/stat.h");
+    @cInclude("sys/xattr.h");
     @cInclude("unistd.h");
 });
 
-const format_v1 = "permbox-overlay-v1\n";
-const format_v2 = "permbox-overlay-v2\n";
-const id_len = 32;
-const max_path = 4096;
+var temporary_counter: std.atomic.Value(u64) = .init(0);
+const internal_trash = ".permfuse-internal-trash";
 
-pub const Range = extern struct {
-    offset: u64,
-    length: u64,
-};
-
-pub const RangeDisk = [@sizeOf(Range)]u8;
-
-pub fn encodeRange(range: Range, little_endian: bool) RangeDisk {
-    var disk: RangeDisk = undefined;
-    const endian: std.builtin.Endian = if (little_endian) .little else @import("builtin").cpu.arch.endian();
-    std.mem.writeInt(u64, disk[0..8], range.offset, endian);
-    std.mem.writeInt(u64, disk[8..16], range.length, endian);
-    return disk;
-}
-
-pub fn decodeRange(disk: *const RangeDisk, little_endian: bool) Range {
-    const endian: std.builtin.Endian = if (little_endian) .little else @import("builtin").cpu.arch.endian();
-    return .{
-        .offset = std.mem.readInt(u64, disk[0..8], endian),
-        .length = std.mem.readInt(u64, disk[8..16], endian),
-    };
-}
-
-comptime {
-    std.debug.assert(@sizeOf(Range) == 16);
-    std.debug.assert(@alignOf(Range) == @alignOf(u64));
-}
-
-pub const Error = error{
-    InvalidSession,
-    InvalidPath,
-    HashCollision,
-    IncompleteEntry,
-    UnsupportedFile,
-    Io,
-    OutOfMemory,
+pub const MountOptions = struct {
+    redirect_dir: bool = true,
+    index: bool = true,
+    xino_auto: bool = true,
 };
 
 pub const ApplyOptions = struct {
-    /// Stop after this many previously-unapplied files. Null means no limit.
-    max_files: ?usize = null,
-    /// Remove overlay data and path records after their apply checkpoint is
-    /// durable. The apply log remains the recovery authority.
-    remove_applied: bool = false,
+    max_entries: ?usize = null,
 };
 
 pub const ApplyResult = struct {
-    applied: usize,
-    skipped: usize,
-    remaining: usize,
+    applied: usize = 0,
+    remaining: usize = 0,
 
     pub fn complete(self: ApplyResult) bool {
         return self.remaining == 0;
@@ -86,1143 +40,681 @@ pub const ApplyResult = struct {
 
 pub const Session = struct {
     io: std.Io,
-    root_fd: c_int,
-    data_fd: c_int,
-    ranges_fd: c_int,
-    paths_fd: c_int,
-    ranges_little_endian: bool,
-    mutex: std.Io.Mutex = .init,
+    root: [:0]u8,
+    upper: [:0]u8,
+    work: [:0]u8,
+    merged: [:0]u8,
+    lock_fd: c_int,
+    mounted: bool = false,
+    index_enabled: bool = false,
 
-    pub fn open(io: std.Io, path: [:0]const u8, create: bool) Error!Session {
-        const root_fd = c.open(
-            path.ptr,
-            c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC,
+    pub fn open(io: std.Io, path: [:0]const u8) !Session {
+        try std.Io.Dir.cwd().createDirPath(io, path);
+        const allocator = std.heap.c_allocator;
+        const root = try allocator.dupeZ(u8, path);
+        errdefer allocator.free(root);
+        try ensureDirectory(root);
+        const upper = try childPath(allocator, path, "upper");
+        errdefer allocator.free(upper);
+        const work = try childPath(allocator, path, "work");
+        errdefer allocator.free(work);
+        const merged = try childPath(allocator, path, "merged");
+        errdefer allocator.free(merged);
+        const lock_path = try childPath(allocator, path, "lock");
+        defer allocator.free(lock_path);
+
+        try ensureDirectory(upper);
+        try ensureDirectory(work);
+        try ensureDirectory(merged);
+
+        const lock_fd = c.open(
+            lock_path.ptr,
+            c.O_RDWR | c.O_CREAT | c.O_CLOEXEC | c.O_NOFOLLOW,
+            @as(c.mode_t, 0o600),
         );
-        if (root_fd < 0) {
-            const open_errno: c_int = @intFromEnum(std.c.errno(root_fd));
-            if (!create or open_errno != c.ENOENT) {
-                log.err(@src(), "open session root failed; path={s}, create={}, errno={}", .{ path, create, open_errno });
-                return error.Io;
-            }
-            const mkdir_rc = c.mkdir(path.ptr, 0o700);
-            const mkdir_errno: c_int = @intFromEnum(std.c.errno(mkdir_rc));
-            if (mkdir_rc != 0 and mkdir_errno != c.EEXIST) {
-                log.err(@src(), "mkdir session root failed; path={s}, errno={}", .{ path, mkdir_errno });
-                return error.Io;
-            }
-        }
-        const opened_root = if (root_fd >= 0) root_fd else c.open(
-            path.ptr,
-            c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC,
-        );
-        if (opened_root < 0) {
-            log.err(@src(), "reopen session root after mkdir failed; path={s}, errno={}", .{ path, @intFromEnum(std.c.errno(opened_root)) });
-            return error.Io;
-        }
-        errdefer _ = c.close(opened_root);
-
-        const ranges_little_endian = try ensureFormat(opened_root, create);
-        try ensureDir(opened_root, "data", create);
-        try ensureDir(opened_root, "ranges", create);
-        try ensureDir(opened_root, "paths", create);
-        const root_sync_rc = if (create) c.fsync(opened_root) else 0;
-        if (root_sync_rc != 0) {
-            log.err(@src(), "fsync session root failed; path={s}, errno={}", .{ path, @intFromEnum(std.c.errno(root_sync_rc)) });
-            return error.Io;
-        }
-
-        const data_fd = c.openat(opened_root, "data", c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC);
-        if (data_fd < 0) {
-            log.err(@src(), "open data dir failed; root={s}, errno={}", .{ path, @intFromEnum(std.c.errno(data_fd)) });
-            return error.Io;
-        }
-        errdefer _ = c.close(data_fd);
-        const paths_fd = c.openat(opened_root, "paths", c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC);
-        if (paths_fd < 0) {
-            log.err(@src(), "open paths dir failed; root={s}, errno={}", .{ path, @intFromEnum(std.c.errno(paths_fd)) });
-            return error.Io;
-        }
-        errdefer _ = c.close(paths_fd);
-        const ranges_fd = c.openat(opened_root, "ranges", c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC);
-        if (ranges_fd < 0) {
-            log.err(@src(), "open ranges dir failed; root={s}, errno={}", .{ path, @intFromEnum(std.c.errno(ranges_fd)) });
-            return error.Io;
-        }
-        errdefer _ = c.close(ranges_fd);
+        if (lock_fd < 0) return error.OpenSessionLockFailed;
+        errdefer _ = c.close(lock_fd);
+        if (c.flock(lock_fd, c.LOCK_EX | c.LOCK_NB) != 0)
+            return error.SessionBusy;
 
         return .{
             .io = io,
-            .root_fd = opened_root,
-            .data_fd = data_fd,
-            .ranges_fd = ranges_fd,
-            .paths_fd = paths_fd,
-            .ranges_little_endian = ranges_little_endian,
+            .root = root,
+            .upper = upper,
+            .work = work,
+            .merged = merged,
+            .lock_fd = lock_fd,
         };
-    }
-
-    pub fn rangesAreLittleEndian(self: *const Session) bool {
-        return self.ranges_little_endian;
     }
 
     pub fn deinit(self: *Session) void {
-        _ = c.close(self.paths_fd);
-        _ = c.close(self.ranges_fd);
-        _ = c.close(self.data_fd);
-        _ = c.close(self.root_fd);
+        if (self.mounted) self.unmount() catch |err|
+            log.err(@src(), "failed to unmount OverlayFS during deinit: {t}", .{err});
+        _ = c.flock(self.lock_fd, c.LOCK_UN);
+        _ = c.close(self.lock_fd);
+        const allocator = std.heap.c_allocator;
+        allocator.free(self.merged);
+        allocator.free(self.work);
+        allocator.free(self.upper);
+        allocator.free(self.root);
         self.* = undefined;
     }
 
-    pub fn duplicateDataFd(self: *const Session) Error!c_int {
-        const fd = c.fcntl(self.data_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
-        if (fd < 0) log.err(@src(), "fcntl(DUPFD_CLOEXEC) for data_fd failed; fd={}, errno={}", .{ self.data_fd, @intFromEnum(std.c.errno(fd)) });
-        return if (fd < 0) error.Io else fd;
+    pub fn mount(self: *Session, lower: [:0]const u8, options: MountOptions) !void {
+        if (self.mounted) return error.AlreadyMounted;
+
+        if (options.index) {
+            self.mountWith(lower, options, true) catch |err| {
+                log.warn(@src(), "OverlayFS index unavailable, retrying without it: {t}", .{err});
+                try self.mountWith(lower, options, false);
+                self.index_enabled = false;
+                self.mounted = true;
+                return;
+            };
+            self.index_enabled = true;
+        } else {
+            try self.mountWith(lower, options, false);
+            self.index_enabled = false;
+        }
+        self.mounted = true;
     }
 
-    pub fn duplicatePathsFd(self: *const Session) Error!c_int {
-        const fd = c.fcntl(self.paths_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
-        if (fd < 0) log.err(@src(), "fcntl(DUPFD_CLOEXEC) for paths_fd failed; fd={}, errno={}", .{ self.paths_fd, @intFromEnum(std.c.errno(fd)) });
-        return if (fd < 0) error.Io else fd;
-    }
-
-    /// Records the reverse mapping before overlay data is made writable.
-    pub fn register(self: *Session, path: []const u8) Error![id_len:0]u8 {
-        if (!validPath(path)) {
-            log.err(@src(), "register called with invalid path; path={s}", .{path});
-            return error.InvalidPath;
-        }
-        var id = overlayId(path);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
-        const existing = c.openat(self.paths_fd, &id, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
-        if (existing >= 0) {
-            var buf: [max_path]u8 = undefined;
-            const got = c.pread(existing, &buf, buf.len, 0);
-            const read_errno: c_int = if (got < 0) @intFromEnum(std.c.errno(got)) else 0;
-            _ = c.close(existing);
-            if (got < 0) {
-                log.err(@src(), "read existing path record failed; id={s}, errno={}", .{ id, read_errno });
-                return error.Io;
-            }
-            const existing_path = buf[0..@intCast(got)];
-            if (!std.mem.eql(u8, existing_path, path)) {
-                log.err(@src(), "hash collision; id={s}, existing={s}, path={s}", .{ id, existing_path, path });
-                return error.HashCollision;
-            }
-            return id;
-        }
-        const existing_errno: c_int = @intFromEnum(std.c.errno(existing));
-        if (existing_errno != c.ENOENT) {
-            log.err(@src(), "open existing path record failed; id={s}, errno={}", .{ id, existing_errno });
-            return error.Io;
-        }
-
-        // Publish only a completely written record. A crash may leave an
-        // ignored pending file, never a torn final path mapping.
-        var pending_buf: [96]u8 = undefined;
-        const pending = std.fmt.bufPrintZ(&pending_buf, "{s}.{d}.{x}.pending", .{
-            id[0..id_len],
-            c.getpid(),
-            @intFromPtr(self),
-        }) catch unreachable;
-        const fd = c.openat(
-            self.paths_fd,
-            pending.ptr,
-            c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_NOFOLLOW | c.O_CLOEXEC,
-            @as(c.mode_t, 0o600),
+    fn mountWith(
+        self: *Session,
+        lower: [:0]const u8,
+        options: MountOptions,
+        index: bool,
+    ) !void {
+        const mount_data = try std.fmt.allocPrintSentinel(
+            std.heap.c_allocator,
+            "lowerdir={s},upperdir={s},workdir={s},redirect_dir={s},index={s},xino={s},metacopy=off",
+            .{
+                lower,
+                self.upper,
+                self.work,
+                if (options.redirect_dir) "on" else "off",
+                if (index) "on" else "off",
+                if (options.xino_auto) "auto" else "off",
+            },
+            0,
         );
-        if (fd < 0) {
-            log.err(@src(), "open pending path record failed; id={s}, errno={}", .{ id, @intFromEnum(std.c.errno(fd)) });
-            return error.Io;
-        }
-        const written = c.pwrite(fd, path.ptr, path.len, 0);
-        if (written != @as(isize, @intCast(path.len))) {
-            log.err(@src(), "write pending path record failed; id={s}, wanted={d}, wrote={d}, errno={}", .{
-                id,
-                path.len,
-                written,
-                if (written < 0) @intFromEnum(std.c.errno(written)) else 0,
+        defer std.heap.c_allocator.free(mount_data);
+        const rc = c.mount("overlay", self.merged.ptr, "overlay", 0, mount_data.ptr);
+        if (rc != 0) {
+            log.err(@src(), "OverlayFS mount failed; merged={s}, errno={}", .{
+                self.merged,
+                @intFromEnum(std.c.errno(rc)),
             });
-            _ = c.close(fd);
-            _ = c.unlinkat(self.paths_fd, pending.ptr, 0);
-            return error.Io;
+            return error.OverlayMountFailed;
         }
-        const data_sync_rc = c.fdatasync(fd);
-        if (data_sync_rc != 0) {
-            log.err(@src(), "sync pending path record failed; id={s}, errno={}", .{ id, @intFromEnum(std.c.errno(data_sync_rc)) });
-            _ = c.close(fd);
-            _ = c.unlinkat(self.paths_fd, pending.ptr, 0);
-            return error.Io;
-        }
-        _ = c.close(fd);
-        const link_rc = c.linkat(self.paths_fd, pending.ptr, self.paths_fd, &id, 0);
-        if (link_rc != 0) {
-            const link_errno: c_int = @intFromEnum(std.c.errno(link_rc));
-            if (link_errno != c.EEXIST) {
-                log.err(@src(), "publish path record failed; id={s}, errno={}", .{ id, link_errno });
-                _ = c.unlinkat(self.paths_fd, pending.ptr, 0);
-                return error.Io;
-            }
-        }
-        const unlink_rc = c.unlinkat(self.paths_fd, pending.ptr, 0);
-        const unlink_errno: c_int = @intFromEnum(std.c.errno(unlink_rc));
-        if (unlink_rc != 0 and unlink_errno != c.ENOENT) {
-            log.warn(@src(), "remove pending path record failed; id={s}, errno={}", .{ id, unlink_errno });
-        }
-        const paths_sync_rc = c.fsync(self.paths_fd);
-        if (paths_sync_rc != 0) {
-            log.err(@src(), "sync paths directory after publish failed; id={s}, errno={}", .{ id, @intFromEnum(std.c.errno(paths_sync_rc)) });
-            return error.Io;
-        }
-
-        // A cross-process winner must map the hash to the same path.
-        const published = c.openat(self.paths_fd, &id, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
-        if (published < 0) {
-            log.err(@src(), "verify-open published path failed; id={s}, errno={}", .{ id, @intFromEnum(std.c.errno(published)) });
-            return error.Io;
-        }
-        defer _ = c.close(published);
-        var published_buf: [max_path]u8 = undefined;
-        const published_len = c.pread(published, &published_buf, published_buf.len, 0);
-        if (published_len < 0) {
-            log.err(@src(), "verify-read published path failed; id={s}, errno={}", .{ id, @intFromEnum(std.c.errno(published_len)) });
-            return error.Io;
-        }
-        if (!std.mem.eql(u8, published_buf[0..@intCast(published_len)], path)) {
-            log.err(@src(), "verify mismatch; id={s}, published={s}, path={s}", .{ id, published_buf[0..@intCast(published_len)], path });
-            return error.HashCollision;
-        }
-        return id;
     }
 
-    /// Applies pending sparse extents to `backing_path`. This method may be
-    /// called repeatedly, across process restarts, or with a file limit.
+    pub fn unmount(self: *Session) !void {
+        if (!self.mounted) return;
+        const rc = c.umount2(self.merged.ptr, 0);
+        if (rc != 0) return error.OverlayUnmountFailed;
+        self.mounted = false;
+    }
+
+    pub fn openMergedRoot(self: *Session) !c_int {
+        if (!self.mounted) return error.NotMounted;
+        const fd = c.open(
+            self.merged.ptr,
+            c.O_PATH | c.O_DIRECTORY | c.O_CLOEXEC | c.O_NOFOLLOW,
+        );
+        if (fd < 0) return error.OpenMergedRootFailed;
+        return fd;
+    }
+
+    /// Apply a bounded number of upper entries. The upper tree is the durable
+    /// checkpoint: an entry is removed only after its lower operation and
+    /// destination directory have been synced.
     pub fn apply(
         self: *Session,
-        allocator: std.mem.Allocator,
-        backing_path: [:0]const u8,
+        lower: [:0]const u8,
         options: ApplyOptions,
-    ) Error!ApplyResult {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
-        const backing_fd = c.open(
-            backing_path.ptr,
-            c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC,
-        );
-        if (backing_fd < 0) {
-            log.err(@src(), "open backing dir for apply failed; path={s}, errno={}", .{ backing_path, @intFromEnum(std.c.errno(backing_fd)) });
-            return error.Io;
-        }
-        defer _ = c.close(backing_fd);
-
-        const log_fd = c.openat(
-            self.root_fd,
-            "apply.log",
-            c.O_RDWR | c.O_CREAT | c.O_APPEND | c.O_NOFOLLOW | c.O_CLOEXEC,
-            @as(c.mode_t, 0o600),
-        );
-        if (log_fd < 0) {
-            log.err(@src(), "open/create apply checkpoint log failed; root_fd={}, errno={}", .{ self.root_fd, @intFromEnum(std.c.errno(log_fd)) });
-            return error.Io;
-        }
-        defer _ = c.close(log_fd);
-        const root_sync_rc = c.fsync(self.root_fd);
-        if (root_sync_rc != 0) {
-            log.err(@src(), "fsync root dir before apply failed; errno={}", .{@intFromEnum(std.c.errno(root_sync_rc))});
-            return error.Io;
-        }
-
-        var completed = std.StringHashMapUnmanaged(u64).empty;
+    ) !ApplyResult {
+        if (self.mounted) return error.SessionMounted;
+        var result: ApplyResult = .{};
+        var budget = options.max_entries orelse std.math.maxInt(usize);
+        const trash = try childPath(std.heap.c_allocator, self.upper, internal_trash);
+        defer std.heap.c_allocator.free(trash);
+        removeTree(trash) catch |err| if (err != error.NotFound) return err;
+        var links: std.AutoHashMapUnmanaged(u128, [:0]u8) = .empty;
         defer {
-            var it = completed.keyIterator();
-            while (it.next()) |key| allocator.free(key.*);
-            completed.deinit(allocator);
+            var iterator = links.valueIterator();
+            while (iterator.next()) |path| std.heap.c_allocator.free(path.*);
+            links.deinit(std.heap.c_allocator);
         }
-        try readCompleted(allocator, log_fd, &completed);
-
-        // A dup shares the directory stream offset with paths_fd. Open a new
-        // file description so repeated partial applications always rescan.
-        const scan_fd = c.openat(
-            self.root_fd,
-            "paths",
-            c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC,
-        );
-        if (scan_fd < 0) {
-            log.err(@src(), "open paths dir for apply scan failed; errno={}", .{@intFromEnum(std.c.errno(scan_fd))});
-            return error.Io;
-        }
-        const directory = c.fdopendir(scan_fd) orelse {
-            log.err(@src(), "fdopendir for apply scan failed; errno={}", .{@intFromEnum(std.c.errno(@as(c_int, -1)))});
-            _ = c.close(scan_fd);
-            return error.Io;
-        };
-        defer _ = c.closedir(directory);
-
-        var result: ApplyResult = .{ .applied = 0, .skipped = 0, .remaining = 0 };
-        while (true) {
-            // readdir returns null for both EOF and failure. errno must be
-            // cleared immediately before the call to distinguish the two.
-            std.c._errno().* = 0;
-            const entry = c.readdir(directory) orelse {
-                const read_errno: c_int = @intFromEnum(std.c.errno(@as(c_int, -1)));
-                if (read_errno != 0) {
-                    log.err(@src(), "readdir failed during apply scan; errno={}", .{read_errno});
-                    return error.Io;
-                }
-                break;
-            };
-            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
-            if (name.len != id_len or name[0] == '.') continue;
-            const journal_end = rangeJournalEnd(self, name) catch |err| switch (err) {
-                error.IncompleteEntry => {
-                    result.remaining += 1;
-                    continue;
-                },
-                else => return err,
-            };
-            var journal_start = completed.get(name) orelse 0;
-            // remove_applied permits a later mount to recreate the same id.
-            if (journal_start > journal_end) journal_start = 0;
-            if (journal_start == journal_end) {
-                if (options.remove_applied)
-                    try removeAppliedEntry(self, log_fd, name);
-                result.skipped += 1;
-                continue;
-            }
-            if (options.max_files) |limit| {
-                if (result.applied >= limit) {
-                    result.remaining += 1;
-                    continue;
-                }
-            }
-
-            applyOne(self, backing_fd, name, journal_start, journal_end) catch |err| switch (err) {
-                error.IncompleteEntry => {
-                    result.remaining += 1;
-                    continue;
-                },
-                else => return err,
-            };
-            try appendCheckpoint(log_fd, name, journal_end);
-            result.applied += 1;
-
-            if (options.remove_applied)
-                try removeAppliedEntry(self, log_fd, name);
-        }
+        try applyDirectory(self.upper, lower, lower, &budget, &result, &links, true);
+        result.remaining = try countEntries(self.upper);
         return result;
+    }
+
+    pub fn discard(self: *Session, relative_path: []const u8) !void {
+        if (self.mounted) return error.SessionMounted;
+        if (!validRelative(relative_path)) return error.InvalidPath;
+        const target = try childPath(std.heap.c_allocator, self.upper, relative_path);
+        defer std.heap.c_allocator.free(target);
+        try removeTree(target);
+        try syncParent(target);
     }
 };
 
-pub fn overlayId(path: []const u8) [id_len:0]u8 {
-    var result: [id_len:0]u8 = undefined;
-    _ = std.fmt.bufPrint(result[0..id_len], "{x:0>16}{x:0>16}", .{
-        std.hash.Wyhash.hash(0, path),
-        std.hash.Wyhash.hash(0x9e3779b97f4a7c15, path),
-    }) catch unreachable;
-    result[id_len] = 0;
-    return result;
+fn childPath(allocator: std.mem.Allocator, parent: []const u8, child: []const u8) ![:0]u8 {
+    return std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}{s}{s}",
+        .{ parent, if (parent.len == 1) "" else "/", child },
+        0,
+    );
 }
 
-fn appendCheckpoint(fd: c_int, id: []const u8, offset: u64) Error!void {
-    var buffer: [64]u8 = undefined;
-    const checkpoint = std.fmt.bufPrint(&buffer, "{s} {d}\n", .{ id, offset }) catch unreachable;
-    const written = c.write(fd, checkpoint.ptr, checkpoint.len);
-    if (written != @as(isize, @intCast(checkpoint.len))) {
-        log.err(@src(), "write checkpoint failed; fd={}, id={s}, offset={}, wanted={d}, wrote={d}, errno={}", .{
-            fd,
-            id,
-            offset,
-            checkpoint.len,
-            written,
-            if (written < 0) @intFromEnum(std.c.errno(written)) else 0,
-        });
-        return error.Io;
+fn ensureDirectory(path: [:0]const u8) !void {
+    const rc = c.mkdir(path.ptr, @as(c.mode_t, 0o700));
+    if (rc != 0 and std.c.errno(rc) != .EXIST)
+        return error.CreateSessionDirectoryFailed;
+    var st: c.struct_stat = undefined;
+    if (c.lstat(path.ptr, &st) != 0 or st.st_mode & c.S_IFMT != c.S_IFDIR)
+        return error.InvalidSessionDirectory;
+}
+
+fn applyDirectory(
+    upper: [:0]const u8,
+    lower: [:0]const u8,
+    lower_root: [:0]const u8,
+    budget: *usize,
+    result: *ApplyResult,
+    links: *std.AutoHashMapUnmanaged(u128, [:0]u8),
+    root: bool,
+) !void {
+    if (!root) try applyRedirect(upper, lower, lower_root);
+    if (!root and opaqueDirectory(upper)) {
+        removeTree(lower) catch |err| if (err != error.NotFound) return err;
     }
-    const sync_rc = c.fdatasync(fd);
-    if (sync_rc != 0) {
-        log.err(@src(), "sync checkpoint failed; fd={}, id={s}, offset={}, errno={}", .{ fd, id, offset, @intFromEnum(std.c.errno(sync_rc)) });
-        return error.Io;
+    try ensureDirectory(lower);
+    const names = try directoryNames(upper);
+    defer freeNames(names);
+    for (names) |name| {
+        const upper_child = try childPath(std.heap.c_allocator, upper, name);
+        defer std.heap.c_allocator.free(upper_child);
+        const lower_child = try childPath(std.heap.c_allocator, lower, name);
+        defer std.heap.c_allocator.free(lower_child);
+        var st: c.struct_stat = undefined;
+        if (c.lstat(upper_child.ptr, &st) != 0)
+            return error.StatUpperEntryFailed;
+
+        if (st.st_mode & c.S_IFMT == c.S_IFDIR) {
+            try applyDirectory(upper_child, lower_child, lower_root, budget, result, links, false);
+            if (try countEntries(upper_child) == 0) {
+                clearOverlayXattrs(upper_child);
+                _ = c.rmdir(upper_child.ptr);
+            }
+            continue;
+        }
+        const hardlink_key: ?u128 = if (st.st_mode & c.S_IFMT == c.S_IFREG)
+            (@as(u128, @intCast(st.st_dev)) << 64) | @as(u128, @intCast(st.st_ino))
+        else
+            null;
+        const completes_hardlink_group = if (hardlink_key) |key| links.contains(key) else false;
+        if (budget.* == 0 and !completes_hardlink_group) continue;
+        if (whiteout(st, upper_child)) {
+            removeTree(lower_child) catch |err| if (err != error.NotFound) return err;
+        } else {
+            try publishEntry(upper_child, lower_child, st, links);
+        }
+        try syncParent(lower_child);
+        if (c.unlink(upper_child.ptr) != 0)
+            return error.RemoveAppliedUpperFailed;
+        try syncParent(upper_child);
+        if (budget.* != 0) budget.* -= 1;
+        result.applied += 1;
+    }
+    if (!root) try copyDirectoryMetadata(upper, lower);
+}
+
+fn applyRedirect(upper: [:0]const u8, destination: [:0]const u8, lower_root: [:0]const u8) !void {
+    var redirect_buffer: [max_path]u8 = undefined;
+    var length: isize = -1;
+    inline for (.{ "trusted.overlay.redirect", "user.overlay.redirect" }) |name| {
+        length = c.lgetxattr(upper.ptr, name, &redirect_buffer, redirect_buffer.len - 1);
+        if (length >= 0) break;
+    }
+    if (length < 0) return;
+    const raw = redirect_buffer[0..@intCast(length)];
+    const relative = std.mem.trimStart(u8, raw, "/");
+    if (!validRelative(relative)) return error.InvalidRedirect;
+    const source = try childPath(std.heap.c_allocator, lower_root, relative);
+    defer std.heap.c_allocator.free(source);
+    var source_stat: c.struct_stat = undefined;
+    if (c.lstat(source.ptr, &source_stat) != 0) {
+        if (std.c.errno(-1) == .NOENT) return;
+        return error.StatRedirectSourceFailed;
+    }
+    removeTree(destination) catch |err| if (err != error.NotFound) return err;
+    if (c.rename(source.ptr, destination.ptr) != 0)
+        return error.ApplyRedirectFailed;
+    try syncParent(source);
+    try syncParent(destination);
+}
+
+fn publishEntry(
+    source: [:0]const u8,
+    destination: [:0]const u8,
+    st: c.struct_stat,
+    links: *std.AutoHashMapUnmanaged(u128, [:0]u8),
+) !void {
+    const temporary = try temporaryPath(destination);
+    defer std.heap.c_allocator.free(temporary);
+    _ = c.unlink(temporary.ptr);
+    const kind = st.st_mode & c.S_IFMT;
+    const link_key: ?u128 = if (kind == c.S_IFREG)
+        (@as(u128, @intCast(st.st_dev)) << 64) | @as(u128, @intCast(st.st_ino))
+    else
+        null;
+    if (kind == c.S_IFREG) {
+        var linked = false;
+        if (link_key) |key| {
+            if (links.get(key)) |first| {
+                if (c.link(first.ptr, temporary.ptr) != 0)
+                    return error.CreateApplyHardLinkFailed;
+                linked = true;
+            }
+        }
+        if (!linked) {
+            try copyRegular(source, temporary, st);
+        }
+    } else if (kind == c.S_IFLNK) {
+        var target: [max_path]u8 = undefined;
+        const length = c.readlink(source.ptr, &target, target.len - 1);
+        if (length < 0) return error.ReadSymlinkFailed;
+        target[@intCast(length)] = 0;
+        if (c.symlink(@ptrCast(&target), temporary.ptr) != 0)
+            return error.CreateSymlinkFailed;
+    } else {
+        if (c.mknod(temporary.ptr, st.st_mode, st.st_rdev) != 0)
+            return error.CreateSpecialFileFailed;
+    }
+    if (kind != c.S_IFLNK) {
+        _ = c.chown(temporary.ptr, st.st_uid, st.st_gid);
+        _ = c.chmod(temporary.ptr, st.st_mode & 0o7777);
+        try copyXattrs(source, temporary);
+        const times = [_]c.struct_timespec{ st.st_atim, st.st_mtim };
+        _ = c.utimensat(c.AT_FDCWD, temporary.ptr, &times, 0);
+    }
+    if (c.rename(temporary.ptr, destination.ptr) != 0)
+        return error.PublishEntryFailed;
+    if (link_key) |key| {
+        if (!links.contains(key)) {
+            const owned = try std.heap.c_allocator.dupeZ(u8, destination);
+            errdefer std.heap.c_allocator.free(owned);
+            try links.put(std.heap.c_allocator, key, owned);
+        }
     }
 }
 
-fn clearAppliedFiles(session: *Session, id: []const u8) Error!void {
-    var id_z: [id_len:0]u8 = undefined;
-    @memcpy(id_z[0..id_len], id);
-    id_z[id_len] = 0;
-    const directories = [_]c_int{ session.data_fd, session.ranges_fd };
-    for (directories) |directory_fd| {
-        const fd = c.openat(
-            directory_fd,
-            &id_z,
-            c.O_WRONLY | c.O_NOFOLLOW | c.O_CLOEXEC,
-        );
-        if (fd < 0) {
-            if (std.c.errno(fd) == .NOENT) continue;
-            log.err(@src(), "open applied overlay file for cleanup failed; id={s}, errno={}", .{
-                id,
-                @intFromEnum(std.c.errno(fd)),
-            });
-            return error.Io;
+const max_path = 4096;
+
+fn copyRegular(source: [:0]const u8, temporary: [:0]const u8, st: c.struct_stat) !void {
+    const source_fd = c.open(source.ptr, c.O_RDONLY | c.O_CLOEXEC | c.O_NOFOLLOW);
+    if (source_fd < 0) return error.OpenUpperFileFailed;
+    defer _ = c.close(source_fd);
+    const destination_fd = c.open(
+        temporary.ptr,
+        c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC | c.O_NOFOLLOW,
+        st.st_mode & 0o7777,
+    );
+    if (destination_fd < 0) return error.CreateApplyTemporaryFailed;
+    errdefer _ = c.unlink(temporary.ptr);
+    defer _ = c.close(destination_fd);
+
+    var buffer: [128 * 1024]u8 = undefined;
+    while (true) {
+        const got = c.read(source_fd, &buffer, buffer.len);
+        if (got < 0) return error.ReadUpperFileFailed;
+        if (got == 0) break;
+        var written: usize = 0;
+        while (written < @as(usize, @intCast(got))) {
+            const amount = c.write(
+                destination_fd,
+                buffer[written..].ptr,
+                @as(usize, @intCast(got)) - written,
+            );
+            if (amount <= 0) return error.WriteApplyTemporaryFailed;
+            written += @intCast(amount);
         }
-        defer _ = c.close(fd);
-        const truncate_rc = c.ftruncate(fd, 0);
-        if (truncate_rc != 0) {
-            log.err(@src(), "truncate applied overlay file failed; id={s}, errno={}", .{
-                id,
-                @intFromEnum(std.c.errno(truncate_rc)),
-            });
-            return error.Io;
-        }
-        const file_sync_rc = c.fsync(fd);
-        if (file_sync_rc != 0) {
-            log.err(@src(), "sync cleared overlay file failed; id={s}, errno={}", .{
-                id,
-                @intFromEnum(std.c.errno(file_sync_rc)),
-            });
-            return error.Io;
-        }
+    }
+    if (c.fsync(destination_fd) != 0) return error.SyncApplyTemporaryFailed;
+}
+
+fn copyDirectoryMetadata(source: [:0]const u8, destination: [:0]const u8) !void {
+    var st: c.struct_stat = undefined;
+    if (c.lstat(source.ptr, &st) != 0) return error.StatUpperEntryFailed;
+    _ = c.chown(destination.ptr, st.st_uid, st.st_gid);
+    _ = c.chmod(destination.ptr, st.st_mode & 0o7777);
+    try copyXattrs(source, destination);
+    const times = [_]c.struct_timespec{ st.st_atim, st.st_mtim };
+    _ = c.utimensat(c.AT_FDCWD, destination.ptr, &times, 0);
+    try syncPath(destination);
+}
+
+fn copyXattrs(source: [:0]const u8, destination: [:0]const u8) !void {
+    const needed = c.llistxattr(source.ptr, null, 0);
+    if (needed <= 0) return;
+    const names = try std.heap.c_allocator.alloc(u8, @intCast(needed));
+    defer std.heap.c_allocator.free(names);
+    const got = c.llistxattr(source.ptr, names.ptr, names.len);
+    if (got < 0) return error.ListUpperXattrsFailed;
+    var start: usize = 0;
+    while (start < @as(usize, @intCast(got))) {
+        const end = std.mem.indexOfScalarPos(u8, names, start, 0) orelse break;
+        const name = names[start..end :0];
+        start = end + 1;
+        if (overlayXattr(name)) continue;
+        const value_size = c.lgetxattr(source.ptr, name.ptr, null, 0);
+        if (value_size < 0) continue;
+        const value = try std.heap.c_allocator.alloc(u8, @intCast(value_size));
+        defer std.heap.c_allocator.free(value);
+        if (c.lgetxattr(source.ptr, name.ptr, value.ptr, value.len) != value_size)
+            continue;
+        if (c.lsetxattr(destination.ptr, name.ptr, value.ptr, value.len, 0) != 0)
+            return error.SetDestinationXattrFailed;
     }
 }
 
-fn removeAppliedEntry(session: *Session, log_fd: c_int, id: []const u8) Error!void {
-    // Empty and sync the old generation before publishing the zero checkpoint.
-    // Either side of a crash is therefore safe to resume.
-    try clearAppliedFiles(session, id);
-    try appendCheckpoint(log_fd, id, 0);
-    var id_z: [id_len:0]u8 = undefined;
-    @memcpy(id_z[0..id_len], id);
-    id_z[id_len] = 0;
-    const directories = [_]c_int{ session.data_fd, session.ranges_fd, session.paths_fd };
-    for (directories) |directory_fd| {
-        const unlink_rc = c.unlinkat(directory_fd, &id_z, 0);
-        const unlink_errno: c_int = @intFromEnum(std.c.errno(unlink_rc));
-        if (unlink_rc != 0 and unlink_errno != c.ENOENT) {
-            log.err(@src(), "unlink applied session entry failed; id={s}, dir_fd={}, errno={}", .{
-                id,
-                directory_fd,
-                unlink_errno,
-            });
-            return error.Io;
-        }
-        const directory_sync_rc = c.fsync(directory_fd);
-        if (directory_sync_rc != 0) {
-            log.err(@src(), "sync session directory after cleanup failed; id={s}, dir_fd={}, errno={}", .{
-                id,
-                directory_fd,
-                @intFromEnum(std.c.errno(directory_sync_rc)),
-            });
-            return error.Io;
-        }
-    }
+fn overlayXattr(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "trusted.overlay.") or
+        std.mem.startsWith(u8, name, "user.overlay.");
 }
 
-fn ensureFormat(root_fd: c_int, create: bool) Error!bool {
-    var fd = c.openat(root_fd, "format", c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
-    if (fd < 0) {
-        const open_errno: c_int = @intFromEnum(std.c.errno(fd));
-        if (!create or open_errno != c.ENOENT) {
-            log.err(@src(), "open format file failed; root_fd={}, create={}, errno={}", .{ root_fd, create, open_errno });
-            return error.InvalidSession;
-        }
-        fd = c.openat(
-            root_fd,
-            "format",
-            c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_NOFOLLOW | c.O_CLOEXEC,
-            @as(c.mode_t, 0o600),
-        );
-        if (fd < 0) {
-            log.err(@src(), "create format file failed; root_fd={}, errno={}", .{ root_fd, @intFromEnum(std.c.errno(fd)) });
-            return error.Io;
-        }
-        defer _ = c.close(fd);
-        const written = c.write(fd, format_v2, format_v2.len);
-        if (written != format_v2.len) {
-            log.err(@src(), "write format marker failed; root_fd={}, wanted={d}, wrote={d}, errno={}", .{
-                root_fd,
-                format_v2.len,
-                written,
-                if (written < 0) @intFromEnum(std.c.errno(written)) else 0,
-            });
-            return error.Io;
-        }
-        const data_sync_rc = c.fdatasync(fd);
-        if (data_sync_rc != 0) {
-            log.err(@src(), "sync format marker failed; root_fd={}, errno={}", .{ root_fd, @intFromEnum(std.c.errno(data_sync_rc)) });
-            return error.Io;
-        }
-        const root_sync_rc = c.fsync(root_fd);
-        if (root_sync_rc != 0) {
-            log.err(@src(), "sync session root after format creation failed; root_fd={}, errno={}", .{ root_fd, @intFromEnum(std.c.errno(root_sync_rc)) });
-            return error.Io;
-        }
-        return true;
+fn clearOverlayXattrs(path: [:0]const u8) void {
+    inline for (.{
+        "trusted.overlay.opaque",
+        "user.overlay.opaque",
+        "trusted.overlay.redirect",
+        "user.overlay.redirect",
+        "trusted.overlay.metacopy",
+        "user.overlay.metacopy",
+        "trusted.overlay.origin",
+        "user.overlay.origin",
+    }) |name| _ = c.lremovexattr(path.ptr, name);
+}
+
+fn opaqueDirectory(path: [:0]const u8) bool {
+    var value: [1]u8 = undefined;
+    inline for (.{ "trusted.overlay.opaque", "user.overlay.opaque" }) |name| {
+        if (c.lgetxattr(path.ptr, name, &value, 1) == 1 and
+            (value[0] == 'y' or value[0] == 'x'))
+            return true;
     }
+    return false;
+}
+
+fn whiteout(st: c.struct_stat, path: [:0]const u8) bool {
+    if (st.st_mode & c.S_IFMT == c.S_IFCHR and st.st_rdev == 0) return true;
+    var value: [1]u8 = undefined;
+    inline for (.{ "trusted.overlay.whiteout", "user.overlay.whiteout" }) |name|
+        if (c.lgetxattr(path.ptr, name, &value, 1) >= 0) return true;
+    return false;
+}
+
+fn removeTree(path: [:0]const u8) !void {
+    var st: c.struct_stat = undefined;
+    if (c.lstat(path.ptr, &st) != 0) {
+        if (std.c.errno(-1) == .NOENT) return error.NotFound;
+        return error.StatRemoveTargetFailed;
+    }
+    if (st.st_mode & c.S_IFMT != c.S_IFDIR)
+        return if (c.unlink(path.ptr) == 0) {} else error.RemoveTargetFailed;
+    const names = try directoryNames(path);
+    defer freeNames(names);
+    for (names) |name| {
+        const child = try childPath(std.heap.c_allocator, path, name);
+        defer std.heap.c_allocator.free(child);
+        try removeTree(child);
+    }
+    if (c.rmdir(path.ptr) != 0) return error.RemoveDirectoryFailed;
+}
+
+fn directoryNames(path: [:0]const u8) ![][:0]u8 {
+    const directory = c.opendir(path.ptr) orelse return error.OpenUpperDirectoryFailed;
+    defer _ = c.closedir(directory);
+    var names: std.ArrayList([:0]u8) = .empty;
+    errdefer {
+        for (names.items) |name| std.heap.c_allocator.free(name);
+        names.deinit(std.heap.c_allocator);
+    }
+    while (c.readdir(directory)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        try names.append(std.heap.c_allocator, try std.heap.c_allocator.dupeZ(u8, name));
+    }
+    return names.toOwnedSlice(std.heap.c_allocator);
+}
+
+fn freeNames(names: [][:0]u8) void {
+    for (names) |name| std.heap.c_allocator.free(name);
+    std.heap.c_allocator.free(names);
+}
+
+fn countEntries(path: [:0]const u8) !usize {
+    const directory = c.opendir(path.ptr) orelse return error.OpenUpperDirectoryFailed;
+    defer _ = c.closedir(directory);
+    var count: usize = 0;
+    while (c.readdir(directory)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        const child = try childPath(std.heap.c_allocator, path, name);
+        defer std.heap.c_allocator.free(child);
+        var st: c.struct_stat = undefined;
+        if (c.lstat(child.ptr, &st) != 0) continue;
+        count += if (st.st_mode & c.S_IFMT == c.S_IFDIR)
+            try countEntries(child)
+        else
+            1;
+    }
+    return count;
+}
+
+fn temporaryPath(destination: [:0]const u8) ![:0]u8 {
+    return std.fmt.allocPrintSentinel(
+        std.heap.c_allocator,
+        "{s}.permfuse-{d}-{d}",
+        .{ destination, c.getpid(), temporary_counter.fetchAdd(1, .monotonic) },
+        0,
+    );
+}
+
+fn syncPath(path: [:0]const u8) !void {
+    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC | c.O_NOFOLLOW);
+    if (fd < 0) return error.OpenSyncTargetFailed;
     defer _ = c.close(fd);
-    var buf: [@max(format_v1.len, format_v2.len)]u8 = undefined;
-    const got = c.pread(fd, &buf, buf.len, 0);
-    if (got == format_v2.len and std.mem.eql(u8, buf[0..format_v2.len], format_v2))
-        return true;
-    if (got == format_v1.len and std.mem.eql(u8, buf[0..format_v1.len], format_v1))
-        return false;
-    {
-        log.err(@src(), "format file content mismatch; root_fd={}, got={d}", .{ root_fd, got });
-        return error.InvalidSession;
-    }
+    if (c.fsync(fd) != 0) return error.SyncTargetFailed;
 }
 
-fn ensureDir(root_fd: c_int, name: [*:0]const u8, create: bool) Error!void {
-    if (!create) {
-        const fd = c.openat(root_fd, name, c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC);
-        if (fd < 0) {
-            log.err(@src(), "open subdir failed; root_fd={}, name={s}, errno={}", .{ root_fd, name, @intFromEnum(std.c.errno(fd)) });
-            return error.InvalidSession;
-        }
-        _ = c.close(fd);
-        return;
-    }
-    const rc = c.mkdirat(root_fd, name, 0o700);
-    if (rc == 0) return;
-    const err: c_int = @intFromEnum(std.c.errno(rc));
-    if (err == c.EEXIST) return;
-    log.err(@src(), "mkdirat subdir failed; root_fd={}, name={s}, errno={}", .{ root_fd, name, err });
-    return error.Io;
+fn syncParent(path: [:0]const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse "/";
+    const parent_z = try std.heap.c_allocator.dupeZ(u8, parent);
+    defer std.heap.c_allocator.free(parent_z);
+    try syncPath(parent_z);
 }
 
-fn validPath(path: []const u8) bool {
-    if (path.len < 2 or path.len >= max_path or path[0] != '/' or path[path.len - 1] == '/')
+fn validRelative(path: []const u8) bool {
+    if (path.len == 0 or path[0] == '/' or std.mem.indexOfScalar(u8, path, 0) != null)
         return false;
-    var components = std.mem.splitScalar(u8, path[1..], '/');
-    while (components.next()) |component| {
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component|
         if (component.len == 0 or std.mem.eql(u8, component, ".") or
-            std.mem.eql(u8, component, "..") or
-            std.mem.indexOfScalar(u8, component, 0) != null)
+            std.mem.eql(u8, component, ".."))
             return false;
-    }
     return true;
 }
 
-fn readCompleted(
-    allocator: std.mem.Allocator,
-    fd: c_int,
-    completed: *std.StringHashMapUnmanaged(u64),
-) Error!void {
-    var st: c.struct_stat = undefined;
-    const stat_rc = c.fstat(fd, &st);
-    if (stat_rc != 0) {
-        log.err(@src(), "fstat apply.log failed; fd={}, errno={}", .{ fd, @intFromEnum(std.c.errno(stat_rc)) });
-        return error.Io;
-    }
-    if (st.st_size == 0) return;
-    if (st.st_size < 0 or st.st_size > 64 * 1024 * 1024) {
-        log.err(@src(), "apply.log size out of range; size={}", .{st.st_size});
-        return error.InvalidSession;
-    }
-    const contents = allocator.alloc(u8, @intCast(st.st_size)) catch return error.OutOfMemory;
-    defer allocator.free(contents);
-    const got = c.pread(fd, contents.ptr, contents.len, 0);
-    if (got != @as(isize, @intCast(contents.len))) {
-        log.err(@src(), "read apply checkpoint log failed; fd={}, wanted={d}, got={d}, errno={}", .{
-            fd,
-            contents.len,
-            got,
-            if (got < 0) @intFromEnum(std.c.errno(got)) else 0,
-        });
-        return error.Io;
-    }
-    const parsed_len = if (std.mem.lastIndexOfScalar(u8, contents, '\n')) |last_newline|
-        last_newline + 1
-    else
-        0;
-    if (parsed_len != contents.len) {
-        // A checkpoint write may have been interrupted before fdatasync.
-        const truncate_rc = c.ftruncate(fd, @intCast(parsed_len));
-        if (truncate_rc != 0) {
-            log.err(@src(), "truncate torn checkpoint failed; fd={}, valid_bytes={d}, errno={}", .{ fd, parsed_len, @intFromEnum(std.c.errno(truncate_rc)) });
-            return error.Io;
-        }
-        const sync_rc = c.fdatasync(fd);
-        if (sync_rc != 0) {
-            log.err(@src(), "sync truncated checkpoint log failed; fd={}, valid_bytes={d}, errno={}", .{ fd, parsed_len, @intFromEnum(std.c.errno(sync_rc)) });
-            return error.Io;
-        }
-    }
-    var lines = std.mem.splitScalar(u8, contents[0..parsed_len], '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (line.len <= id_len or line[id_len] != ' ') {
-            log.err(@src(), "malformed checkpoint line; line={s}", .{line});
-            return error.InvalidSession;
-        }
-        const id = line[0..id_len];
-        const checkpoint = std.fmt.parseInt(u64, line[id_len + 1 ..], 10) catch {
-            log.err(@src(), "invalid checkpoint offset; line={s}", .{line});
-            return error.InvalidSession;
-        };
-        if (completed.getPtr(id)) |value| {
-            value.* = checkpoint;
-            continue;
-        }
-        const owned = allocator.dupe(u8, id) catch return error.OutOfMemory;
-        errdefer allocator.free(owned);
-        completed.put(allocator, owned, checkpoint) catch return error.OutOfMemory;
-    }
-}
-
-fn rangeJournalEnd(session: *Session, id: []const u8) Error!u64 {
-    var id_z: [id_len:0]u8 = undefined;
-    @memcpy(id_z[0..id_len], id);
-    id_z[id_len] = 0;
-    const fd = c.openat(session.ranges_fd, &id_z, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
-    const open_errno: c_int = @intFromEnum(std.c.errno(fd));
-    if (fd < 0 and open_errno == c.ENOENT) {
-        // Publishing the path precedes creating the data and range files. A
-        // missing journal is therefore a harmless interrupted registration
-        // only when no overlay data was published.
-        const data_fd = c.openat(session.data_fd, &id_z, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
-        const data_errno: c_int = @intFromEnum(std.c.errno(data_fd));
-        if (data_fd < 0) {
-            if (data_errno == c.ENOENT) return 0;
-            log.err(@src(), "open orphan overlay data failed; id={s}, errno={}", .{ id, data_errno });
-            return error.Io;
-        }
-        defer _ = c.close(data_fd);
-        var data_stat: c.struct_stat = undefined;
-        const data_stat_rc = c.fstat(data_fd, &data_stat);
-        if (data_stat_rc != 0) {
-            log.err(@src(), "fstat orphan overlay data failed; id={s}, errno={}", .{
-                id,
-                @intFromEnum(std.c.errno(data_stat_rc)),
-            });
-            return error.Io;
-        }
-        if (data_stat.st_size == 0) return 0;
-        log.err(@src(), "range journal missing for non-empty overlay data; id={s}, size={d}", .{
-            id,
-            data_stat.st_size,
-        });
-        return error.InvalidSession;
-    }
-    if (fd < 0) return blk: {
-        log.err(@src(), "open range journal failed; id={s}, errno={}", .{ id, open_errno });
-        break :blk error.Io;
-    };
-    defer _ = c.close(fd);
-    var st: c.struct_stat = undefined;
-    const stat_rc = c.fstat(fd, &st);
-    if (stat_rc != 0) {
-        log.err(@src(), "fstat range journal failed; id={s}, errno={}", .{ id, @intFromEnum(std.c.errno(stat_rc)) });
-        return error.Io;
-    }
-    if (st.st_size < 0) {
-        log.err(@src(), "range journal has negative size; id={s}, size={d}", .{ id, st.st_size });
-        return error.InvalidSession;
-    }
-    return @divFloor(@as(u64, @intCast(st.st_size)), @sizeOf(Range)) * @sizeOf(Range);
-}
-
-fn applyOne(
-    session: *Session,
-    backing_fd: c_int,
-    id: []const u8,
-    journal_start: u64,
-    journal_end: u64,
-) Error!void {
-    var id_z: [id_len:0]u8 = undefined;
-    @memcpy(id_z[0..id_len], id);
-    id_z[id_len] = 0;
-
-    const path_fd = c.openat(session.paths_fd, &id_z, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
-    if (path_fd < 0) {
-        log.err(@src(), "applyOne: open path record failed; id={s}, errno={}", .{ id, @intFromEnum(std.c.errno(path_fd)) });
-        return error.Io;
-    }
-    defer _ = c.close(path_fd);
-    var path_buf: [max_path]u8 = undefined;
-    const path_len = c.pread(path_fd, &path_buf, path_buf.len, 0);
-    if (path_len < 0) {
-        log.err(@src(), "apply path: read path record failed; id={s}, errno={}", .{ id, @intFromEnum(std.c.errno(path_len)) });
-        return error.Io;
-    }
-    if (path_len == 0) {
-        log.err(@src(), "apply path: empty path record; id={s}", .{id});
-        return error.InvalidPath;
-    }
-    const path = path_buf[0..@intCast(path_len)];
-    if (!validPath(path)) {
-        log.err(@src(), "apply path: invalid path record; id={s}, path={s}", .{ id, path });
-        return error.InvalidPath;
-    }
-    path_buf[@intCast(path_len)] = 0;
-
-    const overlay_fd = c.openat(session.data_fd, &id_z, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
-    const overlay_errno: c_int = @intFromEnum(std.c.errno(overlay_fd));
-    if (overlay_fd < 0) return if (overlay_errno == c.ENOENT) blk: {
-        log.warn(@src(), "applyOne: overlay data missing; id={s}", .{id});
-        break :blk error.IncompleteEntry;
-    } else blk: {
-        log.err(@src(), "applyOne: open overlay data failed; id={s}, errno={}", .{ id, overlay_errno });
-        break :blk error.Io;
-    };
-    defer _ = c.close(overlay_fd);
-    const ranges_fd = c.openat(session.ranges_fd, &id_z, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
-    const ranges_errno: c_int = @intFromEnum(std.c.errno(ranges_fd));
-    if (ranges_fd < 0) return if (ranges_errno == c.ENOENT) blk: {
-        log.warn(@src(), "applyOne: range journal missing; id={s}", .{id});
-        break :blk error.IncompleteEntry;
-    } else blk: {
-        log.err(@src(), "applyOne: open range journal failed; id={s}, errno={}", .{ id, ranges_errno });
-        break :blk error.Io;
-    };
-    defer _ = c.close(ranges_fd);
-    const target_fd = openBeneath(backing_fd, path_buf[1..@intCast(path_len) :0]);
-    if (target_fd < 0) return error.Io;
-    defer _ = c.close(target_fd);
-    var target_stat: c.struct_stat = undefined;
-    const target_stat_rc = c.fstat(target_fd, &target_stat);
-    if (target_stat_rc != 0) {
-        log.err(@src(), "applyOne: fstat target failed; id={s}, path={s}, errno={}", .{ id, path, @intFromEnum(std.c.errno(target_stat_rc)) });
-        return error.Io;
-    }
-    if (target_stat.st_mode & c.S_IFMT != c.S_IFREG) {
-        log.err(@src(), "applyOne: target not a regular file; id={s}, path={s}, mode={o}", .{ id, path, target_stat.st_mode });
-        return error.UnsupportedFile;
-    }
-
-    var journal_offset = journal_start;
-    var records: [256]RangeDisk = undefined;
-    var buffer: [64 * 1024]u8 = undefined;
-    while (journal_offset < journal_end) {
-        const record_bytes: usize = @intCast(@min(
-            @as(u64, @sizeOf(@TypeOf(records))),
-            journal_end - journal_offset,
-        ));
-        const got_records = c.pread(ranges_fd, &records, record_bytes, @intCast(journal_offset));
-        if (got_records <= 0 or @rem(got_records, @sizeOf(Range)) != 0) {
-            log.err(@src(), "apply path: invalid range-journal read; id={s}, offset={d}, got={d}, errno={}", .{
-                id,
-                journal_offset,
-                got_records,
-                if (got_records < 0) @intFromEnum(std.c.errno(got_records)) else 0,
-            });
-            return error.Io;
-        }
-        for (records[0..@intCast(@divExact(got_records, @sizeOf(Range)))]) |*disk| {
-            const record = decodeRange(disk, session.ranges_little_endian);
-            if (record.length == 0) {
-                if (record.offset > std.math.maxInt(c.off_t)) {
-                    log.err(@src(), "applyOne: truncate size out of range; id={s}, size={d}", .{
-                        id,
-                        record.offset,
-                    });
-                    return error.InvalidSession;
-                }
-                const truncate_rc = c.ftruncate(target_fd, @intCast(record.offset));
-                if (truncate_rc != 0) {
-                    log.err(@src(), "applyOne: truncate record failed; id={s}, size={d}, errno={}", .{
-                        id,
-                        record.offset,
-                        @intFromEnum(std.c.errno(truncate_rc)),
-                    });
-                    return error.Io;
-                }
-                continue;
-            }
-            if (record.offset > std.math.maxInt(c.off_t) or
-                record.length > std.math.maxInt(c.off_t) - record.offset)
-            {
-                log.err(@src(), "applyOne: invalid range record; id={s}, offset={d}, length={d}", .{ id, record.offset, record.length });
-                return error.InvalidSession;
-            }
-            var cursor: u64 = record.offset;
-            const end = record.offset + record.length;
-            while (cursor < end) {
-                const amount: usize = @intCast(@min(
-                    @as(u64, buffer.len),
-                    end - cursor,
-                ));
-                const got = c.pread(overlay_fd, &buffer, amount, @intCast(cursor));
-                if (got <= 0) {
-                    log.err(@src(), "apply path: overlay data read failed; id={s}, cursor={d}, wanted={d}, got={d}, errno={}", .{
-                        id,
-                        cursor,
-                        amount,
-                        got,
-                        if (got < 0) @intFromEnum(std.c.errno(got)) else 0,
-                    });
-                    return error.Io;
-                }
-                const written = c.pwrite(target_fd, &buffer, @intCast(got), @intCast(cursor));
-                if (written != got) {
-                    log.err(@src(), "apply path: target write failed; id={s}, cursor={d}, wanted={d}, wrote={d}, errno={}", .{
-                        id,
-                        cursor,
-                        got,
-                        written,
-                        if (written < 0) @intFromEnum(std.c.errno(written)) else 0,
-                    });
-                    return error.Io;
-                }
-                cursor += @intCast(got);
-            }
-        }
-        journal_offset += @intCast(got_records);
-    }
-    const sync_rc = c.fsync(target_fd);
-    if (sync_rc != 0) {
-        log.err(@src(), "applyOne: fsync target failed; id={s}, path={s}, errno={}", .{ id, path, @intFromEnum(std.c.errno(sync_rc)) });
-        return error.Io;
-    }
-}
-
-/// Opens each directory component with O_NOFOLLOW so a session path can never
-/// escape the configured backing root through an intermediate symlink.
-fn openBeneath(root_fd: c_int, relative: [:0]u8) c_int {
-    var directory_fd = c.fcntl(root_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
-    if (directory_fd < 0) {
-        log.err(@src(), "openBeneath: DUPFD root_fd failed; root_fd={}, errno={}", .{ root_fd, @intFromEnum(std.c.errno(directory_fd)) });
-        return -1;
-    }
-    var start: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, relative, start, '/')) |slash| {
-        relative[slash] = 0;
-        const next = c.openat(
-            directory_fd,
-            @as([*:0]const u8, @ptrCast(relative.ptr + start)),
-            c.O_PATH | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC,
-        );
-        const open_errno: c_int = if (next < 0) @intFromEnum(std.c.errno(next)) else 0;
-        relative[slash] = '/';
-        _ = c.close(directory_fd);
-        if (next < 0) {
-            log.err(@src(), "open backing directory component failed; component={s}, offset={d}, errno={}", .{
-                relative[start..slash],
-                start,
-                open_errno,
-            });
-            return -1;
-        }
-        directory_fd = next;
-        start = slash + 1;
-    }
-    const result = c.openat(
-        directory_fd,
-        @as([*:0]const u8, @ptrCast(relative.ptr + start)),
-        c.O_WRONLY | c.O_NONBLOCK | c.O_NOFOLLOW | c.O_CLOEXEC,
-    );
-    if (result < 0) {
-        log.err(@src(), "open backing target failed; target={s}, errno={}", .{ relative[start..], @intFromEnum(std.c.errno(result)) });
-    }
-    _ = c.close(directory_fd);
-    return result;
-}
-
-test "overlay ids are stable and path-sensitive" {
-    const a = overlayId("/a");
-    const again = overlayId("/a");
-    const b = overlayId("/b");
-    try std.testing.expectEqualStrings(&a, &again);
-    try std.testing.expect(!std.mem.eql(u8, &a, &b));
-}
-
-test "version two range records are explicitly little endian" {
-    const range: Range = .{
-        .offset = 0x0102030405060708,
-        .length = 0x1112131415161718,
-    };
-    const disk = encodeRange(range, true);
-    try std.testing.expectEqualSlices(u8, &.{
-        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
-        0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
-    }, &disk);
-    try std.testing.expectEqualDeep(range, decodeRange(&disk, true));
-}
-
-test "path validation rejects traversal and malformed paths" {
-    try std.testing.expect(validPath("/a/b"));
-    try std.testing.expect(!validPath(""));
-    try std.testing.expect(!validPath("/"));
-    try std.testing.expect(!validPath("relative"));
-    try std.testing.expect(!validPath("/a/../b"));
-    try std.testing.expect(!validPath("/a//b"));
-    try std.testing.expect(!validPath("/a/"));
-    try std.testing.expect(!validPath("/a\x00b"));
-    var maximum: [max_path]u8 = undefined;
-    @memset(&maximum, 'a');
-    maximum[0] = '/';
-    try std.testing.expect(!validPath(&maximum));
-}
-
-test "session root symlinks are rejected" {
+test "session paths are deterministic and exclusively locked" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try std.testing.expectEqual(@as(c_int, 0), c.mkdirat(tmp.dir.handle, "real", 0o700));
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/proc/self/fd/{d}/session", .{tmp.dir.handle});
+    var session = try Session.open(std.testing.io, path);
+    defer session.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, session.upper, "/upper"));
+    try std.testing.expectError(error.SessionBusy, Session.open(std.testing.io, path));
+}
+
+test "bounded apply drains ordinary upper files and resumes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     try std.testing.expectEqual(
         @as(c_int, 0),
-        c.symlinkat("real", tmp.dir.handle, "link"),
+        c.mkdirat(tmp.dir.handle, "lower", @as(c.mode_t, 0o700)),
     );
-    var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(
-        &path_buf,
-        "/proc/self/fd/{d}/link",
-        .{tmp.dir.handle},
-    );
-    try std.testing.expectError(error.Io, Session.open(std.testing.io, path, false));
-}
-
-test "version one sessions retain native range decoding" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try std.testing.expectEqual(@as(c_int, 0), c.mkdirat(tmp.dir.handle, "session", 0o700));
-    const root_fd = c.openat(
-        tmp.dir.handle,
-        "session",
-        c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC,
-    );
-    try std.testing.expect(root_fd >= 0);
-    defer _ = c.close(root_fd);
-    for ([_][*:0]const u8{ "data", "ranges", "paths" }) |name|
-        try std.testing.expectEqual(@as(c_int, 0), c.mkdirat(root_fd, name, 0o700));
-    const format_fd = c.openat(
-        root_fd,
-        "format",
-        c.O_WRONLY | c.O_CREAT | c.O_CLOEXEC,
-        @as(c.mode_t, 0o600),
-    );
-    try std.testing.expect(format_fd >= 0);
-    try std.testing.expectEqual(
-        @as(isize, format_v1.len),
-        c.write(format_fd, format_v1, format_v1.len),
-    );
-    _ = c.close(format_fd);
-    var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(
-        &path_buf,
-        "/proc/self/fd/{d}/session",
-        .{tmp.dir.handle},
-    );
-    var session = try Session.open(std.testing.io, path, false);
-    defer session.deinit();
-    try std.testing.expect(!session.rangesAreLittleEndian());
-}
-
-test "libc return values are decoded with C errno" {
-    const rc = c.close(-1);
-    try std.testing.expectEqual(@as(c_int, c.EBADF), @intFromEnum(std.c.errno(rc)));
-}
-
-test "torn apply checkpoint tail is discarded" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const fd = c.openat(
-        tmp.dir.handle,
-        "apply.log",
-        c.O_RDWR | c.O_CREAT | c.O_CLOEXEC,
-        @as(c.mode_t, 0o600),
-    );
-    try std.testing.expect(fd >= 0);
-    defer _ = c.close(fd);
-
-    const id = "0123456789abcdef0123456789abcdef";
-    const contents = id ++ " 16\n" ++ id ++ " 3";
-    const written = c.write(fd, contents.ptr, contents.len);
-    try std.testing.expectEqual(@as(isize, @intCast(contents.len)), written);
-
-    var completed = std.StringHashMapUnmanaged(u64).empty;
-    defer {
-        var it = completed.keyIterator();
-        while (it.next()) |key| std.testing.allocator.free(key.*);
-        completed.deinit(std.testing.allocator);
-    }
-    try readCompleted(std.testing.allocator, fd, &completed);
-    try std.testing.expectEqual(@as(?u64, 16), completed.get(id));
-
-    var st: c.struct_stat = undefined;
-    const stat_rc = c.fstat(fd, &st);
-    try std.testing.expectEqual(@as(c_int, 0), stat_rc);
-    try std.testing.expectEqual(@as(c.off_t, id.len + " 16\n".len), st.st_size);
-}
-
-test "session resumes and bounded apply is idempotent" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const tmp_fd = tmp.dir.handle;
-    try std.testing.expectEqual(@as(c_int, 0), c.mkdirat(tmp_fd, "backing", 0o700));
-    const backing_fd = c.openat(tmp_fd, "backing", c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
-    try std.testing.expect(backing_fd >= 0);
-    defer _ = c.close(backing_fd);
-    const target_fd = c.openat(
-        backing_fd,
-        "file",
-        c.O_RDWR | c.O_CREAT | c.O_CLOEXEC,
-        @as(c.mode_t, 0o600),
-    );
-    try std.testing.expect(target_fd >= 0);
-    defer _ = c.close(target_fd);
-    try std.testing.expectEqual(@as(isize, 6), c.write(target_fd, "abcdef", 6));
-
-    var session_path_buf: [128]u8 = undefined;
+    var session_buffer: [128]u8 = undefined;
+    var lower_buffer: [128]u8 = undefined;
     const session_path = try std.fmt.bufPrintZ(
-        &session_path_buf,
+        &session_buffer,
         "/proc/self/fd/{d}/session",
-        .{tmp_fd},
+        .{tmp.dir.handle},
     );
-    var backing_path_buf: [128]u8 = undefined;
-    const backing_path = try std.fmt.bufPrintZ(
-        &backing_path_buf,
-        "/proc/self/fd/{d}/backing",
-        .{tmp_fd},
+    const lower_path = try std.fmt.bufPrintZ(
+        &lower_buffer,
+        "/proc/self/fd/{d}/lower",
+        .{tmp.dir.handle},
     );
-
-    var session = try Session.open(std.testing.io, session_path, true);
-    const id = try session.register("/file");
-    const data_fd = c.openat(
-        session.data_fd,
-        &id,
-        c.O_RDWR | c.O_CREAT | c.O_CLOEXEC,
-        @as(c.mode_t, 0o600),
-    );
-    try std.testing.expect(data_fd >= 0);
-    try std.testing.expectEqual(@as(isize, 3), c.pwrite(data_fd, "XYZ", 3, 2));
-    try std.testing.expectEqual(@as(c_int, 0), c.fsync(data_fd));
-    _ = c.close(data_fd);
-    const ranges_fd = c.openat(
-        session.ranges_fd,
-        &id,
-        c.O_RDWR | c.O_CREAT | c.O_APPEND | c.O_CLOEXEC,
-        @as(c.mode_t, 0o600),
-    );
-    try std.testing.expect(ranges_fd >= 0);
-    const record = Range{ .offset = 2, .length = 3 };
-    const record_disk = encodeRange(record, session.ranges_little_endian);
-    try std.testing.expectEqual(
-        @as(isize, @sizeOf(Range)),
-        c.write(ranges_fd, &record_disk, @sizeOf(Range)),
-    );
-    try std.testing.expectEqual(@as(c_int, 0), c.fsync(ranges_fd));
-    _ = c.close(ranges_fd);
-
-    const partial = try session.apply(std.testing.allocator, backing_path, .{ .max_files = 0 });
-    try std.testing.expectEqual(@as(usize, 0), partial.applied);
-    try std.testing.expectEqual(@as(usize, 1), partial.remaining);
-    session.deinit();
-
-    session = try Session.open(std.testing.io, session_path, false);
+    var session = try Session.open(std.testing.io, session_path);
     defer session.deinit();
-    const resumed = try session.apply(std.testing.allocator, backing_path, .{ .max_files = 1 });
-    try std.testing.expectEqual(@as(usize, 1), resumed.applied);
-    try std.testing.expect(resumed.complete());
-
-    var contents: [6]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, 6), c.pread(target_fd, &contents, contents.len, 0));
-    try std.testing.expectEqualStrings("abXYZf", &contents);
-
-    const again = try session.apply(std.testing.allocator, backing_path, .{});
-    try std.testing.expectEqual(@as(usize, 0), again.applied);
-    try std.testing.expectEqual(@as(usize, 1), again.skipped);
-    try std.testing.expect(again.complete());
-
-    const resumed_data = c.openat(session.data_fd, &id, c.O_RDWR | c.O_CLOEXEC);
-    const resumed_ranges = c.openat(
-        session.ranges_fd,
-        &id,
-        c.O_RDWR | c.O_APPEND | c.O_CLOEXEC,
-    );
-    try std.testing.expect(resumed_data >= 0 and resumed_ranges >= 0);
-    try std.testing.expectEqual(@as(isize, 1), c.pwrite(resumed_data, "Q", 1, 0));
-    const later_record = Range{ .offset = 0, .length = 1 };
-    const later_disk = encodeRange(later_record, session.ranges_little_endian);
-    try std.testing.expectEqual(
-        @as(isize, @sizeOf(Range)),
-        c.write(resumed_ranges, &later_disk, @sizeOf(Range)),
-    );
-    _ = c.close(resumed_ranges);
-    _ = c.close(resumed_data);
-
-    const later = try session.apply(std.testing.allocator, backing_path, .{});
-    try std.testing.expectEqual(@as(usize, 1), later.applied);
-    try std.testing.expectEqual(@as(isize, 6), c.pread(target_fd, &contents, contents.len, 0));
-    try std.testing.expectEqualStrings("QbXYZf", &contents);
-
-    const removed = try session.apply(std.testing.allocator, backing_path, .{
-        .remove_applied = true,
-    });
-    try std.testing.expectEqual(@as(usize, 1), removed.skipped);
-    const missing_data = c.openat(session.data_fd, &id, c.O_RDONLY | c.O_CLOEXEC);
-    const missing_data_errno = std.c.errno(missing_data);
-    try std.testing.expectEqual(@as(c_int, -1), missing_data);
-    try std.testing.expectEqual(std.c.E.NOENT, missing_data_errno);
-    const missing_ranges = c.openat(session.ranges_fd, &id, c.O_RDONLY | c.O_CLOEXEC);
-    const missing_ranges_errno = std.c.errno(missing_ranges);
-    try std.testing.expectEqual(@as(c_int, -1), missing_ranges);
-    try std.testing.expectEqual(std.c.E.NOENT, missing_ranges_errno);
-
-    // A crash after publishing the path record but before creating its range
-    // journal leaves no data that can be applied. It must not keep the session
-    // permanently incomplete.
-    _ = try session.register("/file");
-    const corrupt_data = c.openat(
-        session.data_fd,
-        &id,
-        c.O_WRONLY | c.O_CREAT | c.O_CLOEXEC,
-        @as(c.mode_t, 0o600),
-    );
-    try std.testing.expect(corrupt_data >= 0);
-    try std.testing.expectEqual(@as(isize, 1), c.write(corrupt_data, "x", 1));
-    _ = c.close(corrupt_data);
-    try std.testing.expectError(
-        error.InvalidSession,
-        session.apply(std.testing.allocator, backing_path, .{}),
-    );
-    try std.testing.expectEqual(@as(c_int, 0), c.unlinkat(session.data_fd, &id, 0));
-
-    const orphaned = try session.apply(std.testing.allocator, backing_path, .{
-        .remove_applied = true,
-    });
-    try std.testing.expectEqual(@as(usize, 1), orphaned.skipped);
-    try std.testing.expect(orphaned.complete());
-    const missing_path = c.openat(session.paths_fd, &id, c.O_RDONLY | c.O_CLOEXEC);
-    const missing_path_errno = std.c.errno(missing_path);
-    try std.testing.expectEqual(@as(c_int, -1), missing_path);
-    try std.testing.expectEqual(std.c.E.NOENT, missing_path_errno);
-
-    _ = try session.register("/file");
-
-    const truncated_data = c.openat(
-        session.data_fd,
-        &id,
-        c.O_RDWR | c.O_CREAT | c.O_CLOEXEC,
-        @as(c.mode_t, 0o600),
-    );
-    const truncated_ranges = c.openat(
-        session.ranges_fd,
-        &id,
-        c.O_RDWR | c.O_CREAT | c.O_APPEND | c.O_CLOEXEC,
-        @as(c.mode_t, 0o600),
-    );
-    try std.testing.expect(truncated_data >= 0 and truncated_ranges >= 0);
-    try std.testing.expectEqual(@as(isize, 2), c.pwrite(truncated_data, "12", 2, 0));
-    for ([_]Range{
-        .{ .offset = 0, .length = 0 },
-        .{ .offset = 0, .length = 2 },
-    }) |range| {
-        const disk = encodeRange(range, session.ranges_little_endian);
-        try std.testing.expectEqual(
-            @as(isize, @sizeOf(Range)),
-            c.write(truncated_ranges, &disk, disk.len),
+    const upper_fd = c.open(session.upper.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+    try std.testing.expect(upper_fd >= 0);
+    defer _ = c.close(upper_fd);
+    inline for (.{ "a", "b" }) |name| {
+        const fd = c.openat(
+            upper_fd,
+            name,
+            c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC,
+            @as(c.mode_t, 0o600),
         );
+        try std.testing.expect(fd >= 0);
+        try std.testing.expectEqual(@as(isize, 1), c.write(fd, name, 1));
+        _ = c.close(fd);
     }
-    _ = c.close(truncated_ranges);
-    _ = c.close(truncated_data);
-    const truncated = try session.apply(std.testing.allocator, backing_path, .{});
-    try std.testing.expectEqual(@as(usize, 1), truncated.applied);
-    var short_contents: [2]u8 = undefined;
+    const first = try session.apply(lower_path, .{ .max_entries = 1 });
+    try std.testing.expectEqual(@as(usize, 1), first.applied);
+    try std.testing.expectEqual(@as(usize, 1), first.remaining);
+    const second = try session.apply(lower_path, .{});
+    try std.testing.expectEqual(@as(usize, 1), second.applied);
+    try std.testing.expect(second.complete());
+}
+
+test "bounded apply completes a hard-link group together" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     try std.testing.expectEqual(
-        @as(isize, short_contents.len),
-        c.pread(target_fd, &short_contents, short_contents.len, 0),
+        @as(c_int, 0),
+        c.mkdirat(tmp.dir.handle, "lower", @as(c.mode_t, 0o700)),
     );
-    try std.testing.expectEqualStrings("12", &short_contents);
-    var target_stat: c.struct_stat = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), c.fstat(target_fd, &target_stat));
-    try std.testing.expectEqual(@as(c.off_t, 2), target_stat.st_size);
+    var session_buffer: [128]u8 = undefined;
+    var lower_buffer: [128]u8 = undefined;
+    const session_path = try std.fmt.bufPrintZ(
+        &session_buffer,
+        "/proc/self/fd/{d}/session",
+        .{tmp.dir.handle},
+    );
+    const lower_path = try std.fmt.bufPrintZ(
+        &lower_buffer,
+        "/proc/self/fd/{d}/lower",
+        .{tmp.dir.handle},
+    );
+    var session = try Session.open(std.testing.io, session_path);
+    defer session.deinit();
+    const upper_fd = c.open(session.upper.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+    try std.testing.expect(upper_fd >= 0);
+    defer _ = c.close(upper_fd);
+    const file_fd = c.openat(
+        upper_fd,
+        "a",
+        c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC,
+        @as(c.mode_t, 0o600),
+    );
+    try std.testing.expect(file_fd >= 0);
+    try std.testing.expectEqual(@as(isize, 1), c.write(file_fd, "x", 1));
+    _ = c.close(file_fd);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.linkat(upper_fd, "a", upper_fd, "b", 0),
+    );
+    const result = try session.apply(lower_path, .{ .max_entries = 1 });
+    try std.testing.expect(result.complete());
+    const lower_fd = c.open(lower_path.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+    try std.testing.expect(lower_fd >= 0);
+    defer _ = c.close(lower_fd);
+    var a_stat: c.struct_stat = undefined;
+    var b_stat: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.fstatat(
+        lower_fd,
+        "a",
+        &a_stat,
+        0,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), c.fstatat(
+        lower_fd,
+        "b",
+        &b_stat,
+        0,
+    ));
+    try std.testing.expectEqual(a_stat.st_ino, b_stat.st_ino);
+}
+
+test "apply translates whiteouts and opaque directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectEqual(@as(c_int, 0), c.mkdirat(tmp.dir.handle, "lower", @as(c.mode_t, 0o700)));
+    const lower_fd = c.openat(tmp.dir.handle, "lower", c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+    try std.testing.expect(lower_fd >= 0);
+    defer _ = c.close(lower_fd);
+    const victim = c.openat(lower_fd, "victim", c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
+    try std.testing.expect(victim >= 0);
+    _ = c.close(victim);
+    try std.testing.expectEqual(@as(c_int, 0), c.mkdirat(lower_fd, "dir", @as(c.mode_t, 0o700)));
+    const lower_dir = c.openat(lower_fd, "dir", c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+    try std.testing.expect(lower_dir >= 0);
+    defer _ = c.close(lower_dir);
+    const old = c.openat(lower_dir, "old", c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
+    try std.testing.expect(old >= 0);
+    _ = c.close(old);
+
+    var session_buffer: [128]u8 = undefined;
+    var lower_buffer: [128]u8 = undefined;
+    const session_path = try std.fmt.bufPrintZ(&session_buffer, "/proc/self/fd/{d}/session", .{tmp.dir.handle});
+    const lower_path = try std.fmt.bufPrintZ(&lower_buffer, "/proc/self/fd/{d}/lower", .{tmp.dir.handle});
+    var session = try Session.open(std.testing.io, session_path);
+    defer session.deinit();
+    const upper_fd = c.open(session.upper.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+    try std.testing.expect(upper_fd >= 0);
+    defer _ = c.close(upper_fd);
+    const marker = c.openat(upper_fd, "victim", c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
+    try std.testing.expect(marker >= 0);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.fsetxattr(marker, "user.overlay.whiteout", "y", 1, 0),
+    );
+    _ = c.close(marker);
+    try std.testing.expectEqual(@as(c_int, 0), c.mkdirat(upper_fd, "dir", @as(c.mode_t, 0o700)));
+    const upper_dir = c.openat(upper_fd, "dir", c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+    try std.testing.expect(upper_dir >= 0);
+    defer _ = c.close(upper_dir);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.fsetxattr(upper_dir, "user.overlay.opaque", "y", 1, 0),
+    );
+    const fresh = c.openat(upper_dir, "new", c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
+    try std.testing.expect(fresh >= 0);
+    _ = c.close(fresh);
+
+    const result = try session.apply(lower_path, .{});
+    try std.testing.expect(result.complete());
+    try std.testing.expectEqual(@as(c_int, -1), c.faccessat(lower_fd, "victim", c.F_OK, 0));
+    const applied_dir = c.openat(lower_fd, "dir", c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+    try std.testing.expect(applied_dir >= 0);
+    defer _ = c.close(applied_dir);
+    try std.testing.expectEqual(@as(c_int, -1), c.faccessat(applied_dir, "old", c.F_OK, 0));
+    try std.testing.expectEqual(@as(c_int, 0), c.faccessat(applied_dir, "new", c.F_OK, 0));
 }
