@@ -59,34 +59,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli);
 
-    // Keep the manual harness as an additional non-installed integration
-    // target.
-    const mount_test = b.addExecutable(.{
-        .name = "permfuse-mount-test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/mount_test.zig"),
-            .target = compile_target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "permfuse", .module = permbox_module },
-            },
-        }),
-    });
-
-    const mount_test_step = b.step(
-        "mount-test",
-        "Build the non-installed manual mount integration harness",
-    );
-    mount_test_step.dependOn(&mount_test.step);
-
-    const run_mount_test_step = b.step(
-        "run-mount-test",
-        "Run the manual mount integration harness",
-    );
-    const run_cmd = b.addRunArtifact(mount_test);
-    if (b.args) |args| run_cmd.addArgs(args);
-    run_mount_test_step.dependOn(&run_cmd.step);
-
     const test_step = b.step("test", "Run tests");
     const test_runner: std.Build.Step.Compile.TestRunner = .{
         .path = b.path("src/test_runner.zig"),

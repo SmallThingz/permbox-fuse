@@ -1,12 +1,13 @@
 //! libfuse bindings shared by the low-level daemon.
 const std = @import("std");
 
-pub const api_version = 318;
+/// External libfuse API level, not a permfuse data or package version.
+pub const fuse_api_level = 318;
 
 pub const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
     @cDefine("_FORTIFY_SOURCE", "0");
-    @cDefine("FUSE_USE_VERSION", std.fmt.comptimePrint("{d}", .{api_version}));
+    @cDefine("FUSE_USE_VERSION", std.fmt.comptimePrint("{d}", .{fuse_api_level}));
     @cInclude("fuse_lowlevel.h");
     @cInclude("fuse_log.h");
     @cInclude("dirent.h");
