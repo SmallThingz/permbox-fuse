@@ -120,7 +120,7 @@ fn overlap(a: []const u8, b: []const u8) bool {
 
 test "parse accepts root lower and keeps session disjoint from mount" {
     const args = [_][:0]const u8{
-        "permfuse",
+        "permfs",
         "--lower=/",
         "--policy=/policy",
         "--session=/state",
@@ -134,7 +134,7 @@ test "parse accepts root lower and keeps session disjoint from mount" {
     try std.testing.expect(config.passthrough);
 
     const bad = [_][:0]const u8{
-        "permfuse",
+        "permfs",
         "--lower=/",
         "--policy=/policy",
         "--session=/mount/session",
@@ -144,6 +144,6 @@ test "parse accepts root lower and keeps session disjoint from mount" {
 }
 
 test "parse rejects missing required paths" {
-    const args = [_][:0]const u8{ "permfuse", "--lower=/lower", "/mount" };
+    const args = [_][:0]const u8{ "permfs", "--lower=/lower", "/mount" };
     try std.testing.expectError(error.MissingPolicy, parse(&args));
 }

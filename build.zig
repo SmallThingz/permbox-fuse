@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     const trie_logging_options = b.addOptions();
     trie_logging_options.addOption([]const u8, "module_name", "permbox.trie");
     const fuse_logging_options = b.addOptions();
-    fuse_logging_options.addOption([]const u8, "module_name", "permbox.fuse");
+    fuse_logging_options.addOption([]const u8, "module_name", "permfs");
 
     const trie_module = b.addModule("permtrie", .{
         .root_source_file = b.path("src/trie/root.zig"),
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const permbox_module = b.addModule("permfuse", .{
+    const permfs_module = b.addModule("permfs", .{
         .root_source_file = b.path("src/fuse/root.zig"),
         .target = compile_target,
         .optimize = optimize,
@@ -38,20 +38,20 @@ pub fn build(b: *std.Build) void {
             .{ .name = "logging_options", .module = fuse_logging_options.createModule() },
         },
     });
-    permbox_module.link_libc = true;
-    permbox_module.addIncludePath(b.path("src"));
-    permbox_module.addIncludePath(.{ .cwd_relative = "/usr/include/fuse3" });
-    permbox_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
-    permbox_module.linkSystemLibrary("fuse3", .{});
+    permfs_module.link_libc = true;
+    permfs_module.addIncludePath(b.path("src"));
+    permfs_module.addIncludePath(.{ .cwd_relative = "/usr/include/fuse3" });
+    permfs_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+    permfs_module.linkSystemLibrary("fuse3", .{});
 
     const cli = b.addExecutable(.{
-        .name = "permfuse",
+        .name = "permfs",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/cli.zig"),
             .target = compile_target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "permfuse", .module = permbox_module },
+                .{ .name = "permfs", .module = permfs_module },
                 .{ .name = "permtrie", .module = trie_module },
             },
         }),
@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(overlay_tests).step);
 
     const api_tests = b.addTest(.{
-        .root_module = permbox_module,
+        .root_module = permfs_module,
         .test_runner = test_runner,
     });
     test_step.dependOn(&b.addRunArtifact(api_tests).step);

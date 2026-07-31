@@ -3,7 +3,7 @@
 The package exports two Zig modules:
 
 - `permtrie`: concurrent, mmap-backed longest-prefix policy storage.
-- `permfuse`: private OverlayFS lifecycle and policy-aware FUSE driver.
+- `permfs`: private OverlayFS lifecycle and policy-aware FUSE driver.
 
 All APIs are alpha and intentionally have no compatibility guarantees.
 
@@ -70,7 +70,7 @@ pub fn replaceFromText(
 The caller owns the returned text. `replaceFromText` parses before locking and
 then replaces all rules under one write-side critical section.
 
-## `permfuse`
+## `permfs`
 
 ### Policy types
 

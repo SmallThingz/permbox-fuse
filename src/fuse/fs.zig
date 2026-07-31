@@ -10,7 +10,7 @@ const allocator = std.heap.c_allocator;
 const root_ino: c.fuse_ino_t = 1;
 const max_path = 4096;
 const dir_buffer_size = 64 * 1024;
-const internal_trash = ".permfuse-internal-trash";
+const internal_trash = ".permfs-internal-trash";
 var trash_counter: std.atomic.Value(u64) = .init(0);
 
 const Inode = struct {

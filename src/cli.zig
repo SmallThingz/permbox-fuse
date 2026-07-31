@@ -1,5 +1,5 @@
 const std = @import("std");
-const permfuse = @import("permfuse");
+const permfs = @import("permfs");
 const permtrie = @import("permtrie");
 const terminal = @import("terminal.zig");
 
@@ -23,7 +23,7 @@ pub fn getLogger(comptime module_name: []const u8) type {
 }
 
 const MountContext = struct {
-    driver: *permfuse.Driver,
+    driver: *permfs.Driver,
     mountpoint: [:0]const u8,
     io_uring: bool,
     arguments: []const [:0]const u8,
@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len >= 2 and std.mem.eql(u8, args[1], "trie"))
         return runTrieCommand(init, args[2..]);
 
-    var config = permfuse.options.parse(args) catch |err| {
+    var config = permfs.options.parse(args) catch |err| {
         printUsage(err);
         return 2;
     };
@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
 
-    var driver: permfuse.Driver = undefined;
+    var driver: permfs.Driver = undefined;
     driver.init(init.io, .{
         .lower_path = config.lower,
         .policy_path = config.policy,
@@ -114,7 +114,7 @@ pub fn main(init: std.process.Init) !u8 {
             joined = true;
             terminal.label(terminal.yellow, "mount loop stopped\n");
         }
-        terminal.label(terminal.cyan, "permfuse");
+        terminal.label(terminal.cyan, "permfs");
         terminal.label(terminal.dim, " > ");
         const length = c.getline(&line_ptr, &line_capacity, c.stdin);
         if (length < 0) break;
@@ -263,8 +263,8 @@ fn printTrieUsage(err: ?anyerror) void {
     }
     terminal.label(terminal.bright_blue, "trie conversion\n");
     std.debug.print(
-        "  permfuse trie to-text BINARY [TEXT|-]\n" ++
-            "  permfuse trie from-text TEXT BINARY\n" ++
+        "  permfs trie to-text BINARY [TEXT|-]\n" ++
+            "  permfs trie from-text TEXT BINARY\n" ++
             "\n" ++
             "  to-text writes the fs block to stdout when TEXT is omitted or '-'.\n" ++
             "  from-text creates or replaces BINARY from the test fs representation.\n",
@@ -274,7 +274,7 @@ fn printTrieUsage(err: ?anyerror) void {
 
 fn executeCommand(
     init: std.process.Init,
-    driver: *permfuse.Driver,
+    driver: *permfs.Driver,
     line: []const u8,
 ) !bool {
     var words = std.mem.tokenizeAny(u8, line, " \t");
@@ -297,7 +297,7 @@ fn executeCommand(
     } else if (std.mem.eql(u8, command, "set")) {
         const path = words.next() orelse return error.MissingPath;
         const flags_start = skipWords(line, 2) orelse return error.MissingFlags;
-        const access = try permfuse.parseAccessText(flags_start);
+        const access = try permfs.parseAccessText(flags_start);
         try driver.setRule(path, access);
         terminal.label(terminal.bright_green, "updated  ");
         std.debug.print("{s}\n", .{path});
@@ -360,7 +360,7 @@ fn skipWords(line: []const u8, count: usize) ?[]const u8 {
     return if (index == line.len) null else line[index..];
 }
 
-fn printMode(mode: ?permfuse.Access) void {
+fn printMode(mode: ?permfs.Access) void {
     if (mode) |value| {
         std.debug.print("{t}\n", .{value});
     } else {
@@ -397,10 +397,10 @@ fn printUsage(err: anyerror) void {
     );
     terminal.label(terminal.bright_blue, "usage\n  ");
     std.debug.print(
-        "permfuse --lower=/absolute/root --policy=/absolute/trie " ++
+        "permfs --lower=/absolute/root --policy=/absolute/trie " ++
             "--session=/absolute/session [--no-io-uring] [--no-passthrough] " ++
             "/absolute/mountpoint [FUSE options]\n" ++
-            "  permfuse trie help\n",
+            "  permfs trie help\n",
         .{},
     );
 }

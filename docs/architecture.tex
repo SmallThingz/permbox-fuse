@@ -13,15 +13,15 @@
 \definecolor{storage}{HTML}{2E7D32}
 \hypersetup{colorlinks=true,linkcolor=policy,urlcolor=kernel}
 
-\title{permfuse: a Policy Layer over Linux OverlayFS}
-\author{permbox-fuse3}
+\title{permfs: a Policy Layer over Linux OverlayFS}
+\author{permfs}
 \date{\today}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-permfuse is a library that presents a filesystem through a dynamic path
+permfs is a library that presents a filesystem through a dynamic path
 policy. Linux OverlayFS stores all changes. A low-level FUSE filesystem
 controls namespace visibility and decides whether each path is read-only,
 writable, or requires an interactive decision. This split keeps filesystem
@@ -38,7 +38,7 @@ mechanics in the kernel and keeps the policy implementation small.
 ]
 \node[box,draw=storage] (lower) {lower filesystem};
 \node[box,draw=storage,above=of lower] (overlay) {private kernel OverlayFS};
-\node[box,draw=policy,above=of overlay] (fuse) {permfuse policy filesystem};
+\node[box,draw=policy,above=of overlay] (fuse) {permfs policy filesystem};
 \node[box,draw=kernel,above=of fuse] (task) {sandboxed process};
 \draw[arrow] (task) -- (fuse);
 \draw[arrow] (fuse) -- (overlay);
@@ -83,7 +83,7 @@ handle.
 The FUSE mount uses \texttt{default\_permissions} and returns ownership and
 mode metadata from the merged OverlayFS object. The kernel checks the caller's
 UID, GID, mode bits, ACL, sticky directory rules, and execute permission.
-permfuse then applies its four-state path policy. OverlayFS finally performs
+permfs then applies its four-state path policy. OverlayFS finally performs
 the operation using its mount credentials.
 
 This arrangement avoids a partial userspace implementation of supplementary
@@ -150,7 +150,7 @@ call. Discard removes one selected upper subtree.
 \section{Limits}
 
 Editing an OverlayFS lower tree while it is mounted is unsupported by Linux.
-permfuse does not attempt to make it safe. Kernel OverlayFS and FUSE support,
+permfs does not attempt to make it safe. Kernel OverlayFS and FUSE support,
 mount privileges, upper filesystem xattrs, and valid directory entry types
 are required. Passthrough additionally needs kernel support and
 \texttt{CAP\_SYS\_ADMIN}.

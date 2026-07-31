@@ -1,7 +1,7 @@
 //! libfuse bindings shared by the low-level daemon.
 const std = @import("std");
 
-/// External libfuse API level, not a permfuse data or package version.
+/// External libfuse API level, not a permfs data or package version.
 pub const fuse_api_level = 318;
 
 pub const c = @cImport({

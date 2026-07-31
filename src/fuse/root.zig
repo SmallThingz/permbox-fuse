@@ -183,7 +183,7 @@ pub const Driver = struct {
 
         const argv = try allocator.alloc([*c]u8, 4 + mount_options.arguments.len);
         defer allocator.free(argv);
-        argv[0] = @constCast("permfuse");
+        argv[0] = @constCast("permfs");
         argv[1] = @constCast("-o");
         argv[2] = @constCast(if (mount_options.io_uring)
             "io_uring,default_permissions"

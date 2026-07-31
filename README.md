@@ -1,6 +1,6 @@
-# permfuse
+# permfs
 
-`permfuse` is an embeddable Linux filesystem policy driver used by Permbox.
+`permfs` is an embeddable Linux filesystem policy driver used by Permbox.
 It mounts a private kernel OverlayFS and exposes that merged tree through a
 small low-level FUSE filesystem.
 
@@ -60,13 +60,13 @@ When passthrough is unavailable, file I/O uses the normal FUSE path.
 
 ```zig
 const std = @import("std");
-const permfuse = @import("permfuse");
+const permfs = @import("permfs");
 
 fn ask(
     context: ?*anyopaque,
     io: std.Io,
-    request: permfuse.AskRequest,
-) !permfuse.Access {
+    request: permfs.AskRequest,
+) !permfs.Access {
     _ = context;
     _ = io;
     std.log.info("policy request: {s} {t}", .{
@@ -76,7 +76,7 @@ fn ask(
     return .r;
 }
 
-var driver: permfuse.Driver = undefined;
+var driver: permfs.Driver = undefined;
 try driver.init(io, .{
     .lower_path = "/srv/root",
     .policy_path = "/run/permbox/policy.trie",
@@ -113,7 +113,7 @@ tree is therefore the restart checkpoint.
 ## CLI
 
 ```sh
-zig-out/bin/permfuse \
+zig-out/bin/permfs \
   --lower=/absolute/lower \
   --policy=/absolute/policy.trie \
   --session=/absolute/session \
@@ -138,8 +138,8 @@ quit
 Trie conversion does not mount a filesystem:
 
 ```sh
-permfuse trie to-text policy.trie policy.fs
-permfuse trie from-text policy.fs policy.trie
+permfs trie to-text policy.trie policy.fs
+permfs trie from-text policy.fs policy.trie
 ```
 
 See [docs/API.md](docs/API.md) for the exported API and [PLAN.md](PLAN.md) for

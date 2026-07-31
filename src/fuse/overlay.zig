@@ -17,7 +17,7 @@ const c = @cImport({
 });
 
 var temporary_counter: std.atomic.Value(u64) = .init(0);
-const internal_trash = ".permfuse-internal-trash";
+const internal_trash = ".permfs-internal-trash";
 
 pub const MountOptions = struct {
     redirect_dir: bool = true,
@@ -519,7 +519,7 @@ fn countEntries(path: [:0]const u8) !usize {
 fn temporaryPath(destination: [:0]const u8) ![:0]u8 {
     return std.fmt.allocPrintSentinel(
         std.heap.c_allocator,
-        "{s}.permfuse-{d}-{d}",
+        "{s}.permfs-{d}-{d}",
         .{ destination, c.getpid(), temporary_counter.fetchAdd(1, .monotonic) },
         0,
     );

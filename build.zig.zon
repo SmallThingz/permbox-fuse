@@ -1,7 +1,7 @@
 .{
-    .name = .permbox_fuse,
+    .name = .permfs,
     .version = "0.0.0",
-    .fingerprint = 0xe633bf4de44fcfbe, // Changing this has security and trust implications.
+    .fingerprint = 0x90a0889c4c6ac018, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
